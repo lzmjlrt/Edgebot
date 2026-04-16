@@ -27,7 +27,7 @@ TASKS_DIR = WORKDIR / ".tasks"
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 MEMORY_DIR = WORKDIR / "memory"
-MCP_CONFIG_PATH = WORKDIR / ".edgebot" / "mcp.json"
+MCP_CONFIG_PATH = WORKDIR / "mcp_servers.json"
 SESSION_DIR = Path.home() / ".edgebot" / "sessions"
 
 # --- Tuning constants ---

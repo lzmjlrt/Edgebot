@@ -1,16 +1,20 @@
 """
-edgebot/agent/loop.py - Main agent loop and system prompt.
+edgebot/agent/loop.py - Main agent loop with Rich UI.
 """
 
+import asyncio
 import json
 
 import litellm
+from rich.console import Console
+from rich.markdown import Markdown
 
 from edgebot.agent.compression import auto_compact, estimate_tokens, microcompact
 from edgebot.agent.memory import consolidate_memory
 from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD
 
-_CONSOLIDATION_INTERVAL = 5  # Run memory consolidation every N turns
+_console = Console()
+_CONSOLIDATION_INTERVAL = 5
 _turn_counter = 0
 
 
@@ -43,28 +47,13 @@ async def agent_loop(
     session_store=None,
     session_key: str = "default",
 ):
-    """
-    Main agentic loop (async).
-
-    Args:
-        messages:      Conversation history (mutated in place).
-        system:        System prompt string.
-        tools:         OpenAI function-calling tool schema list.
-        tool_handlers: {tool_name: callable(**kwargs) -> str | Awaitable[str]}
-        todo_mgr:      TodoManager instance (for nag reminder).
-        bg_mgr:        BackgroundManager instance (drain notifications).
-        bus:           MessageBus instance (read lead inbox).
-        session_store: Optional SessionStore for persistence.
-        session_key:   Key used in session_store.
-    """
-    import asyncio
     rounds_without_todo = 0
 
     while True:
         # s06: compression pipeline
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            print("[auto-compact triggered]")
+            _console.print("[dim]  Auto-compressing context...[/dim]")
             messages[:] = await auto_compact(messages)
             if session_store:
                 session_store.save_all(session_key, messages)
@@ -90,13 +79,14 @@ async def agent_loop(
             })
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
 
-        # LLM call (system prompt as first message)
+        # LLM call with thinking spinner
         call_messages = [{"role": "system", "content": system}] + messages
-        response = await litellm.acompletion(
-            model=MODEL, messages=call_messages,
-            tools=tools, max_tokens=8000,
-            api_key=API_KEY, api_base=API_BASE,
-        )
+        with _console.status("[dim]Edgebot is thinking...[/dim]", spinner="dots"):
+            response = await litellm.acompletion(
+                model=MODEL, messages=call_messages,
+                tools=tools, max_tokens=8000,
+                api_key=API_KEY, api_base=API_BASE,
+            )
         choice = response.choices[0]
         asst_msg = _serialize_assistant(choice.message)
         messages.append(asst_msg)
@@ -105,7 +95,8 @@ async def agent_loop(
 
         if choice.finish_reason != "tool_calls":
             if choice.message.content:
-                print(choice.message.content)
+                _console.print()
+                _console.print(Markdown(choice.message.content))
             return
 
         # Tool execution
@@ -129,7 +120,7 @@ async def agent_loop(
                         output = result
             except Exception as e:
                 output = f"Error: {e}"
-            print(f"> {name}: {str(output)[:200]}")
+            _console.print(f"  [dim]\u21b3 {name}: {str(output)[:200]}[/dim]")
             tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -151,7 +142,7 @@ async def agent_loop(
 
         # s06: manual compress
         if manual_compress:
-            print("[manual compact]")
+            _console.print("[dim]  Compressing...[/dim]")
             messages[:] = await auto_compact(messages)
             if session_store:
                 session_store.save_all(session_key, messages)
@@ -164,4 +155,4 @@ async def agent_loop(
             try:
                 await consolidate_memory(messages)
             except Exception as e:
-                print(f"[memory] Consolidation error: {e}")
+                _console.print(f"[dim]  Memory error: {e}[/dim]")

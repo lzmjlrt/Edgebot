@@ -6,6 +6,66 @@ This module is the single assembly point that wires all sub-systems together.
 Import TOOLS and TOOL_HANDLERS from here for use in the agent loop.
 """
 
+from edgebot.background.manager import BackgroundManager
+from edgebot.config import SKILLS_DIR
+from edgebot.skills.loader import SkillLoader
+from edgebot.tasks.manager import TaskManager
+from edgebot.tasks.todo import TodoManager
+from edgebot.team.bus import MessageBus
+from edgebot.team.teammate import TeammateManager
+
+# ---------------------------------------------------------------------------
+# Global singleton instances
+# ---------------------------------------------------------------------------
+TODO = TodoManager()
+SKILLS = SkillLoader(SKILLS_DIR)
+TASK_MGR = TaskManager()
+BG = BackgroundManager()
+BUS = MessageBus()
+TEAM = TeammateManager(BUS, TASK_MGR)
+
+# ---------------------------------------------------------------------------
+# Tool registration capabilities
+# ---------------------------------------------------------------------------
+TOOL_HANDLERS = {}
+TOOLS = []
+
+def register_tool(tool_instance):
+    """Register a BaseTool instance."""
+    TOOLS.append(tool_instance.to_openai())
+    TOOL_HANDLERS[tool_instance.name] = tool_instance.execute
+
+# Manually register built-ins to avoid circular imports during setup
+def init_builtin_tools():
+    from edgebot.tools.builtin.filesystem import ReadFileTool, WriteFileTool, EditFileTool
+    from edgebot.tools.builtin.shell import BashTool
+    from edgebot.tools.builtin.tasks import TaskCreateTool, TaskGetTool, TaskUpdateTool, TaskListTool, ClaimTaskTool
+    from edgebot.tools.builtin.team_manager import (
+        BroadcastTool, SendMessageTool, ReadInboxTool, SpawnTeammateTool, 
+        ListTeammatesTool, TaskTool, TodoWriteTool, LoadSkillTool, IdleTool, 
+        ShutdownRequestTool, PlanApprovalTool, BackgroundRunTool, CheckBackgroundTool, CompressTool
+    )
+    
+    for t in [
+        ReadFileTool(), WriteFileTool(), EditFileTool(),
+        BashTool(),
+        TaskCreateTool(), TaskGetTool(), TaskUpdateTool(), TaskListTool(), ClaimTaskTool(),
+        BroadcastTool(), SendMessageTool(), ReadInboxTool(), SpawnTeammateTool(),
+        ListTeammatesTool(), TaskTool(), TodoWriteTool(), LoadSkillTool(), IdleTool(),
+        ShutdownRequestTool(), PlanApprovalTool(), BackgroundRunTool(), CheckBackgroundTool(), CompressTool()
+    ]:
+        register_tool(t)
+
+# Initialize them right away so TOOLS mapped properties are available statically
+init_builtin_tools()
+"""
+edgebot/tools/registry.py - Global singleton instances, tool schema list,
+and tool handler dispatch dict.
+
+This module is the single assembly point that wires all sub-systems together.
+Import TOOLS and TOOL_HANDLERS from here for use in the agent loop.
+"""
+
 import json
 
 from edgebot.agent.subagent import run_subagent

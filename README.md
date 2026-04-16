@@ -10,6 +10,8 @@ A minimal, modular coding agent framework built with Python. Reference [learn-cl
 - **Multi-agent team** - spawn persistent autonomous teammates that collaborate via file-based message bus
 - **Task board** - file-backed persistent task management with dependencies and ownership
 - **Skill system** - extend the agent with `SKILL.md` files for domain-specific knowledge
+- **MCP Support** - native support for Model Context Protocol (MCP) servers via `mcp_servers.json`
+- **Modular Tool Architecture** - easily extend capabilities by inheriting from `BaseTool`
 - **Context compression** - automatic microcompact + full conversation summarization to stay within token limits
 - **Background execution** - run long commands in background threads, get notified on completion
 
@@ -21,12 +23,14 @@ edgebot/
 ├── agent/
 │   ├── loop.py              # Main agent loop
 │   ├── subagent.py          # One-shot subagent spawning
+│   ├── context.py           # Auto-seeds templates & bootstrap config
 │   └── compression.py       # Token estimation & context compaction
 ├── tools/
-│   ├── base.py              # Path safety (sandbox)
-│   ├── shell.py             # Shell command execution
-│   ├── filesystem.py        # File read / write / edit
-│   └── registry.py          # Tool schemas + handler dispatch + global instances
+│   ├── base.py              # BaseTool API & sandbox safety
+│   ├── builtin/             # Modularized built-in tools (BashTool, FileTool, etc.)
+│   └── registry.py          # Dynamic tool schema & handler registration
+├── mcp/
+│   └── client.py            # External MCP server communication
 ├── tasks/
 │   ├── todo.py              # In-memory checklist (TodoWrite)
 │   └── manager.py           # File-backed persistent task board
@@ -77,6 +81,11 @@ See [LiteLLM supported providers](https://docs.litellm.ai/docs/providers) for th
 python -m edgebot
 ```
 
+Upon first run, Edgebot will auto-generate base configurations in your workspace if they do not exist:
+- `AGENTS.md` / `SOUL.md` / `USER.md` / `TOOLS.md` - Core prompts and identity configuration.
+- `skills/` - A sample directory with an instructional `summarize` skill.
+- `mcp_servers.json` - A template config for routing capabilities to external MCP servers.
+
 ## REPL Commands
 
 | Command | Description |
@@ -99,9 +108,16 @@ The agent has access to 22 tools:
 | **Agent** | `task` (subagent), `load_skill`, `compress` |
 | **Team** | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox`, `broadcast`, `shutdown_request`, `plan_approval`, `idle` |
 
-## Skills
+## Adding Built-in Tools
 
-Place `SKILL.md` files under a `skills/` directory in your workspace to extend the agent with domain knowledge:
+Edgebot leverages an easy-to-extend `BaseTool` class in `edgebot/tools/base.py`. To plug in a new capability:
+
+1. Create a class inheriting from `BaseTool` with `name`, `description`, `parameters`, and `execute`.
+2. Register it in `edgebot/tools/registry.py` (e.g. `register_tool(MyCustomTool())`).
+
+## Adding Skills
+
+Place `SKILL.md` files under a `skills/` directory in your workspace to teach the agent specific domain knowledge without changing code:
 
 ```
 skills/
@@ -118,6 +134,22 @@ description: What this skill does
 ---
 
 Skill content and instructions here...
+```
+
+## Adding MCP Servers
+
+Edgebot natively scales with external MCP servers. A default config `mcp_servers.json` is generated in your workspace holding your command routes:
+
+```json
+{
+  "mcpServers": {
+    "everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {}
+    }
+  }
+}
 ```
 
 ## License

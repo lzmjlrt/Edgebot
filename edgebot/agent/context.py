@@ -25,6 +25,20 @@ def seed_workspace_templates() -> None:
         if not dst.exists() and src.exists():
             shutil.copy2(src, dst)
             print(f"[setup] Created {filename}")
+            
+    # Seed skills
+    skills_src_dir = _TEMPLATES_DIR / "skills"
+    skills_dst_dir = WORKDIR / "skills"
+    if not skills_dst_dir.exists() and skills_src_dir.exists():
+        shutil.copytree(skills_src_dir, skills_dst_dir)
+        print("[setup] Created sample skills directory")
+        
+    # Seed MCP config
+    mcp_src = _TEMPLATES_DIR / "mcp_servers.json"
+    mcp_dst = WORKDIR / "mcp_servers.json"
+    if not mcp_dst.exists() and mcp_src.exists():
+        shutil.copy2(mcp_src, mcp_dst)
+        print("[setup] Created mcp_servers.json")
 
 
 def build_system_prompt(skills_descriptions: str) -> str:

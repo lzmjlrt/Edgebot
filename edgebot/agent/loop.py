@@ -7,17 +7,11 @@ import json
 import litellm
 
 from edgebot.agent.compression import auto_compact, estimate_tokens, microcompact
-from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD, WORKDIR
+from edgebot.agent.memory import consolidate_memory
+from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD
 
-
-def build_system_prompt(skills_descriptions: str) -> str:
-    return (
-        f"You are a coding agent at {WORKDIR}. Use tools to solve tasks.\n"
-        "Prefer task_create/task_update/task_list for multi-step work. "
-        "Use TodoWrite for short checklists.\n"
-        "Use task for subagent delegation. Use load_skill for specialized knowledge.\n"
-        f"Skills: {skills_descriptions}"
-    )
+_CONSOLIDATION_INTERVAL = 5  # Run memory consolidation every N turns
+_turn_counter = 0
 
 
 def _serialize_assistant(message) -> dict:
@@ -161,3 +155,13 @@ async def agent_loop(
             messages[:] = await auto_compact(messages)
             if session_store:
                 session_store.save_all(session_key, messages)
+
+        # Memory consolidation every N turns
+        global _turn_counter
+        _turn_counter += 1
+        if _turn_counter >= _CONSOLIDATION_INTERVAL:
+            _turn_counter = 0
+            try:
+                await consolidate_memory(messages)
+            except Exception as e:
+                print(f"[memory] Consolidation error: {e}")

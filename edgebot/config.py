@@ -26,6 +26,7 @@ INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+MEMORY_DIR = WORKDIR / "memory"
 MCP_CONFIG_PATH = WORKDIR / ".edgebot" / "mcp.json"
 SESSION_DIR = Path.home() / ".edgebot" / "sessions"
 

@@ -51,7 +51,7 @@ TOOL_HANDLERS = {
     "write_file":       lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":        lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "TodoWrite":        lambda **kw: TODO.update(kw["items"]),
-    "task":             lambda **kw: run_subagent(kw["prompt"], kw.get("agent_type", "Explore")),
+    "task":             lambda **kw: run_subagent(kw["prompt"], kw.get("agent_type", "Explore")),  # returns coroutine
     "load_skill":       lambda **kw: SKILLS.load(kw["name"]),
     "compress":         lambda **kw: "Compressing...",
     "background_run":   lambda **kw: BG.run(kw["command"], kw.get("timeout", 120)),

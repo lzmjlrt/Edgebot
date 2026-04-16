@@ -26,6 +26,8 @@ INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+MCP_CONFIG_PATH = WORKDIR / ".edgebot" / "mcp.json"
+SESSION_DIR = Path.home() / ".edgebot" / "sessions"
 
 # --- Tuning constants ---
 TOKEN_THRESHOLD = 100_000

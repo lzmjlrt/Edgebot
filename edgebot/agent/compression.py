@@ -24,7 +24,7 @@ def microcompact(messages: list):
             msg["content"] = "[cleared]"
 
 
-def auto_compact(messages: list) -> list:
+async def auto_compact(messages: list) -> list:
     """Summarize the full conversation and replace with a compact seed."""
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
@@ -32,7 +32,7 @@ def auto_compact(messages: list) -> list:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     conv_text = json.dumps(messages, default=str)[:80000]
-    resp = litellm.completion(
+    resp = await litellm.acompletion(
         model=MODEL,
         messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
         max_tokens=2000,

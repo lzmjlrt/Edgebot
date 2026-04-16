@@ -38,7 +38,7 @@ def _serialize_assistant(message) -> dict:
     return msg
 
 
-def agent_loop(
+async def agent_loop(
     messages: list,
     system: str,
     tools: list,
@@ -46,19 +46,24 @@ def agent_loop(
     todo_mgr,
     bg_mgr,
     bus,
+    session_store=None,
+    session_key: str = "default",
 ):
     """
-    Main agentic loop.
+    Main agentic loop (async).
 
     Args:
         messages:      Conversation history (mutated in place).
         system:        System prompt string.
         tools:         OpenAI function-calling tool schema list.
-        tool_handlers: {tool_name: callable(**kwargs) -> str}
+        tool_handlers: {tool_name: callable(**kwargs) -> str | Awaitable[str]}
         todo_mgr:      TodoManager instance (for nag reminder).
         bg_mgr:        BackgroundManager instance (drain notifications).
         bus:           MessageBus instance (read lead inbox).
+        session_store: Optional SessionStore for persistence.
+        session_key:   Key used in session_store.
     """
+    import asyncio
     rounds_without_todo = 0
 
     while True:
@@ -66,7 +71,9 @@ def agent_loop(
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             print("[auto-compact triggered]")
-            messages[:] = auto_compact(messages)
+            messages[:] = await auto_compact(messages)
+            if session_store:
+                session_store.save_all(session_key, messages)
 
         # s08: drain background notifications
         notifs = bg_mgr.drain()
@@ -91,13 +98,16 @@ def agent_loop(
 
         # LLM call (system prompt as first message)
         call_messages = [{"role": "system", "content": system}] + messages
-        response = litellm.completion(
+        response = await litellm.acompletion(
             model=MODEL, messages=call_messages,
             tools=tools, max_tokens=8000,
             api_key=API_KEY, api_base=API_BASE,
         )
         choice = response.choices[0]
-        messages.append(_serialize_assistant(choice.message))
+        asst_msg = _serialize_assistant(choice.message)
+        messages.append(asst_msg)
+        if session_store:
+            session_store.append(session_key, asst_msg)
 
         if choice.finish_reason != "tool_calls":
             if choice.message.content:
@@ -115,15 +125,25 @@ def agent_loop(
                 manual_compress = True
             handler = tool_handlers.get(name)
             try:
-                output = handler(**args) if handler else f"Unknown tool: {name}"
+                if handler is None:
+                    output = f"Unknown tool: {name}"
+                else:
+                    result = handler(**args)
+                    if asyncio.iscoroutine(result):
+                        output = await result
+                    else:
+                        output = result
             except Exception as e:
                 output = f"Error: {e}"
             print(f"> {name}: {str(output)[:200]}")
-            messages.append({
+            tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": str(output),
-            })
+            }
+            messages.append(tool_msg)
+            if session_store:
+                session_store.append(session_key, tool_msg)
             if name == "TodoWrite":
                 used_todo = True
 
@@ -138,4 +158,6 @@ def agent_loop(
         # s06: manual compress
         if manual_compress:
             print("[manual compact]")
-            messages[:] = auto_compact(messages)
+            messages[:] = await auto_compact(messages)
+            if session_store:
+                session_store.save_all(session_key, messages)

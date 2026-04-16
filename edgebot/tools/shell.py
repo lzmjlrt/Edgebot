@@ -8,9 +8,12 @@ from edgebot.config import WORKDIR
 
 
 def run_bash(command: str) -> str:
+    from edgebot.security.network import contains_internal_url
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
+    if contains_internal_url(command):
+        return "Error: Command blocked — contains internal network URL"
     try:
         r = subprocess.run(
             command, shell=True, cwd=WORKDIR,

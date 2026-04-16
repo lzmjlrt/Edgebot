@@ -18,7 +18,7 @@ def _tool(name: str, description: str, parameters: dict) -> dict:
     }
 
 
-def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
+async def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     sub_tools = [
         _tool("bash", "Run command.",
               {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
@@ -41,7 +41,7 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     sub_msgs = [{"role": "user", "content": prompt}]
     choice = None
     for _ in range(30):
-        resp = litellm.completion(
+        resp = await litellm.acompletion(
             model=MODEL, messages=sub_msgs, tools=sub_tools, max_tokens=8000,
             api_key=API_KEY, api_base=API_BASE,
         )

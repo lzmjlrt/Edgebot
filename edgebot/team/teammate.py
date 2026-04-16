@@ -2,9 +2,9 @@
 edgebot/team/teammate.py - Persistent autonomous teammate agents.
 """
 
+import asyncio
 import json
 import threading
-import time
 
 import litellm
 
@@ -56,9 +56,11 @@ class TeammateManager:
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save()
-        threading.Thread(
-            target=self._loop, args=(name, role, prompt), daemon=True
-        ).start()
+
+        def _run_thread():
+            asyncio.run(self._loop(name, role, prompt))
+
+        threading.Thread(target=_run_thread, daemon=True).start()
         return f"Spawned '{name}' (role: {role})"
 
     def _set_status(self, name: str, status: str):
@@ -67,7 +69,7 @@ class TeammateManager:
             member["status"] = status
             self._save()
 
-    def _loop(self, name: str, role: str, prompt: str):
+    async def _loop(self, name: str, role: str, prompt: str):
         team_name = self.config["team_name"]
         sys_prompt = (
             f"You are '{name}', role: {role}, team: {team_name}, at "
@@ -103,7 +105,7 @@ class TeammateManager:
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
                     call_messages = [{"role": "system", "content": sys_prompt}] + messages
-                    response = litellm.completion(
+                    response = await litellm.acompletion(
                         model=MODEL, messages=call_messages,
                         tools=tools, max_tokens=8000,
                         api_key=API_KEY, api_base=API_BASE,
@@ -155,7 +157,7 @@ class TeammateManager:
             self._set_status(name, "idle")
             resume = False
             for _ in range(IDLE_TIMEOUT // max(POLL_INTERVAL, 1)):
-                time.sleep(POLL_INTERVAL)
+                await asyncio.sleep(POLL_INTERVAL)
                 inbox = self.bus.read_inbox(name)
                 if inbox:
                     for msg in inbox:

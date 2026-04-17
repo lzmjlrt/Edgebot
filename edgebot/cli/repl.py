@@ -85,10 +85,16 @@ async def main():
     system = build_system_prompt(SKILLS.descriptions())
 
     # --- Welcome banner ---
-    console.print(
-        f"\n[bold cyan]Edgebot[/bold cyan] [dim]({MODEL})[/dim] "
-        f"— type [bold]/help[/bold] for commands, [bold]exit[/bold] to quit\n"
-    )
+    _LOGO = r"""
+[bold cyan]    ,──────.    [/bold cyan]
+[bold cyan]   / ,────. \   [/bold cyan]    [bold white]E D G E B O T[/bold white]
+[bold blue]  / / ,──┐ \ \  [/bold blue]    [dim]Autonomous Workspace Agent[/dim]
+[bold blue]  \ \ └──/ / /  [/bold blue]
+[bold magenta]   \ ─────/ /   [/bold magenta]    [dim]Model:[/dim] [cyan]{model}[/cyan]
+[bold purple]    `──────'    [/bold purple]
+"""
+    console.print(_LOGO.format(model=MODEL))
+    console.print("  [dim]Type [bold]/help[/bold] for commands, [bold]exit[/bold] to quit[/dim]\n")
 
     try:
         while True:

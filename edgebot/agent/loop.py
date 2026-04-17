@@ -1,39 +1,114 @@
 """
-edgebot/agent/loop.py - Main agent loop with Rich UI.
+edgebot/agent/loop.py - Main agent loop with Rich streaming UI.
 """
 
 import asyncio
 import json
+import sys
 
 import litellm
 from rich.console import Console
-from rich.markdown import Markdown
 
 from edgebot.agent.compression import auto_compact, estimate_tokens, microcompact
 from edgebot.agent.memory import consolidate_memory
+from edgebot.cli.tool_hints import format_tool_hint
 from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD
 
 _console = Console()
-_CONSOLIDATION_INTERVAL = 5
+_CONSOLIDATION_INTERVAL = 15
+_MIN_HISTORY_FOR_MEMORY = 10
 _turn_counter = 0
 
 
-def _serialize_assistant(message) -> dict:
-    """Convert litellm response message to a storable dict."""
-    msg = {"role": "assistant", "content": message.content}
-    if message.tool_calls:
-        msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-            for tc in message.tool_calls
-        ]
-    return msg
+def _flush_stdin() -> None:
+    """Drop any keystrokes typed while the model was generating."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+async def _stream_completion(call_messages, tools):
+    """
+    Stream the LLM response. Prints text deltas as they arrive.
+    Returns (content_text, tool_calls_list, finish_reason).
+    """
+    content_parts: list[str] = []
+    tool_calls_buf: dict[int, dict] = {}
+    finish_reason = "stop"
+    first_delta = True
+    status = _console.status("[dim]Edgebot is thinking...[/dim]", spinner="dots")
+    status.start()
+
+    try:
+        stream = await litellm.acompletion(
+            model=MODEL,
+            messages=call_messages,
+            tools=tools,
+            max_tokens=8000,
+            api_key=API_KEY,
+            api_base=API_BASE,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+
+            # Text content streams to stdout token-by-token
+            text = getattr(delta, "content", None)
+            if text:
+                if first_delta:
+                    status.stop()
+                    _console.print()  # blank line before response
+                    _console.print("[cyan]Edgebot:[/cyan]")
+                    first_delta = False
+                _console.print(text, end="", highlight=False, soft_wrap=True)
+                content_parts.append(text)
+
+            # Tool call deltas accumulate
+            tc_delta = getattr(delta, "tool_calls", None) or []
+            for tc in tc_delta:
+                idx = getattr(tc, "index", 0) or 0
+                buf = tool_calls_buf.setdefault(
+                    idx, {"id": "", "name": "", "arguments": ""}
+                )
+                if getattr(tc, "id", None):
+                    buf["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        buf["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        buf["arguments"] += fn.arguments
+    finally:
+        try:
+            status.stop()
+        except Exception:
+            pass
+        if content_parts:
+            _console.print()  # final newline after streamed text
+
+    tool_calls = [
+        {
+            "id": b["id"],
+            "type": "function",
+            "function": {"name": b["name"], "arguments": b["arguments"] or "{}"},
+        }
+        for _, b in sorted(tool_calls_buf.items())
+        if b["name"]
+    ]
+    return "".join(content_parts), tool_calls, finish_reason
 
 
 async def agent_loop(
@@ -54,7 +129,7 @@ async def agent_loop(
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             _console.print("[dim]  Auto-compressing context...[/dim]")
-            messages[:] = await auto_compact(messages)
+            messages[:] = await auto_compact(messages, is_idle=False)
             if session_store:
                 session_store.save_all(session_key, messages)
 
@@ -79,35 +154,41 @@ async def agent_loop(
             })
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
 
-        # LLM call with thinking spinner
+        # ---- Streaming LLM call ----
         call_messages = [{"role": "system", "content": system}] + messages
-        with _console.status("[dim]Edgebot is thinking...[/dim]", spinner="dots"):
-            response = await litellm.acompletion(
-                model=MODEL, messages=call_messages,
-                tools=tools, max_tokens=8000,
-                api_key=API_KEY, api_base=API_BASE,
-            )
-        choice = response.choices[0]
-        asst_msg = _serialize_assistant(choice.message)
+        content_text, tool_calls, finish_reason = await _stream_completion(
+            call_messages, tools
+        )
+
+        # Drop any keystrokes the user mashed during generation
+        _flush_stdin()
+
+        asst_msg: dict = {"role": "assistant", "content": content_text or None}
+        if tool_calls:
+            asst_msg["tool_calls"] = tool_calls
         messages.append(asst_msg)
         if session_store:
             session_store.append(session_key, asst_msg)
 
-        if choice.finish_reason != "tool_calls":
-            if choice.message.content:
-                _console.print()
-                _console.print(Markdown(choice.message.content))
+        if finish_reason != "tool_calls" or not tool_calls:
             return
 
-        # Tool execution
+        # ---- Tool execution ----
         used_todo = False
         manual_compress = False
 
-        for tc in choice.message.tool_calls or []:
-            name = tc.function.name
-            args = json.loads(tc.function.arguments)
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
             if name == "compress":
                 manual_compress = True
+
+            # Show a short hint line for this tool call
+            _console.print(f"  [dim]\u21b3 {format_tool_hint(name, args)}[/dim]")
+
             handler = tool_handlers.get(name)
             try:
                 if handler is None:
@@ -120,10 +201,10 @@ async def agent_loop(
                         output = result
             except Exception as e:
                 output = f"Error: {e}"
-            _console.print(f"  [dim]\u21b3 {name}: {str(output)[:200]}[/dim]")
+
             tool_msg = {
                 "role": "tool",
-                "tool_call_id": tc.id,
+                "tool_call_id": tc["id"],
                 "content": str(output),
             }
             messages.append(tool_msg)
@@ -143,16 +224,19 @@ async def agent_loop(
         # s06: manual compress
         if manual_compress:
             _console.print("[dim]  Compressing...[/dim]")
-            messages[:] = await auto_compact(messages)
+            messages[:] = await auto_compact(messages, is_idle=False)
             if session_store:
                 session_store.save_all(session_key, messages)
 
-        # Memory consolidation every N turns
+        # Memory consolidation (gated by interval + minimum history)
         global _turn_counter
         _turn_counter += 1
-        if _turn_counter >= _CONSOLIDATION_INTERVAL:
+        if (
+            _turn_counter >= _CONSOLIDATION_INTERVAL
+            and len(messages) >= _MIN_HISTORY_FOR_MEMORY
+        ):
             _turn_counter = 0
             try:
                 await consolidate_memory(messages)
             except Exception as e:
-                _console.print(f"[dim]  Memory error: {e}[/dim]")
+                _console.print(f"[dim red]  [memory] error: {e}[/dim red]")

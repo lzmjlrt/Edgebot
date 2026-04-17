@@ -9,8 +9,11 @@ import json
 import re
 
 import litellm
+from rich.console import Console
 
 from edgebot.config import API_BASE, API_KEY, MODEL, WORKDIR
+
+_console = Console()
 
 MEMORY_DIR = WORKDIR / "memory"
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
@@ -19,20 +22,36 @@ MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 _MAX_MESSAGES = 30
 
 PHASE1_PROMPT = """\
-Compare the recent conversation against the current memory files below.
-Output one finding per line with a file prefix:
-[USER] new fact about the user (identity, preferences, habits)
-[SOUL] new behavior/tone preference for the assistant
-[MEMORY] new knowledge, project context, or confirmed solutions
+Extract ONLY high-value, stable information from the recent conversation.
+Output one finding per line with the format:
+[USER|SOUL|MEMORY] atomic fact
 
-Rules:
-- Only NEW or CONFLICTING information — skip duplicates and ephemera
-- Prefer atomic facts: "prefers Chinese responses" not "discussed language"
-- Corrections override old info: [USER] timezone is UTC+8, not UTC
-- Skip ephemeral topics (one-off debug questions, transient errors)
-- Priority: user corrections > preferences > solutions > decisions > events
+STRICT INCLUSION CRITERIA — a fact must meet ALL of:
+1. Stable — not transient, one-off, or debugging noise
+2. Non-obvious — not derivable from the code or context
+3. User-validated — confirmed by the user (not guessed by the assistant)
+4. Atomic — "prefers Chinese replies" NOT "discussed language preferences"
+5. Absent from current memory files — re-read them and skip duplicates
 
-If nothing needs updating: [SKIP] no new information
+REJECT AGGRESSIVELY:
+- Debug sessions, transient errors, one-off questions
+- Conversational filler ("hi", "thanks", "got it", "ok")
+- Anything mentioned in passing without emphasis
+- Vague summaries ("user asked about X")
+- Code patterns or facts derivable from reading the codebase
+- Anything already in USER.md / SOUL.md / MEMORY.md (even paraphrased)
+- Assistant's own behavior unless user EXPLICITLY corrected it
+
+Category rules:
+[USER]   Only identity/preferences/habits the user stated with emphasis
+         (e.g. "I always use Python 3.12", "I prefer Chinese")
+[SOUL]   Only when user EXPLICITLY corrects the assistant's tone/style
+         (e.g. "please answer more briefly from now on")
+[MEMORY] Only new architectural decisions, confirmed solutions, or long-lived
+         project facts (e.g. "project uses LiteLLM, not direct SDKs")
+
+If in doubt, SKIP. Polluting memory is worse than missing one fact.
+If nothing qualifies: [SKIP] no high-value information
 
 ## Current USER.md
 {user_content}
@@ -108,6 +127,39 @@ def _format_messages(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _filter_dedup(analysis: str, existing_blob: str) -> str:
+    """
+    Drop Phase 1 lines whose factual content is substantially covered by the
+    existing memory blob (USER+SOUL+MEMORY concatenated).
+    Uses a simple word-overlap heuristic.
+    """
+    existing_lower = existing_blob.lower()
+    kept: list[str] = []
+    for raw in analysis.splitlines():
+        line = raw.strip()
+        if not line:
+            kept.append(raw)
+            continue
+        m = re.match(r"^\[(USER|SOUL|MEMORY|SKIP)\]\s*(.*)$", line, re.I)
+        if not m:
+            kept.append(raw)
+            continue
+        tag = m.group(1).upper()
+        content = m.group(2).lower()
+        if tag == "SKIP":
+            kept.append(raw)
+            continue
+        words = [w for w in re.findall(r"[a-z0-9_]+", content) if len(w) > 3]
+        if not words:
+            kept.append(raw)
+            continue
+        hit = sum(1 for w in words if w in existing_lower)
+        if hit / len(words) >= 0.7:
+            continue  # too similar to existing — drop
+        kept.append(raw)
+    return "\n".join(kept)
+
+
 def _parse_phase2(output: str) -> list[dict]:
     """
     Parse Phase 2 LLM output into edit operations.
@@ -130,14 +182,14 @@ def _parse_phase2(output: str) -> list[dict]:
     return edits
 
 
-def _apply_edits(edits: list[dict]) -> list[str]:
-    """Apply parsed edits to workspace files. Returns list of changes made."""
+def _apply_edits(edits: list[dict]) -> set[str]:
+    """Apply parsed edits to workspace files. Returns the set of file names updated."""
     file_map = {
         "USER.md": WORKDIR / "USER.md",
         "SOUL.md": WORKDIR / "SOUL.md",
         "MEMORY.md": MEMORY_FILE,
     }
-    changes = []
+    updated: set[str] = set()
     for edit in edits:
         path = file_map.get(edit["file"])
         if not path:
@@ -149,18 +201,20 @@ def _apply_edits(edits: list[dict]) -> list[str]:
                 existing = ""
             new_content = existing.rstrip() + "\n\n" + edit["content"] + "\n"
             path.write_text(new_content, encoding="utf-8")
-            changes.append(f"  Updated {edit['file']} (+{len(edit['content'])} chars)")
-    return changes
+            updated.add(edit["file"])
+    return updated
 
 
 async def consolidate_memory(messages: list[dict]) -> None:
     """
-    Two-phase memory consolidation.
-    Extracts new facts from recent conversation and writes to workspace files.
+    Two-phase memory consolidation — runs silently.
+    Prints a single summary line only when files actually change.
     """
-    recent = messages[-_MAX_MESSAGES:]
-    if len(recent) < 2:
+    # Require a minimum amount of substantive conversation before running
+    substantive = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+    if len(substantive) < 6:
         return
+    recent = messages[-_MAX_MESSAGES:]
 
     user_content = _read_file(WORKDIR / "USER.md")
     soul_content = _read_file(WORKDIR / "SOUL.md")
@@ -170,7 +224,7 @@ async def consolidate_memory(messages: list[dict]) -> None:
     if not conversation.strip():
         return
 
-    # --- Phase 1: Analyze ---
+    # --- Phase 1: Analyze (silent) ---
     p1_prompt = PHASE1_PROMPT.format(
         user_content=user_content,
         soul_content=soul_content,
@@ -186,16 +240,23 @@ async def consolidate_memory(messages: list[dict]) -> None:
         )
         analysis = resp1.choices[0].message.content or ""
     except Exception as e:
-        print(f"[memory] Phase 1 failed: {e}")
+        _console.print(f"[dim red]  [memory] phase 1 failed: {e}[/dim red]")
         return
 
-    if "[SKIP]" in analysis:
-        print("[memory] No new information to consolidate.")
+    if "[SKIP]" in analysis or not analysis.strip():
         return
 
-    print(f"[memory] Phase 1 found updates:\n{analysis[:300]}")
+    # --- Dedup filter: drop analysis lines already covered by existing memory ---
+    existing_blob = "\n".join([user_content, soul_content, memory_content])
+    analysis = _filter_dedup(analysis, existing_blob)
+    # If after dedup nothing useful is left, bail
+    if not any(
+        re.match(r"^\s*\[(USER|SOUL|MEMORY)\]", ln)
+        for ln in analysis.splitlines()
+    ):
+        return
 
-    # --- Phase 2: Generate edits ---
+    # --- Phase 2: Generate edits (silent) ---
     p2_prompt = PHASE2_PROMPT.format(
         phase1_output=analysis,
         user_content=user_content,
@@ -211,18 +272,18 @@ async def consolidate_memory(messages: list[dict]) -> None:
         )
         edit_output = resp2.choices[0].message.content or ""
     except Exception as e:
-        print(f"[memory] Phase 2 failed: {e}")
+        _console.print(f"[dim red]  [memory] phase 2 failed: {e}[/dim red]")
         return
 
     if "[SKIP]" in edit_output:
-        print("[memory] No edits needed.")
         return
 
     edits = _parse_phase2(edit_output)
     if not edits:
-        print("[memory] No parseable edits.")
         return
 
-    changes = _apply_edits(edits)
-    for c in changes:
-        print(f"[memory]{c}")
+    updated = _apply_edits(edits)
+    if updated:
+        _console.print(
+            f"[dim]  [memory] updated {', '.join(sorted(updated))}[/dim]"
+        )

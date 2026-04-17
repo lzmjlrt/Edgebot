@@ -1,14 +1,18 @@
 """
-edgebot/cli/repl.py - Interactive REPL (async) with Rich UI.
+edgebot/cli/repl.py - Interactive REPL (async) with Rich UI and prompt_toolkit.
 
 REPL commands: /new /sessions /resume /compact /memory /tasks /team /inbox /status /help
 """
 
 import json
 import time
+from pathlib import Path
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
-from rich.markdown import Markdown
 
 from edgebot.agent.compression import auto_compact
 from edgebot.agent.context import build_system_prompt, seed_workspace_templates
@@ -20,6 +24,19 @@ from edgebot.session.store import SessionStore
 from edgebot.tools.registry import BG, BUS, SKILLS, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
 
 console = Console()
+
+_HISTORY_PATH = Path.home() / ".edgebot" / "cli_history"
+_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+_prompt_session: PromptSession = PromptSession(history=FileHistory(str(_HISTORY_PATH)))
+
+
+async def _ask_user() -> str:
+    """Prompt the user for a single line; returns stripped text."""
+    with patch_stdout():
+        line = await _prompt_session.prompt_async(
+            HTML("<b><ansiblue>You:</ansiblue></b> ")
+        )
+    return (line or "").strip()
 
 _HELP_TEXT = """\
 [bold]Edgebot commands:[/bold]
@@ -69,14 +86,14 @@ async def main():
 
     # --- Welcome banner ---
     console.print(
-        f"\n[bold]Edgebot[/bold] [dim]({MODEL})[/dim] "
+        f"\n[bold cyan]Edgebot[/bold cyan] [dim]({MODEL})[/dim] "
         f"— type [bold]/help[/bold] for commands, [bold]exit[/bold] to quit\n"
     )
 
     try:
         while True:
             try:
-                query = input("\033[1;34mYou:\033[0m ").strip()
+                query = await _ask_user()
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -123,13 +140,11 @@ async def main():
                     continue
                 sessions = store.list_sessions()
                 target = None
-                # Try numeric index
                 try:
                     idx = int(arg) - 1
                     if 0 <= idx < len(sessions):
                         target = sessions[idx]
                 except ValueError:
-                    # Try key match
                     for s in sessions:
                         if s["key"] == arg:
                             target = s
@@ -137,6 +152,15 @@ async def main():
                 if target:
                     session_key = target["key"]
                     history[:] = store.load(session_key)
+
+                    idle_minutes = (time.time() - target["updated_at"].timestamp()) / 60
+                    if history and idle_minutes > 60 and len(history) > 10:
+                        console.print(
+                            f"[dim]  Idle {int(idle_minutes)}m — compressing older history...[/dim]"
+                        )
+                        history[:] = await auto_compact(history, is_idle=True, idle_minutes=idle_minutes)
+                        store.save_all(session_key, history)
+
                     console.print(
                         f"[dim]  Resumed '{session_key}' ({len(history)} messages).[/dim]"
                     )
@@ -147,7 +171,7 @@ async def main():
             if query == "/compact":
                 if history:
                     console.print("[dim]  Compressing...[/dim]")
-                    history[:] = await auto_compact(history)
+                    history[:] = await auto_compact(history, is_idle=False)
                     store.save_all(session_key, history)
                     console.print("[dim]  Done.[/dim]")
                 continue
@@ -192,7 +216,7 @@ async def main():
             print()
 
     finally:
-        if len(history) >= 4:
+        if len(history) >= 10:
             console.print("[dim]  Consolidating memory...[/dim]")
             try:
                 await consolidate_memory(history)

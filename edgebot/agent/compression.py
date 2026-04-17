@@ -8,6 +8,7 @@ import time
 import litellm
 
 from edgebot.config import API_BASE, API_KEY, MODEL, TRANSCRIPT_DIR
+from edgebot.session.store import find_legal_start
 
 
 def estimate_tokens(messages: list) -> int:
@@ -24,22 +25,49 @@ def microcompact(messages: list):
             msg["content"] = "[cleared]"
 
 
-async def auto_compact(messages: list) -> list:
-    """Summarize the full conversation and replace with a compact seed."""
+async def auto_compact(messages: list, is_idle: bool = False, idle_minutes: int = 0) -> list:
+    """
+    Summarize the prefix of the conversation while keeping the recent suffix intact.
+    If is_idle, prefixes the summary with an idle notification.
+    """
+    if len(messages) <= 10:
+        return messages
+
+    # Safely slice the suffix using find_legal_start to avoid orphans
+    suffix_candidate = messages[-8:]
+    start_idx = find_legal_start(suffix_candidate)
+    suffix = suffix_candidate[start_idx:]
+    
+    # The remainder is the prefix to summarize
+    prefix_len = len(messages) - len(suffix)
+    prefix = messages[:prefix_len]
+    
+    if not prefix:
+        return messages
+
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    conv_text = json.dumps(messages, default=str)[:80000]
+    with open(path, "w", encoding="utf-8") as f:
+        for msg in prefix:
+            f.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
+            
+    conv_text = json.dumps(prefix, ensure_ascii=False, default=str)[:80000]
+    prompt = f"Summarize the earlier parts of this conversation for continuity:\n{conv_text}"
+    
     resp = await litellm.acompletion(
         model=MODEL,
-        messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
+        messages=[{"role": "user", "content": prompt}],
         max_tokens=2000,
         api_key=API_KEY, api_base=API_BASE,
     )
     summary = resp.choices[0].message.content
+    
+    if is_idle:
+        system_msg = f"[System: User was idle for {int(idle_minutes)} minutes. Previous context summary (log {path.name}):]\n{summary}"
+    else:
+        system_msg = f"[System: Context auto-compressed to save tokens (log {path.name}). Previous summary:]\n{summary}"
+
     return [
-        {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
-        {"role": "assistant", "content": "Understood. Continuing with summary context."},
-    ]
+        {"role": "user", "content": system_msg},
+        {"role": "assistant", "content": "Understood. We will continue from the retained recent messages seamlessly."},
+    ] + suffix

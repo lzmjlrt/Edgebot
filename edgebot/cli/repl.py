@@ -21,7 +21,7 @@ from edgebot.agent.memory import consolidate_memory
 from edgebot.config import MCP_CONFIG_PATH, MODEL, SESSION_DIR
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
-from edgebot.tools.registry import BG, BUS, SKILLS, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
+from edgebot.tools.registry import BG, BUS, SKILLS, SUBAGENT, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
 
 console = Console()
 
@@ -47,6 +47,7 @@ _HELP_TEXT = """\
   /memory         Run memory consolidation now
   /tasks          Show task board
   /team           List teammates
+  /subagents      List one-shot subagents
   /inbox          Read inbox
   /status         Show current session info
   /help           Show this help
@@ -193,6 +194,14 @@ async def main():
 
             if query == "/team":
                 console.print(TEAM.list_all())
+                continue
+
+            if query == "/subagents":
+                sa = SUBAGENT.list_all()
+                if not sa:
+                    console.print("[dim]  No subagents.[/dim]")
+                else:
+                    console.print(json.dumps(sa, indent=2))
                 continue
 
             if query == "/inbox":

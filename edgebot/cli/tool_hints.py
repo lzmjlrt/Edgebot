@@ -45,6 +45,12 @@ def format_tool_hint(name: str, args: dict) -> str:
     if name == "check_background":
         tid = args.get("task_id")
         return f"bg check{(' ' + tid) if tid else ''}"
+    if name == "spawn_subagent":
+        return f"subagent+ [{args.get('capability','?')}] {_trunc(args.get('prompt',''), 50)}"
+    if name == "check_subagent":
+        return f"subagent? {args.get('task_id','?')}"
+    if name == "list_subagents":
+        return "subagents (list)"
     if name == "spawn_teammate":
         return f"spawn {args.get('name', '?')} ({args.get('role', '?')})"
     if name == "list_teammates":

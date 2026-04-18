@@ -72,6 +72,7 @@ from edgebot.agent.subagent import run_subagent
 from edgebot.background.manager import BackgroundManager
 from edgebot.config import SKILLS_DIR, VALID_MSG_TYPES
 from edgebot.skills.loader import SkillLoader
+from edgebot.subagent.runner import SubagentRunner
 from edgebot.tasks.manager import TaskManager
 from edgebot.tasks.todo import TodoManager
 from edgebot.team.bus import MessageBus
@@ -101,6 +102,7 @@ TASK_MGR = TaskManager()
 BG = BackgroundManager()
 BUS = MessageBus()
 TEAM = TeammateManager(BUS, TASK_MGR)
+SUBAGENT = SubagentRunner()
 
 # ---------------------------------------------------------------------------
 # Tool handler dispatch
@@ -133,6 +135,10 @@ TOOL_HANDLERS = {
                             kw["request_id"], kw["approve"], kw.get("feedback", ""), BUS),
     "idle":             lambda **kw: "Lead does not idle.",
     "claim_task":       lambda **kw: TASK_MGR.claim(kw["task_id"], "lead"),
+    "spawn_subagent":   lambda **kw: json.dumps(SUBAGENT.spawn(
+                            kw["capability"], kw["prompt"], kw.get("name", ""))),
+    "check_subagent":   lambda **kw: json.dumps(SUBAGENT.status(kw["task_id"]), indent=2),
+    "list_subagents":   lambda **kw: json.dumps(SUBAGENT.list_all(), indent=2),
 }
 
 # ---------------------------------------------------------------------------
@@ -193,4 +199,24 @@ TOOLS = [
                {"type": "object", "properties": {}}),
     _make_tool("claim_task", "Claim a task from the board.",
                {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}),
+    _make_tool("spawn_subagent",
+               "Spawn a one-shot subagent for a focused task. Returns a task_id immediately; "
+               "poll with check_subagent to retrieve the result. "
+               "Capabilities: explore (read-only investigation), builder (implement changes), "
+               "reviewer (structured code review).",
+               {"type": "object",
+                "properties": {
+                    "capability": {"type": "string",
+                                   "enum": ["explore", "builder", "reviewer"]},
+                    "prompt": {"type": "string",
+                               "description": "Self-contained task description."},
+                    "name": {"type": "string",
+                             "description": "Optional human-readable id."}},
+                "required": ["capability", "prompt"]}),
+    _make_tool("check_subagent", "Check a subagent's status/result by task_id.",
+               {"type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"]}),
+    _make_tool("list_subagents", "List all subagents in this session.",
+               {"type": "object", "properties": {}}),
 ]

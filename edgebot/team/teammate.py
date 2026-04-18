@@ -23,6 +23,8 @@ def _tool(name: str, description: str, parameters: dict) -> dict:
 
 
 class TeammateManager:
+    _save_lock = threading.Lock()
+
     def __init__(self, bus: MessageBus, task_mgr: TaskManager):
         TEAM_DIR.mkdir(exist_ok=True)
         self.bus = bus
@@ -37,7 +39,10 @@ class TeammateManager:
         return {"team_name": "default", "members": []}
 
     def _save(self):
-        self.config_path.write_text(json.dumps(self.config, indent=2))
+        with self._save_lock:
+            tmp = self.config_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.config, indent=2))
+            tmp.replace(self.config_path)
 
     def _find(self, name: str) -> dict:
         for m in self.config["members"]:
@@ -103,16 +108,26 @@ class TeammateManager:
                         self._set_status(name, "shutdown")
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
-                try:
-                    call_messages = [{"role": "system", "content": sys_prompt}] + messages
-                    response = await litellm.acompletion(
-                        model=MODEL, messages=call_messages,
-                        tools=tools, max_tokens=8000,
-                        api_key=API_KEY, api_base=API_BASE,
-                    )
-                except Exception:
-                    self._set_status(name, "shutdown")
-                    return
+                call_messages = [{"role": "system", "content": sys_prompt}] + messages
+                response = None
+                for attempt in range(3):
+                    try:
+                        response = await asyncio.wait_for(
+                            litellm.acompletion(
+                                model=MODEL, messages=call_messages,
+                                tools=tools, max_tokens=8000,
+                                api_key=API_KEY, api_base=API_BASE,
+                            ),
+                            timeout=120,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            print(f"  [{name}] API failed after 3 attempts: {e}")
+                            self._set_status(name, "shutdown")
+                            return
+                        print(f"  [{name}] API attempt {attempt + 1} failed: {e}; retrying...")
+                        await asyncio.sleep(2 ** attempt)
                 choice = response.choices[0]
                 # Store assistant message
                 asst_msg = {"role": "assistant", "content": choice.message.content}

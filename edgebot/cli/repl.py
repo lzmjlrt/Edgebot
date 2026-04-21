@@ -17,7 +17,7 @@ from rich.console import Console
 from edgebot.agent.compression import auto_compact
 from edgebot.agent.context import build_system_prompt, seed_workspace_templates
 from edgebot.agent.loop import agent_loop
-from edgebot.agent.memory import consolidate_memory
+from edgebot.agent.memory import cleanup_memory_files_once, consolidate_memory
 from edgebot.config import MCP_CONFIG_PATH, MODEL, SESSION_DIR
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
@@ -54,6 +54,56 @@ _HELP_TEXT = """\
   exit            Quit"""
 
 
+_REPLAY_TAIL = 10  # How many visible turns to replay on /resume
+
+
+def _render_history(history: list[dict]) -> None:
+    """Pretty-print previous conversation after /resume, dimmed with a divider."""
+    def _is_visible(m: dict) -> bool:
+        if m.get("role") not in ("user", "assistant"):
+            return False
+        c = m.get("content")
+        if not isinstance(c, str) or not c.strip():
+            return False
+        skip_prefixes = (
+            "<background-results>",
+            "<inbox>",
+            "<reminder>",
+            "[System: Context auto-compressed",
+            "[System: User was idle",
+        )
+        return not c.startswith(skip_prefixes)
+
+    visible = [m for m in history if _is_visible(m)]
+    if not visible:
+        return
+
+    shown = visible[-_REPLAY_TAIL:]
+    omitted = len(visible) - len(shown)
+
+    console.rule("[dim]session history[/dim]", style="dim")
+    if omitted > 0:
+        console.print(
+            f"[dim italic]  \u2026 {omitted} earlier message(s) hidden \u2026[/dim italic]\n"
+        )
+
+    for msg in shown:
+        body = msg["content"]
+        if len(body) > 2000:
+            body = body[:2000] + f"\n[\u2026 {len(body) - 2000} chars truncated \u2026]"
+        # Escape Rich markup so user content like "[bold]" isn't interpreted.
+        from rich.markup import escape
+        body_esc = escape(body)
+        if msg["role"] == "user":
+            console.print(f"[dim bold]You:[/dim bold] [dim]{body_esc}[/dim]")
+        else:
+            console.print(f"[dim bold cyan]Edgebot:[/dim bold cyan] [dim]{body_esc}[/dim]")
+        console.print()
+
+    console.rule(style="dim")
+    console.print()
+
+
 def _time_ago(dt) -> str:
     delta = time.time() - dt.timestamp()
     if delta < 60:
@@ -68,6 +118,9 @@ def _time_ago(dt) -> str:
 async def main():
     # --- Seed workspace templates (first run) ---
     seed_workspace_templates()
+
+    # --- One-shot dedup cleanup of accumulated memory files ---
+    cleanup_memory_files_once()
 
     # --- Start fresh session (no picker) ---
     store = SessionStore(SESSION_DIR)
@@ -168,6 +221,8 @@ async def main():
                         history[:] = await auto_compact(history, is_idle=True, idle_minutes=idle_minutes)
                         store.save_all(session_key, history)
 
+                    if history:
+                        _render_history(history)
                     console.print(
                         f"[dim]  Resumed '{session_key}' ({len(history)} messages).[/dim]"
                     )

@@ -7,12 +7,16 @@ import json
 import threading
 
 import litellm
+from rich.console import Console
 
+from edgebot.cli.tool_hints import format_tool_hint
 from edgebot.config import API_BASE, API_KEY, IDLE_TIMEOUT, MODEL, POLL_INTERVAL, TASKS_DIR, TEAM_DIR
 from edgebot.tasks.manager import TaskManager
 from edgebot.team.bus import MessageBus
 from edgebot.tools.filesystem import run_edit, run_read, run_write
 from edgebot.tools.shell import run_bash
+
+_console = Console()
 
 
 def _tool(name: str, description: str, parameters: dict) -> dict:
@@ -35,13 +39,13 @@ class TeammateManager:
 
     def _load(self) -> dict:
         if self.config_path.exists():
-            return json.loads(self.config_path.read_text())
+            return json.loads(self.config_path.read_text(encoding="utf-8"))
         return {"team_name": "default", "members": []}
 
     def _save(self):
         with self._save_lock:
             tmp = self.config_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.config, indent=2))
+            tmp.write_text(json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.config_path)
 
     def _find(self, name: str) -> dict:
@@ -159,7 +163,16 @@ class TeammateManager:
                             "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
                         }
                         output = dispatch.get(fn_name, lambda **kw: "Unknown")(**args)
-                    print(f"  [{name}] {fn_name}: {str(output)[:120]}")
+                    # Render a short dim hint in the REPL; errors bubble up in red.
+                    # Full tool outputs are NOT printed — they'd flood the user's screen.
+                    out_str = str(output)
+                    if out_str.startswith("Error"):
+                        _console.print(
+                            f"[dim red]  [bg {name}] {fn_name} ERROR: {out_str[:120]}[/dim red]"
+                        )
+                    else:
+                        hint = format_tool_hint(fn_name, args)
+                        _console.print(f"[grey50]  [bg {name}] \u21b3 {hint}[/grey50]")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -184,7 +197,7 @@ class TeammateManager:
                     break
                 unclaimed = []
                 for f in sorted(TASKS_DIR.glob("task_*.json")):
-                    t = json.loads(f.read_text())
+                    t = json.loads(f.read_text(encoding="utf-8"))
                     if t.get("status") == "pending" and not t.get("owner") and not t.get("blockedBy"):
                         unclaimed.append(t)
                 if unclaimed:

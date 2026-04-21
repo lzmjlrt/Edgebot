@@ -45,6 +45,10 @@ def format_tool_hint(name: str, args: dict) -> str:
     if name == "check_background":
         tid = args.get("task_id")
         return f"bg check{(' ' + tid) if tid else ''}"
+    if name == "web_fetch":
+        return f"fetch {_trunc(args.get('url', ''), 60)}"
+    if name == "web_search":
+        return f"search: {_trunc(args.get('query', ''), 50)}"
     if name == "spawn_subagent":
         return f"subagent+ [{args.get('capability','?')}] {_trunc(args.get('prompt',''), 50)}"
     if name == "check_subagent":

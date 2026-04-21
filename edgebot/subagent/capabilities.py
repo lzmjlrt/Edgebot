@@ -7,6 +7,7 @@ which tools are injected into the LLM's tool list, not by runtime checks.
 
 from edgebot.tools.filesystem import run_edit, run_read, run_write
 from edgebot.tools.shell import run_bash
+from edgebot.tools.web import run_web_fetch, run_web_search
 
 
 def _tool(name: str, description: str, parameters: dict) -> dict:
@@ -39,10 +40,24 @@ _EDIT_SCHEMA = _tool(
      "required": ["path", "old_text", "new_text"]},
 )
 
-_READ_TOOLS = [_READ_SCHEMA, _BASH_SCHEMA]
+_WEB_FETCH_SCHEMA = _tool(
+    "web_fetch", "Fetch a URL and return its visible text (SSRF-filtered; ~50KB cap).",
+    {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+)
+_WEB_SEARCH_SCHEMA = _tool(
+    "web_search", "Search the web (title/url/snippet). Tavily/SerpAPI via env, else DuckDuckGo.",
+    {"type": "object",
+     "properties": {"query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 5}},
+     "required": ["query"]},
+)
+
+_READ_TOOLS = [_READ_SCHEMA, _BASH_SCHEMA, _WEB_FETCH_SCHEMA, _WEB_SEARCH_SCHEMA]
 _READ_HANDLERS = {
-    "read_file": lambda **kw: run_read(kw["path"]),
-    "bash":      lambda **kw: run_bash(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"]),
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "web_fetch":  lambda **kw: run_web_fetch(kw["url"]),
+    "web_search": lambda **kw: run_web_search(kw["query"], kw.get("max_results", 5)),
 }
 
 _FULL_TOOLS = _READ_TOOLS + [_WRITE_SCHEMA, _EDIT_SCHEMA]

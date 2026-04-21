@@ -41,6 +41,8 @@ REJECT AGGRESSIVELY:
 - Code patterns or facts derivable from reading the codebase
 - Anything already in USER.md / SOUL.md / MEMORY.md (even paraphrased)
 - Assistant's own behavior unless user EXPLICITLY corrected it
+- Any key-value fact (e.g. "Technical Level: expert") whose key already has a value
+  in USER.md — even if the value differs. Upsert is handled by code; don't re-emit
 
 Category rules:
 [USER]   Only identity/preferences/habits the user stated with emphasis
@@ -182,6 +184,82 @@ def _parse_phase2(output: str) -> list[dict]:
     return edits
 
 
+def _normalize_line(line: str) -> str:
+    """Normalize a bullet line for duplicate detection."""
+    s = line.strip().lstrip("-*").strip()
+    s = re.sub(r"\*\*|__|\*|_", "", s)
+    s = re.sub(r"\s+", " ", s).lower()
+    return s
+
+
+_KV_RE = re.compile(r"^[\s\-*]*\*?\*?([A-Za-z][A-Za-z \w/]*?)\*?\*?\s*:\s*(.+)$")
+
+
+def _parse_kv(text: str) -> tuple[dict, list[str]]:
+    """
+    Split *text* into key/value upserts (`Language: Chinese`) and everything else
+    (headers, blanks, free prose). Returns ({normalized_key: original_line}, non_kv_lines_in_order).
+    """
+    kvs: dict[str, str] = {}
+    rest: list[str] = []
+    for line in text.splitlines():
+        m = _KV_RE.match(line.strip())
+        if m and m.group(2).strip():
+            key = _normalize_line(m.group(1))
+            # Real values always win over placeholder-only values like "(your name)".
+            is_placeholder = m.group(2).strip().startswith("(")
+            existing = kvs.get(key)
+            if existing is None or not is_placeholder:
+                # Latest real value wins; placeholders never overwrite an existing entry.
+                kvs[key] = line.rstrip()
+        else:
+            rest.append(line.rstrip())
+    return kvs, rest
+
+
+def _apply_user_upsert(path, new_block: str) -> bool:
+    """
+    For USER.md: treat '- Key: value' lines as upserts; preserve non-KV content.
+    Returns True if the file was rewritten.
+    """
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    old_kvs, old_rest = _parse_kv(existing)
+    new_kvs, _ = _parse_kv(new_block)
+    if not new_kvs:
+        return False
+    merged = {**old_kvs, **new_kvs}  # new overrides
+    rebuilt = "\n".join(old_rest).rstrip() + "\n\n" + "\n".join(merged.values()) + "\n"
+    if rebuilt == existing:
+        return False
+    path.write_text(rebuilt, encoding="utf-8")
+    return True
+
+
+def _apply_line_dedup_append(path, new_block: str) -> bool:
+    """For SOUL.md / MEMORY.md: append only lines not already present."""
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    existing_norm = {n for n in (_normalize_line(l) for l in existing.splitlines()) if n}
+    kept: list[str] = []
+    for raw in new_block.splitlines():
+        n = _normalize_line(raw)
+        if not n:
+            kept.append(raw)
+            continue
+        if n in existing_norm:
+            continue
+        existing_norm.add(n)
+        kept.append(raw)
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    if not kept:
+        return False
+    new_content = existing.rstrip() + "\n\n" + "\n".join(kept) + "\n"
+    path.write_text(new_content, encoding="utf-8")
+    return True
+
+
 def _apply_edits(edits: list[dict]) -> set[str]:
     """Apply parsed edits to workspace files. Returns the set of file names updated."""
     file_map = {
@@ -192,17 +270,60 @@ def _apply_edits(edits: list[dict]) -> set[str]:
     updated: set[str] = set()
     for edit in edits:
         path = file_map.get(edit["file"])
-        if not path:
+        if not path or edit["action"] != "append":
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        if edit["action"] == "append":
-            existing = _read_file(path)
-            if existing == "(empty)":
-                existing = ""
-            new_content = existing.rstrip() + "\n\n" + edit["content"] + "\n"
-            path.write_text(new_content, encoding="utf-8")
+        if edit["file"] == "USER.md":
+            changed = _apply_user_upsert(path, edit["content"])
+        else:
+            changed = _apply_line_dedup_append(path, edit["content"])
+        if changed:
             updated.add(edit["file"])
     return updated
+
+
+def cleanup_memory_files_once() -> None:
+    """
+    One-shot cleanup for existing USER.md/SOUL.md/MEMORY.md accumulated duplicates.
+    Leaves a marker so it runs at most once per workspace.
+    """
+    marker = WORKDIR / ".memory_cleaned"
+    if marker.exists():
+        return
+    results: list[str] = []
+    for fname, path in (
+        ("USER.md",   WORKDIR / "USER.md"),
+        ("SOUL.md",   WORKDIR / "SOUL.md"),
+        ("MEMORY.md", MEMORY_FILE),
+    ):
+        if not path.exists():
+            continue
+        original = path.read_text(encoding="utf-8")
+        if fname == "USER.md":
+            kvs, rest = _parse_kv(original)
+            rebuilt = "\n".join(rest).rstrip() + ("\n\n" + "\n".join(kvs.values()) if kvs else "") + "\n"
+        else:
+            seen: set[str] = set()
+            kept: list[str] = []
+            for line in original.splitlines():
+                n = _normalize_line(line)
+                if n and n in seen:
+                    continue
+                if n:
+                    seen.add(n)
+                kept.append(line)
+            rebuilt = "\n".join(kept).rstrip() + "\n"
+        if rebuilt != original:
+            path.write_text(rebuilt, encoding="utf-8")
+            results.append(fname)
+    try:
+        marker.write_text("cleaned\n", encoding="utf-8")
+    except Exception:
+        pass
+    if results:
+        _console.print(
+            f"[dim]  [memory] cleaned duplicates in {', '.join(results)}[/dim]"
+        )
 
 
 async def consolidate_memory(messages: list[dict]) -> None:

@@ -28,7 +28,7 @@ def run_write(path: str, content: str) -> str:
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
-        c = fp.read_text()
+        c = fp.read_text(encoding="utf-8")
         if old_text not in c:
             return f"Error: Text not found in {path}"
         fp.write_text(c.replace(old_text, new_text, 1),encoding="utf-8")

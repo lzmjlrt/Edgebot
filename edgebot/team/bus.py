@@ -28,8 +28,8 @@ class MessageBus:
         }
         if extra:
             msg.update(extra)
-        with open(INBOX_DIR / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with open(INBOX_DIR / f"{to}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
@@ -43,7 +43,7 @@ class MessageBus:
         except FileNotFoundError:
             return []
         try:
-            lines = tmp.read_text().strip().splitlines()
+            lines = tmp.read_text(encoding="utf-8").strip().splitlines()
             msgs = []
             for l in lines:
                 if not l:

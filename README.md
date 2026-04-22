@@ -3,6 +3,8 @@
   <img width="648" height="187" alt="image" src="https://github.com/user-attachments/assets/811c787b-ccf4-45df-8645-0526fd3b9be2" />
   <br/>
   <br/>
+  <img width="578" height="161" alt="image" src="https://github.com/user-attachments/assets/9e517ed5-03ec-431d-a241-6548e8e7e2d2" />
+
 
   <p>
     <b>A minimal, modular, and extensible autonomous coding agent framework built with Python.</b>

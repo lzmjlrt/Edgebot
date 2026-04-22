@@ -14,16 +14,17 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
-from edgebot.agent.compression import auto_compact
+from edgebot.agent.compression import auto_compact, extract_session_summary
 from edgebot.agent.context import build_system_prompt, seed_workspace_templates
 from edgebot.agent.loop import agent_loop
-from edgebot.agent.memory import cleanup_memory_files_once, consolidate_memory
+from edgebot.agent.memory import MemoryStore, cleanup_memory_files_once, consolidate_memory
 from edgebot.config import MCP_CONFIG_PATH, MODEL, SESSION_DIR
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
 from edgebot.tools.registry import BG, BUS, SKILLS, SUBAGENT, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
 
 console = Console()
+_MEMORY = MemoryStore(Path.cwd())
 
 _HISTORY_PATH = Path.home() / ".edgebot" / "cli_history"
 _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +129,15 @@ def _time_ago(dt) -> str:
     return f"{int(delta // 86400)}d ago"
 
 
+def _resolve_session_summary(state: dict) -> str | None:
+    """Prefer explicit session metadata, then fall back to compacted history."""
+    metadata = state.get("metadata", {})
+    summary = metadata.get("session_summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    return extract_session_summary(state.get("messages", []))
+
+
 async def main():
     # --- Seed workspace templates (first run) ---
     seed_workspace_templates()
@@ -141,6 +151,7 @@ async def main():
     store = SessionStore(SESSION_DIR)
     session_key = f"session_{int(time.time())}"
     history: list[dict] = []
+    session_summary: str | None = None
 
     # --- MCP initialization (optional) ---
     mcp_client = await load_mcp(MCP_CONFIG_PATH)
@@ -150,8 +161,6 @@ async def main():
         all_tools.extend(mcp_client.tool_schemas)
         all_handlers.update(mcp_client.tool_handlers)
         _render_mcp_startup(mcp_client)
-
-    system = build_system_prompt(SKILLS.descriptions())
 
     # --- Welcome banner ---
     _LOGO = r"""
@@ -186,6 +195,7 @@ async def main():
                 console.print(f"[dim]  Session : {session_key}[/dim]")
                 console.print(f"[dim]  Messages: {len(history)}[/dim]")
                 console.print(f"[dim]  Model   : {MODEL}[/dim]")
+                console.print(f"[dim]  Summary : {'yes' if session_summary else 'none'}[/dim]")
                 if mcp_client and mcp_client.connected_servers:
                     console.print(
                         f"[dim]  MCP     : {len(mcp_client.connected_servers)} server(s), "
@@ -207,6 +217,7 @@ async def main():
             if query == "/new":
                 session_key = f"session_{int(time.time())}"
                 history.clear()
+                session_summary = None
                 console.print("[dim]  New session started.[/dim]")
                 continue
 
@@ -242,18 +253,29 @@ async def main():
                             break
                 if target:
                     session_key = target["key"]
-                    history[:] = store.load(session_key)
+                    state = store.load_state(session_key)
+                    history[:] = state["messages"]
+                    session_summary = _resolve_session_summary(state)
 
                     idle_minutes = (time.time() - target["updated_at"].timestamp()) / 60
                     if history and idle_minutes > 60 and len(history) > 10:
                         console.print(
                             f"[dim]  Idle {int(idle_minutes)}m — compressing older history...[/dim]"
                         )
-                        history[:] = await auto_compact(history, is_idle=True, idle_minutes=idle_minutes)
+                        history[:] = await auto_compact(
+                            history,
+                            is_idle=True,
+                            idle_minutes=idle_minutes,
+                            memory_store=_MEMORY,
+                        )
                         store.save_all(session_key, history)
+                        session_summary = extract_session_summary(history)
+                        store.update_metadata(session_key, session_summary=session_summary or "")
 
                     if history:
                         _render_history(history)
+                    if session_summary:
+                        console.print("[dim]  Resume summary loaded into runtime context.[/dim]")
                     console.print(
                         f"[dim]  Resumed '{session_key}' ({len(history)} messages).[/dim]"
                     )
@@ -264,14 +286,16 @@ async def main():
             if query == "/compact":
                 if history:
                     console.print("[dim]  Compressing...[/dim]")
-                    history[:] = await auto_compact(history, is_idle=False)
+                    history[:] = await auto_compact(history, is_idle=False, memory_store=_MEMORY)
                     store.save_all(session_key, history)
+                    session_summary = extract_session_summary(history)
+                    store.update_metadata(session_key, session_summary=session_summary or "")
                     console.print("[dim]  Done.[/dim]")
                 continue
 
             if query == "/memory":
                 console.print("[dim]  Running memory consolidation...[/dim]")
-                await consolidate_memory(history)
+                await consolidate_memory(history, store=_MEMORY)
                 continue
 
             if query == "/tasks":
@@ -300,8 +324,10 @@ async def main():
 
             # ---- Normal message ----
             user_msg = {"role": "user", "content": query}
+            store.update_metadata(session_key, pending_user_turn=True)
             history.append(user_msg)
             store.append(session_key, user_msg)
+            system = build_system_prompt()
 
             await agent_loop(
                 messages=history,
@@ -313,6 +339,9 @@ async def main():
                 bus=BUS,
                 session_store=store,
                 session_key=session_key,
+                channel="cli",
+                chat_id="direct",
+                session_summary=session_summary,
             )
             print()
 
@@ -320,7 +349,7 @@ async def main():
         if len(history) >= 10:
             console.print("[dim]  Consolidating memory...[/dim]")
             try:
-                await consolidate_memory(history)
+                await consolidate_memory(history, store=_MEMORY)
             except Exception:
                 pass
         if mcp_client:

@@ -92,9 +92,12 @@ class MCPClient:
         self.tool_schemas: list[dict[str, Any]] = []
         self.tool_handlers: dict[str, Any] = {}
         self.connected_servers: list[str] = []
+        self.server_capabilities: dict[str, dict[str, list[str]]] = {}
 
     async def start(self) -> None:
         """Connect to all configured MCP servers in parallel."""
+        self.connected_servers = []
+        self.server_capabilities = {}
         tasks = [
             asyncio.create_task(self._connect_single_server(name, cfg))
             for name, cfg in self._servers_config.items()
@@ -112,12 +115,14 @@ class MCPClient:
                 continue
             if result is None:
                 continue
-            self._server_stacks[server_name] = result
+            stack, capability_summary = result
+            self._server_stacks[server_name] = stack
             self.connected_servers.append(server_name)
+            self.server_capabilities[server_name] = capability_summary
 
     async def _connect_single_server(
         self, server_name: str, cfg: MCPServerConfig
-    ) -> AsyncExitStack | None:
+    ) -> tuple[AsyncExitStack, dict[str, list[str]]] | None:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.sse import sse_client
         from mcp.client.stdio import stdio_client
@@ -186,6 +191,11 @@ class MCPClient:
             await session.initialize()
 
             registered_count = 0
+            capability_summary: dict[str, list[str]] = {
+                "tools": [],
+                "resources": [],
+                "prompts": [],
+            }
             tools_result = await session.list_tools()
             enabled_tools = set(cfg.enabled_tools)
             allow_all_tools = "*" in enabled_tools
@@ -221,6 +231,7 @@ class MCPClient:
                     timeout=cfg.tool_timeout,
                 )
                 registered_count += 1
+                capability_summary["tools"].append(wrapped_name)
 
                 if tool_def.name in enabled_tools:
                     matched_enabled_tools.add(tool_def.name)
@@ -262,6 +273,7 @@ class MCPClient:
                         timeout=cfg.tool_timeout,
                     )
                     registered_count += 1
+                    capability_summary["resources"].append(wrapped_name)
             except Exception as exc:
                 print(f"[mcp] Server '{server_name}': resources unavailable: {exc}")
 
@@ -300,11 +312,12 @@ class MCPClient:
                         timeout=cfg.tool_timeout,
                     )
                     registered_count += 1
+                    capability_summary["prompts"].append(wrapped_name)
             except Exception as exc:
                 print(f"[mcp] Server '{server_name}': prompts unavailable: {exc}")
 
             print(f"[mcp] Connected '{server_name}': {registered_count} capabilities")
-            return server_stack
+            return server_stack, capability_summary
         except Exception as exc:
             hint = self._build_error_hint(exc)
             print(f"[mcp] Failed to connect '{server_name}': {exc}{hint}")
@@ -424,3 +437,61 @@ class MCPClient:
             except Exception:
                 pass
         self._server_stacks.clear()
+        self.connected_servers = []
+        self.server_capabilities = {}
+
+    def startup_summary_lines(self) -> list[str]:
+        """Return concise startup summary lines for connected servers."""
+        if not self.connected_servers:
+            return ["[mcp] no MCP servers connected"]
+
+        lines: list[str] = []
+        for server_name in self.connected_servers:
+            caps = self.server_capabilities.get(
+                server_name,
+                {"tools": [], "resources": [], "prompts": []},
+            )
+            tool_count = len(caps.get("tools", []))
+            resource_count = len(caps.get("resources", []))
+            prompt_count = len(caps.get("prompts", []))
+            total = tool_count + resource_count + prompt_count
+            lines.append(
+                f"[mcp] {server_name}: {total} capabilities "
+                f"({tool_count} tools, {resource_count} resources, {prompt_count} prompts)"
+            )
+        return lines
+
+    def detailed_summary_lines(self) -> list[str]:
+        """Return detailed summary lines including capability names."""
+        lines = self.startup_summary_lines()
+        if not self.connected_servers:
+            return lines
+
+        detailed: list[str] = list(lines)
+        for server_name in self.connected_servers:
+            caps = self.server_capabilities.get(
+                server_name,
+                {"tools": [], "resources": [], "prompts": []},
+            )
+            for key, label in (("tools", "tools"), ("resources", "resources"), ("prompts", "prompts")):
+                names = caps.get(key, [])
+                if names:
+                    pretty = ", ".join(self._display_name(name) for name in names)
+                    detailed.append(f"      {label}: {pretty}")
+        return detailed
+
+    @staticmethod
+    def _display_name(wrapped_name: str) -> str:
+        if not wrapped_name.startswith("mcp_"):
+            return wrapped_name
+        rest = wrapped_name[4:]
+        if "_resource_" in rest:
+            server, name = rest.split("_resource_", 1)
+            return f"{server}::resource::{name}"
+        if "_prompt_" in rest:
+            server, name = rest.split("_prompt_", 1)
+            return f"{server}::prompt::{name}"
+        server, _, name = rest.partition("_")
+        if not name:
+            return rest
+        return f"{server}::{name}"

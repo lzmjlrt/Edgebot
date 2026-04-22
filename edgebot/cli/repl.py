@@ -45,6 +45,7 @@ _HELP_TEXT = """\
   /resume <#|key> Resume a previous session
   /compact        Compress conversation context
   /memory         Run memory consolidation now
+  /mcp            Show MCP servers and loaded capabilities
   /tasks          Show task board
   /team           List teammates
   /subagents      List one-shot subagents
@@ -55,6 +56,18 @@ _HELP_TEXT = """\
 
 
 _REPLAY_TAIL = 10  # How many visible turns to replay on /resume
+
+
+def _render_mcp_startup(mcp_client) -> None:
+    """Print a concise MCP startup summary."""
+    for line in mcp_client.startup_summary_lines():
+        console.print(f"[dim]{line}[/dim]")
+
+
+def _render_mcp_details(mcp_client) -> None:
+    """Print detailed MCP summary including capability names."""
+    for line in mcp_client.detailed_summary_lines():
+        console.print(f"[dim]{line}[/dim]")
 
 
 def _render_history(history: list[dict]) -> None:
@@ -136,7 +149,7 @@ async def main():
     if mcp_client:
         all_tools.extend(mcp_client.tool_schemas)
         all_handlers.update(mcp_client.tool_handlers)
-        console.print(f"[dim][mcp] {len(mcp_client.tool_schemas)} tools loaded.[/dim]")
+        _render_mcp_startup(mcp_client)
 
     system = build_system_prompt(SKILLS.descriptions())
 
@@ -173,6 +186,22 @@ async def main():
                 console.print(f"[dim]  Session : {session_key}[/dim]")
                 console.print(f"[dim]  Messages: {len(history)}[/dim]")
                 console.print(f"[dim]  Model   : {MODEL}[/dim]")
+                if mcp_client and mcp_client.connected_servers:
+                    console.print(
+                        f"[dim]  MCP     : {len(mcp_client.connected_servers)} server(s), "
+                        f"{len(mcp_client.tool_schemas)} capabilities[/dim]"
+                    )
+                    for line in mcp_client.startup_summary_lines():
+                        console.print(f"[dim]  {line}[/dim]")
+                else:
+                    console.print("[dim]  MCP     : none[/dim]")
+                continue
+
+            if query == "/mcp":
+                if mcp_client and mcp_client.connected_servers:
+                    _render_mcp_details(mcp_client)
+                else:
+                    console.print("[dim]  No MCP servers connected.[/dim]")
                 continue
 
             if query == "/new":

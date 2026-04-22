@@ -10,6 +10,20 @@ def _trunc(s: str, n: int = 60) -> str:
     return s[:n] + "\u2026"
 
 
+def _format_mcp_hint(name: str) -> str:
+    rest = name[4:]
+    if "_resource_" in rest:
+        server, capability = rest.split("_resource_", 1)
+        return f"mcp::{server}::resource::{capability}"
+    if "_prompt_" in rest:
+        server, capability = rest.split("_prompt_", 1)
+        return f"mcp::{server}::prompt::{capability}"
+    server, _, capability = rest.partition("_")
+    if capability:
+        return f"mcp::{server}::{capability}"
+    return f"mcp::{rest}"
+
+
 def format_tool_hint(name: str, args: dict) -> str:
     """Produce a short, readable description of a tool call."""
     if name == "bash":
@@ -74,6 +88,5 @@ def format_tool_hint(name: str, args: dict) -> str:
     if name == "idle":
         return "idle"
     if name.startswith("mcp_"):
-        # Strip the mcp_ prefix for readability
-        return f"mcp::{name[4:]}"
+        return _format_mcp_hint(name)
     return name

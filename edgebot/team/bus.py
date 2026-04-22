@@ -28,16 +28,32 @@ class MessageBus:
         }
         if extra:
             msg.update(extra)
-        with open(INBOX_DIR / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with open(INBOX_DIR / f"{to}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
         path = INBOX_DIR / f"{name}.jsonl"
         if not path.exists():
             return []
-        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
-        path.write_text("")
+        # Atomic drain: rename the file aside so concurrent send() opens a fresh one.
+        tmp = INBOX_DIR / f"{name}.jsonl.reading.{int(time.time() * 1000)}"
+        try:
+            path.rename(tmp)
+        except FileNotFoundError:
+            return []
+        try:
+            lines = tmp.read_text(encoding="utf-8").strip().splitlines()
+            msgs = []
+            for l in lines:
+                if not l:
+                    continue
+                try:
+                    msgs.append(json.loads(l))
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            tmp.unlink(missing_ok=True)
         return msgs
 
     def broadcast(self, sender: str, content: str, names: list) -> str:

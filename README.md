@@ -156,15 +156,18 @@ Edgebot ships with **22 powerful tools** categorized logically:
 
 ### 🔌 Model Context Protocol (MCP) Support
 
-Edgebot natively bridges with external MCP servers. A default configuration template `mcp_servers.json` drops directly into your workspace. 
+Edgebot natively bridges with external MCP servers. A default configuration template `mcp_servers.json` drops directly into your workspace. Use `mcpServers` as the canonical key (legacy `servers` is also accepted for compatibility).
 
 ```json
 {
   "mcpServers": {
     "everything": {
+      "type": "stdio",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-everything"],
-      "env": {}
+      "env": {},
+      "toolTimeout": 30,
+      "enabledTools": ["*"]
     }
   }
 }

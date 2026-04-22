@@ -14,16 +14,17 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
-from edgebot.agent.compression import auto_compact
+from edgebot.agent.compression import auto_compact, extract_session_summary
 from edgebot.agent.context import build_system_prompt, seed_workspace_templates
 from edgebot.agent.loop import agent_loop
-from edgebot.agent.memory import consolidate_memory
+from edgebot.agent.memory import MemoryStore, cleanup_memory_files_once, consolidate_memory
 from edgebot.config import MCP_CONFIG_PATH, MODEL, SESSION_DIR
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
-from edgebot.tools.registry import BG, BUS, SKILLS, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
+from edgebot.tools.registry import BG, BUS, SKILLS, SUBAGENT, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
 
 console = Console()
+_MEMORY = MemoryStore(Path.cwd())
 
 _HISTORY_PATH = Path.home() / ".edgebot" / "cli_history"
 _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -45,12 +46,76 @@ _HELP_TEXT = """\
   /resume <#|key> Resume a previous session
   /compact        Compress conversation context
   /memory         Run memory consolidation now
+  /mcp            Show MCP servers and loaded capabilities
   /tasks          Show task board
   /team           List teammates
+  /subagents      List one-shot subagents
   /inbox          Read inbox
   /status         Show current session info
   /help           Show this help
   exit            Quit"""
+
+
+_REPLAY_TAIL = 10  # How many visible turns to replay on /resume
+
+
+def _render_mcp_startup(mcp_client) -> None:
+    """Print a concise MCP startup summary."""
+    for line in mcp_client.startup_summary_lines():
+        console.print(f"[dim]{line}[/dim]")
+
+
+def _render_mcp_details(mcp_client) -> None:
+    """Print detailed MCP summary including capability names."""
+    for line in mcp_client.detailed_summary_lines():
+        console.print(f"[dim]{line}[/dim]")
+
+
+def _render_history(history: list[dict]) -> None:
+    """Pretty-print previous conversation after /resume, dimmed with a divider."""
+    def _is_visible(m: dict) -> bool:
+        if m.get("role") not in ("user", "assistant"):
+            return False
+        c = m.get("content")
+        if not isinstance(c, str) or not c.strip():
+            return False
+        skip_prefixes = (
+            "<background-results>",
+            "<inbox>",
+            "<reminder>",
+            "[System: Context auto-compressed",
+            "[System: User was idle",
+        )
+        return not c.startswith(skip_prefixes)
+
+    visible = [m for m in history if _is_visible(m)]
+    if not visible:
+        return
+
+    shown = visible[-_REPLAY_TAIL:]
+    omitted = len(visible) - len(shown)
+
+    console.rule("[dim]session history[/dim]", style="dim")
+    if omitted > 0:
+        console.print(
+            f"[dim italic]  \u2026 {omitted} earlier message(s) hidden \u2026[/dim italic]\n"
+        )
+
+    for msg in shown:
+        body = msg["content"]
+        if len(body) > 2000:
+            body = body[:2000] + f"\n[\u2026 {len(body) - 2000} chars truncated \u2026]"
+        # Escape Rich markup so user content like "[bold]" isn't interpreted.
+        from rich.markup import escape
+        body_esc = escape(body)
+        if msg["role"] == "user":
+            console.print(f"[dim bold]You:[/dim bold] [dim]{body_esc}[/dim]")
+        else:
+            console.print(f"[dim bold cyan]Edgebot:[/dim bold cyan] [dim]{body_esc}[/dim]")
+        console.print()
+
+    console.rule(style="dim")
+    console.print()
 
 
 def _time_ago(dt) -> str:
@@ -64,14 +129,29 @@ def _time_ago(dt) -> str:
     return f"{int(delta // 86400)}d ago"
 
 
+def _resolve_session_summary(state: dict) -> str | None:
+    """Prefer explicit session metadata, then fall back to compacted history."""
+    metadata = state.get("metadata", {})
+    summary = metadata.get("session_summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    return extract_session_summary(state.get("messages", []))
+
+
 async def main():
     # --- Seed workspace templates (first run) ---
     seed_workspace_templates()
+    # Skill loader is instantiated at import time; refresh after first-run seeding.
+    SKILLS.reload()
+
+    # --- One-shot dedup cleanup of accumulated memory files ---
+    cleanup_memory_files_once()
 
     # --- Start fresh session (no picker) ---
     store = SessionStore(SESSION_DIR)
     session_key = f"session_{int(time.time())}"
     history: list[dict] = []
+    session_summary: str | None = None
 
     # --- MCP initialization (optional) ---
     mcp_client = await load_mcp(MCP_CONFIG_PATH)
@@ -80,9 +160,7 @@ async def main():
     if mcp_client:
         all_tools.extend(mcp_client.tool_schemas)
         all_handlers.update(mcp_client.tool_handlers)
-        console.print(f"[dim][mcp] {len(mcp_client.tool_schemas)} tools loaded.[/dim]")
-
-    system = build_system_prompt(SKILLS.descriptions())
+        _render_mcp_startup(mcp_client)
 
     # --- Welcome banner ---
     _LOGO = r"""
@@ -117,11 +195,29 @@ async def main():
                 console.print(f"[dim]  Session : {session_key}[/dim]")
                 console.print(f"[dim]  Messages: {len(history)}[/dim]")
                 console.print(f"[dim]  Model   : {MODEL}[/dim]")
+                console.print(f"[dim]  Summary : {'yes' if session_summary else 'none'}[/dim]")
+                if mcp_client and mcp_client.connected_servers:
+                    console.print(
+                        f"[dim]  MCP     : {len(mcp_client.connected_servers)} server(s), "
+                        f"{len(mcp_client.tool_schemas)} capabilities[/dim]"
+                    )
+                    for line in mcp_client.startup_summary_lines():
+                        console.print(f"[dim]  {line}[/dim]")
+                else:
+                    console.print("[dim]  MCP     : none[/dim]")
+                continue
+
+            if query == "/mcp":
+                if mcp_client and mcp_client.connected_servers:
+                    _render_mcp_details(mcp_client)
+                else:
+                    console.print("[dim]  No MCP servers connected.[/dim]")
                 continue
 
             if query == "/new":
                 session_key = f"session_{int(time.time())}"
                 history.clear()
+                session_summary = None
                 console.print("[dim]  New session started.[/dim]")
                 continue
 
@@ -157,16 +253,29 @@ async def main():
                             break
                 if target:
                     session_key = target["key"]
-                    history[:] = store.load(session_key)
+                    state = store.load_state(session_key)
+                    history[:] = state["messages"]
+                    session_summary = _resolve_session_summary(state)
 
                     idle_minutes = (time.time() - target["updated_at"].timestamp()) / 60
                     if history and idle_minutes > 60 and len(history) > 10:
                         console.print(
                             f"[dim]  Idle {int(idle_minutes)}m — compressing older history...[/dim]"
                         )
-                        history[:] = await auto_compact(history, is_idle=True, idle_minutes=idle_minutes)
+                        history[:] = await auto_compact(
+                            history,
+                            is_idle=True,
+                            idle_minutes=idle_minutes,
+                            memory_store=_MEMORY,
+                        )
                         store.save_all(session_key, history)
+                        session_summary = extract_session_summary(history)
+                        store.update_metadata(session_key, session_summary=session_summary or "")
 
+                    if history:
+                        _render_history(history)
+                    if session_summary:
+                        console.print("[dim]  Resume summary loaded into runtime context.[/dim]")
                     console.print(
                         f"[dim]  Resumed '{session_key}' ({len(history)} messages).[/dim]"
                     )
@@ -177,14 +286,16 @@ async def main():
             if query == "/compact":
                 if history:
                     console.print("[dim]  Compressing...[/dim]")
-                    history[:] = await auto_compact(history, is_idle=False)
+                    history[:] = await auto_compact(history, is_idle=False, memory_store=_MEMORY)
                     store.save_all(session_key, history)
+                    session_summary = extract_session_summary(history)
+                    store.update_metadata(session_key, session_summary=session_summary or "")
                     console.print("[dim]  Done.[/dim]")
                 continue
 
             if query == "/memory":
                 console.print("[dim]  Running memory consolidation...[/dim]")
-                await consolidate_memory(history)
+                await consolidate_memory(history, store=_MEMORY)
                 continue
 
             if query == "/tasks":
@@ -193,6 +304,14 @@ async def main():
 
             if query == "/team":
                 console.print(TEAM.list_all())
+                continue
+
+            if query == "/subagents":
+                sa = SUBAGENT.list_all()
+                if not sa:
+                    console.print("[dim]  No subagents.[/dim]")
+                else:
+                    console.print(json.dumps(sa, indent=2))
                 continue
 
             if query == "/inbox":
@@ -205,8 +324,10 @@ async def main():
 
             # ---- Normal message ----
             user_msg = {"role": "user", "content": query}
+            store.update_metadata(session_key, pending_user_turn=True)
             history.append(user_msg)
             store.append(session_key, user_msg)
+            system = build_system_prompt()
 
             await agent_loop(
                 messages=history,
@@ -218,6 +339,9 @@ async def main():
                 bus=BUS,
                 session_store=store,
                 session_key=session_key,
+                channel="cli",
+                chat_id="direct",
+                session_summary=session_summary,
             )
             print()
 
@@ -225,7 +349,7 @@ async def main():
         if len(history) >= 10:
             console.print("[dim]  Consolidating memory...[/dim]")
             try:
-                await consolidate_memory(history)
+                await consolidate_memory(history, store=_MEMORY)
             except Exception:
                 pass
         if mcp_client:

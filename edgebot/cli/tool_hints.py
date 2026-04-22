@@ -10,6 +10,20 @@ def _trunc(s: str, n: int = 60) -> str:
     return s[:n] + "\u2026"
 
 
+def _format_mcp_hint(name: str) -> str:
+    rest = name[4:]
+    if "_resource_" in rest:
+        server, capability = rest.split("_resource_", 1)
+        return f"mcp::{server}::resource::{capability}"
+    if "_prompt_" in rest:
+        server, capability = rest.split("_prompt_", 1)
+        return f"mcp::{server}::prompt::{capability}"
+    server, _, capability = rest.partition("_")
+    if capability:
+        return f"mcp::{server}::{capability}"
+    return f"mcp::{rest}"
+
+
 def format_tool_hint(name: str, args: dict) -> str:
     """Produce a short, readable description of a tool call."""
     if name == "bash":
@@ -45,6 +59,16 @@ def format_tool_hint(name: str, args: dict) -> str:
     if name == "check_background":
         tid = args.get("task_id")
         return f"bg check{(' ' + tid) if tid else ''}"
+    if name == "web_fetch":
+        return f"fetch {_trunc(args.get('url', ''), 60)}"
+    if name == "web_search":
+        return f"search: {_trunc(args.get('query', ''), 50)}"
+    if name == "spawn_subagent":
+        return f"subagent+ [{args.get('capability','?')}] {_trunc(args.get('prompt',''), 50)}"
+    if name == "check_subagent":
+        return f"subagent? {args.get('task_id','?')}"
+    if name == "list_subagents":
+        return "subagents (list)"
     if name == "spawn_teammate":
         return f"spawn {args.get('name', '?')} ({args.get('role', '?')})"
     if name == "list_teammates":
@@ -64,6 +88,5 @@ def format_tool_hint(name: str, args: dict) -> str:
     if name == "idle":
         return "idle"
     if name.startswith("mcp_"):
-        # Strip the mcp_ prefix for readability
-        return f"mcp::{name[4:]}"
+        return _format_mcp_hint(name)
     return name

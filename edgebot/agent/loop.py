@@ -9,15 +9,17 @@ import sys
 import litellm
 from rich.console import Console
 
-from edgebot.agent.compression import auto_compact, estimate_tokens, microcompact
-from edgebot.agent.memory import consolidate_memory
+from edgebot.agent.compression import auto_compact, estimate_tokens, extract_session_summary, microcompact
+from edgebot.agent.context import merge_runtime_context_into_messages
+from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.cli.tool_hints import format_tool_hint
-from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD
+from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD, WORKDIR
 
 _console = Console()
 _CONSOLIDATION_INTERVAL = 15
 _MIN_HISTORY_FOR_MEMORY = 10
 _turn_counter = 0
+_MEMORY = MemoryStore(WORKDIR)
 
 
 def _flush_stdin() -> None:
@@ -121,6 +123,9 @@ async def agent_loop(
     bus,
     session_store=None,
     session_key: str = "default",
+    channel: str = "cli",
+    chat_id: str = "direct",
+    session_summary: str | None = None,
 ):
     rounds_without_todo = 0
 
@@ -129,9 +134,13 @@ async def agent_loop(
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             _console.print("[dim]  Auto-compressing context...[/dim]")
-            messages[:] = await auto_compact(messages, is_idle=False)
+            messages[:] = await auto_compact(messages, is_idle=False, memory_store=_MEMORY)
             if session_store:
                 session_store.save_all(session_key, messages)
+                session_store.update_metadata(
+                    session_key,
+                    session_summary=extract_session_summary(messages) or "",
+                )
 
         # s08: drain background notifications
         notifs = bg_mgr.drain()
@@ -155,7 +164,13 @@ async def agent_loop(
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
 
         # ---- Streaming LLM call ----
-        call_messages = [{"role": "system", "content": system}] + messages
+        call_messages = [{"role": "system", "content": system}] + merge_runtime_context_into_messages(
+            messages,
+            channel=channel,
+            chat_id=chat_id,
+            session_key=session_key,
+            session_summary=session_summary,
+        )
         content_text, tool_calls, finish_reason = await _stream_completion(
             call_messages, tools
         )
@@ -169,8 +184,23 @@ async def agent_loop(
         messages.append(asst_msg)
         if session_store:
             session_store.append(session_key, asst_msg)
+            if tool_calls:
+                session_store.update_metadata(
+                    session_key,
+                    runtime_checkpoint={
+                        "assistant_message": asst_msg,
+                        "completed_tool_results": [],
+                        "pending_tool_calls": tool_calls,
+                    },
+                )
 
         if finish_reason != "tool_calls" or not tool_calls:
+            if session_store:
+                session_store.clear_metadata_keys(
+                    session_key,
+                    "pending_user_turn",
+                    "runtime_checkpoint",
+                )
             return
 
         # ---- Tool execution ----
@@ -210,6 +240,23 @@ async def agent_loop(
             messages.append(tool_msg)
             if session_store:
                 session_store.append(session_key, tool_msg)
+                checkpoint_state = session_store.load_state(session_key)
+                checkpoint = checkpoint_state["metadata"].get("runtime_checkpoint", {})
+                completed = list(checkpoint.get("completed_tool_results", []))
+                completed.append(tool_msg)
+                remaining = [
+                    pending
+                    for pending in checkpoint.get("pending_tool_calls", [])
+                    if pending.get("id") != tc["id"]
+                ]
+                session_store.update_metadata(
+                    session_key,
+                    runtime_checkpoint={
+                        "assistant_message": checkpoint.get("assistant_message", asst_msg),
+                        "completed_tool_results": completed,
+                        "pending_tool_calls": remaining,
+                    },
+                )
             if name == "TodoWrite":
                 used_todo = True
 
@@ -224,9 +271,16 @@ async def agent_loop(
         # s06: manual compress
         if manual_compress:
             _console.print("[dim]  Compressing...[/dim]")
-            messages[:] = await auto_compact(messages, is_idle=False)
+            messages[:] = await auto_compact(messages, is_idle=False, memory_store=_MEMORY)
             if session_store:
                 session_store.save_all(session_key, messages)
+                session_store.update_metadata(
+                    session_key,
+                    session_summary=extract_session_summary(messages) or "",
+                )
+
+        if session_store:
+            session_store.clear_metadata_keys(session_key, "runtime_checkpoint")
 
         # Memory consolidation (gated by interval + minimum history)
         global _turn_counter
@@ -237,6 +291,6 @@ async def agent_loop(
         ):
             _turn_counter = 0
             try:
-                await consolidate_memory(messages)
+                await consolidate_memory(messages, store=_MEMORY)
             except Exception as e:
                 _console.print(f"[dim red]  [memory] error: {e}[/dim red]")

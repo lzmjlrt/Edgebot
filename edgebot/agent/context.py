@@ -2,13 +2,23 @@
 edgebot/agent/context.py - System prompt assembly and workspace template seeding.
 """
 
+from __future__ import annotations
+
 import platform
 import shutil
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from edgebot.config import MEMORY_DIR, WORKDIR
+from edgebot.config import SKILLS_DIR, WORKDIR
+from edgebot.agent.memory import MemoryStore
+from edgebot.skills.loader import SkillLoader
 
 BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+_SKILLS = SkillLoader(SKILLS_DIR)
+_MEMORY = MemoryStore(WORKDIR)
+_RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
+_RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
 # Location of shipped templates inside the edgebot package
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
@@ -41,14 +51,17 @@ def seed_workspace_templates() -> None:
         print("[setup] Created mcp_servers.json")
 
 
-def build_system_prompt(skills_descriptions: str) -> str:
+def build_system_prompt(skills_descriptions: str | None = None) -> str:
     """
     Assemble a rich system prompt from identity, workspace files, and skills.
 
     Loading order (separated by ---):
       1. Identity + Runtime info
       2. Bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md from workspace)
-      3. Skills summary
+      3. Long-term memory
+      4. Active always-skills
+      5. Skills summary
+      6. Recent archived history
     """
     parts = []
 
@@ -75,17 +88,95 @@ def build_system_prompt(skills_descriptions: str) -> str:
                 pass
 
     # 3. Long-term memory (memory/MEMORY.md)
-    memory_file = MEMORY_DIR / "MEMORY.md"
-    if memory_file.exists():
-        try:
-            content = memory_file.read_text(encoding="utf-8").strip()
-            if content:
-                parts.append(f"## Long-term Memory\n\n{content}")
-        except Exception:
-            pass
+    memory_context = _MEMORY.get_memory_context()
+    if memory_context:
+        parts.append(memory_context)
 
-    # 4. Skills
-    if skills_descriptions and skills_descriptions != "(no skills)":
-        parts.append(f"## Available Skills\n\n{skills_descriptions}")
+    # 4. Active always-skills
+    _SKILLS.reload()
+    always_skills = _SKILLS.get_always_skills()
+    if always_skills:
+        always_content = _SKILLS.load_skills_for_context(always_skills)
+        if always_content:
+            parts.append(f"## Active Skills\n\n{always_content}")
+
+    # 5. Skills summary
+    summary = skills_descriptions
+    if summary is None:
+        summary = _SKILLS.build_skills_summary(exclude=set(always_skills))
+    if summary and summary != "(no skills)":
+        parts.append(f"## Available Skills\n\n{summary}")
+
+    # 6. Recent archived history that has not yet been folded into MEMORY.md
+    recent_history_entries = _MEMORY.read_unprocessed_history(_MEMORY.get_last_dream_cursor())
+    if recent_history_entries:
+        recent_lines = [
+            f"- [{entry['timestamp']}] {entry['content']}"
+            for entry in recent_history_entries[-12:]
+            if entry.get("content")
+        ]
+        if recent_lines:
+            parts.append("## Recent History\n\n" + "\n".join(recent_lines))
 
     return "\n\n---\n\n".join(parts)
+
+
+def build_runtime_context(
+    *,
+    channel: str = "cli",
+    chat_id: str = "direct",
+    session_key: str | None = None,
+    session_summary: str | None = None,
+) -> str:
+    """Build an untrusted runtime metadata block for the current turn."""
+    lines = [
+        f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Channel: {channel}",
+        f"Chat ID: {chat_id}",
+    ]
+    if session_key:
+        lines.append(f"Session Key: {session_key}")
+    if session_summary:
+        lines += ["", "[Resumed Session]", session_summary]
+    return _RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + _RUNTIME_CONTEXT_END
+
+
+def merge_runtime_context_into_messages(
+    messages: list[dict[str, Any]],
+    *,
+    channel: str = "cli",
+    chat_id: str = "direct",
+    session_key: str | None = None,
+    session_summary: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Inject runtime metadata into the latest user message only.
+
+    Stored session history remains clean; only the LLM request gets the block.
+    """
+    if not messages:
+        return []
+
+    runtime_block = build_runtime_context(
+        channel=channel,
+        chat_id=chat_id,
+        session_key=session_key,
+        session_summary=session_summary,
+    )
+    merged = list(messages)
+
+    for idx in range(len(merged) - 1, -1, -1):
+        message = merged[idx]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        updated = dict(message)
+        if isinstance(content, str):
+            updated["content"] = f"{runtime_block}\n\n{content}"
+        elif isinstance(content, list):
+            updated["content"] = [{"type": "text", "text": runtime_block}] + content
+        else:
+            updated["content"] = f"{runtime_block}\n\n{content}"
+        merged[idx] = updated
+        break
+    return merged

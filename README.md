@@ -3,7 +3,7 @@
   <img width="648" height="187" alt="image" src="https://github.com/user-attachments/assets/811c787b-ccf4-45df-8645-0526fd3b9be2" />
   <br/>
   <br/>
-  <img width="578" height="161" alt="image" src="https://github.com/user-attachments/assets/9e517ed5-03ec-431d-a241-6548e8e7e2d2" />
+ 
 
 
   <p>
@@ -16,7 +16,7 @@
 ⚡️ Delivers multi-agent collaboration, subagent delegation, native MCP support, and robust tool-calling—all right from your terminal without heavy boilerplate frameworks.
 
 > 🐈 Edgebot supports **any LLM provider** out of the box through [LiteLLM](https://github.com/BerriAI/litellm) (OpenAI, Anthropic, DeepSeek, Ollama, etc.). Simply swap an environment variable and you're good to go!
-
+ <img width="578" height="161" alt="image" src="https://github.com/user-attachments/assets/9e517ed5-03ec-431d-a241-6548e8e7e2d2" />
 ## ✨ Key Features
 
 🧰 **22 Built-in Tools**: Execute shells, manipulate file systems (read/write/edit), manage persistent task boards, and run silent background jobs. <br>

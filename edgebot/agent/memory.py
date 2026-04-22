@@ -9,17 +9,17 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 import litellm
 from rich.console import Console
 
-from edgebot.config import API_BASE, API_KEY, MODEL, WORKDIR
+from edgebot.config import API_BASE, API_KEY, MEMORY_DIR, MODEL, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
 
 _console = Console()
 
-MEMORY_DIR = WORKDIR / "memory"
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 HISTORY_FILE = MEMORY_DIR / "history.jsonl"
 CURSOR_FILE = MEMORY_DIR / ".cursor"
@@ -120,13 +120,16 @@ class MemoryStore:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.memory_dir = workspace / "memory"
+        self.memory_dir = MEMORY_DIR
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.cursor_file = self.memory_dir / ".cursor"
         self.dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self.soul_file = workspace / "SOUL.md"
-        self.user_file = workspace / "USER.md"
+        self.soul_file = SOUL_MD_PATH
+        self.user_file = USER_MD_PATH
+        legacy_memory_dir = workspace / "memory"
+        if not self.memory_dir.exists() and legacy_memory_dir.exists():
+            shutil.copytree(legacy_memory_dir, self.memory_dir)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
 
     def read_memory(self) -> str:
@@ -372,8 +375,8 @@ def _apply_line_dedup_append(path, new_block: str) -> bool:
 def _apply_edits(edits: list[dict]) -> set[str]:
     """Apply parsed edits to workspace files. Returns the set of file names updated."""
     file_map = {
-        "USER.md": WORKDIR / "USER.md",
-        "SOUL.md": WORKDIR / "SOUL.md",
+        "USER.md": USER_MD_PATH,
+        "SOUL.md": SOUL_MD_PATH,
         "MEMORY.md": MEMORY_FILE,
     }
     updated: set[str] = set()
@@ -396,13 +399,13 @@ def cleanup_memory_files_once() -> None:
     One-shot cleanup for existing USER.md/SOUL.md/MEMORY.md accumulated duplicates.
     Leaves a marker so it runs at most once per workspace.
     """
-    marker = WORKDIR / ".memory_cleaned"
+    marker = MEMORY_DIR / ".memory_cleaned"
     if marker.exists():
         return
     results: list[str] = []
     for fname, path in (
-        ("USER.md",   WORKDIR / "USER.md"),
-        ("SOUL.md",   WORKDIR / "SOUL.md"),
+        ("USER.md",   USER_MD_PATH),
+        ("SOUL.md",   SOUL_MD_PATH),
         ("MEMORY.md", MEMORY_FILE),
     ):
         if not path.exists():
@@ -453,6 +456,7 @@ class DreamProcessor:
         api_base: str | None = API_BASE,
         max_live_messages: int = _MAX_MESSAGES,
         max_archived_batch: int = _MAX_ARCHIVED_BATCH,
+        emit_output: bool = True,
     ):
         self.store = store
         self.model = model
@@ -460,6 +464,7 @@ class DreamProcessor:
         self.api_base = api_base
         self.max_live_messages = max_live_messages
         self.max_archived_batch = max_archived_batch
+        self.emit_output = emit_output
 
     def _select_archived_batch(self) -> list[dict]:
         entries = self.store.read_unprocessed_history(self.store.get_last_dream_cursor())
@@ -525,7 +530,8 @@ class DreamProcessor:
             )
             return response.choices[0].message.content or ""
         except Exception as exc:
-            _console.print(f"[dim red]  [memory] phase 1 failed: {exc}[/dim red]")
+            if self.emit_output:
+                _console.print(f"[dim red]  [memory] phase 1 failed: {exc}[/dim red]")
             return None
 
     async def _phase2_plan_edits(
@@ -552,7 +558,8 @@ class DreamProcessor:
             )
             return response.choices[0].message.content or ""
         except Exception as exc:
-            _console.print(f"[dim red]  [memory] phase 2 failed: {exc}[/dim red]")
+            if self.emit_output:
+                _console.print(f"[dim red]  [memory] phase 2 failed: {exc}[/dim red]")
             return None
 
     def _advance_cursor(self, archived_batch: list[dict]) -> None:
@@ -621,27 +628,37 @@ class DreamProcessor:
         updated = _apply_edits(edits)
         self._advance_cursor(archived_batch)
         if updated:
-            _console.print(f"[dim]  [memory] updated {', '.join(sorted(updated))}[/dim]")
+            if self.emit_output:
+                _console.print(f"[dim]  [memory] updated {', '.join(sorted(updated))}[/dim]")
             return True
         return False
 
 
-_DREAMS: dict[Path, DreamProcessor] = {}
+_DREAMS: dict[tuple[Path, bool], DreamProcessor] = {}
 
 
-def get_dream_processor(store: MemoryStore | None = None) -> DreamProcessor:
+def get_dream_processor(
+    store: MemoryStore | None = None,
+    *,
+    emit_output: bool = True,
+) -> DreamProcessor:
     """Return a cached DreamProcessor for the given store/workspace."""
     target_store = store or _STORE
-    key = target_store.workspace.resolve()
+    key = (target_store.workspace.resolve(), emit_output)
     processor = _DREAMS.get(key)
     if processor is None:
-        processor = DreamProcessor(target_store)
+        processor = DreamProcessor(target_store, emit_output=emit_output)
         _DREAMS[key] = processor
     return processor
 
 
-async def consolidate_memory(messages: list[dict], store: MemoryStore | None = None) -> bool:
+async def consolidate_memory(
+    messages: list[dict],
+    store: MemoryStore | None = None,
+    *,
+    emit_output: bool = True,
+) -> bool:
     """
     Backward-compatible wrapper around the Dream-like processor.
     """
-    return await get_dream_processor(store).run(messages)
+    return await get_dream_processor(store, emit_output=emit_output).run(messages)

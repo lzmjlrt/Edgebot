@@ -29,6 +29,13 @@ This file documents non-obvious constraints and usage patterns.
 - Use check_background with the returned task_id to poll status
 - Background task notifications are automatically drained each turn
 
+## cron
+
+- Schedules one-shot or recurring agent tasks
+- `add` supports `every_seconds`, `at`, or `cron_expr`
+- Cron expressions require optional dependency `croniter`
+- Jobs are persisted in `.edgebot/cron/jobs.json`
+
 ## task_create / task_update / task_list
 
 - File-backed persistent tasks in .tasks/ directory

@@ -14,6 +14,7 @@ from edgebot.agent.context import merge_runtime_context_into_messages
 from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.cli.tool_hints import format_tool_hint
 from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD, WORKDIR
+from edgebot.tools.registry import set_tool_runtime_context
 
 _console = Console()
 _CONSOLIDATION_INTERVAL = 15
@@ -36,7 +37,7 @@ def _flush_stdin() -> None:
         pass
 
 
-async def _stream_completion(call_messages, tools):
+async def _stream_completion(call_messages, tools, *, emit_output: bool = True, assistant_label: str = "Edgebot"):
     """
     Stream the LLM response. Prints text deltas as they arrive.
     Returns (content_text, tool_calls_list, finish_reason).
@@ -45,8 +46,10 @@ async def _stream_completion(call_messages, tools):
     tool_calls_buf: dict[int, dict] = {}
     finish_reason = "stop"
     first_delta = True
-    status = _console.status("[dim]Edgebot is thinking...[/dim]", spinner="dots")
-    status.start()
+    status = None
+    if emit_output:
+        status = _console.status("[dim]Edgebot is thinking...[/dim]", spinner="dots")
+        status.start()
 
     try:
         stream = await litellm.acompletion(
@@ -70,12 +73,13 @@ async def _stream_completion(call_messages, tools):
             # Text content streams to stdout token-by-token
             text = getattr(delta, "content", None)
             if text:
-                if first_delta:
+                if emit_output and first_delta:
                     status.stop()
-                    _console.print()  # blank line before response
-                    _console.print("[cyan]Edgebot:[/cyan]")
+                    _console.print()
+                    _console.print(f"[cyan]{assistant_label}:[/cyan]")
                     first_delta = False
-                _console.print(text, end="", highlight=False, soft_wrap=True)
+                if emit_output:
+                    _console.print(text, end="", highlight=False, soft_wrap=True)
                 content_parts.append(text)
 
             # Tool call deltas accumulate
@@ -95,11 +99,12 @@ async def _stream_completion(call_messages, tools):
                         buf["arguments"] += fn.arguments
     finally:
         try:
-            status.stop()
+            if status:
+                status.stop()
         except Exception:
             pass
-        if content_parts:
-            _console.print()  # final newline after streamed text
+        if emit_output and content_parts:
+            _console.print()
 
     tool_calls = [
         {
@@ -126,14 +131,19 @@ async def agent_loop(
     channel: str = "cli",
     chat_id: str = "direct",
     session_summary: str | None = None,
+    emit_output: bool = True,
+    assistant_label: str = "Edgebot",
 ):
     rounds_without_todo = 0
+    final_response = ""
 
     while True:
+        set_tool_runtime_context(channel=channel, chat_id=chat_id, session_key=session_key)
         # s06: compression pipeline
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            _console.print("[dim]  Auto-compressing context...[/dim]")
+            if emit_output:
+                _console.print("[dim]  Auto-compressing context...[/dim]")
             messages[:] = await auto_compact(messages, is_idle=False, memory_store=_MEMORY)
             if session_store:
                 session_store.save_all(session_key, messages)
@@ -172,8 +182,9 @@ async def agent_loop(
             session_summary=session_summary,
         )
         content_text, tool_calls, finish_reason = await _stream_completion(
-            call_messages, tools
+            call_messages, tools, emit_output=emit_output, assistant_label=assistant_label
         )
+        final_response = content_text or ""
 
         # Drop any keystrokes the user mashed during generation
         _flush_stdin()
@@ -201,7 +212,7 @@ async def agent_loop(
                     "pending_user_turn",
                     "runtime_checkpoint",
                 )
-            return
+            return final_response
 
         # ---- Tool execution ----
         used_todo = False
@@ -217,7 +228,12 @@ async def agent_loop(
                 manual_compress = True
 
             # Show a short hint line for this tool call
-            _console.print(f"  [dim]\u21b3 {format_tool_hint(name, args)}[/dim]")
+            tool_hint = format_tool_hint(name, args)
+            tool_status = None
+            if emit_output:
+                _console.print(f"  [dim]\u21b3 {tool_hint}[/dim]")
+                tool_status = _console.status(f"[dim]working {tool_hint}[/dim]", spinner="dots")
+                tool_status.start()
 
             handler = tool_handlers.get(name)
             try:
@@ -231,6 +247,12 @@ async def agent_loop(
                         output = result
             except Exception as e:
                 output = f"Error: {e}"
+            finally:
+                try:
+                    if tool_status:
+                        tool_status.stop()
+                except Exception:
+                    pass
 
             tool_msg = {
                 "role": "tool",
@@ -270,7 +292,8 @@ async def agent_loop(
 
         # s06: manual compress
         if manual_compress:
-            _console.print("[dim]  Compressing...[/dim]")
+            if emit_output:
+                _console.print("[dim]  Compressing...[/dim]")
             messages[:] = await auto_compact(messages, is_idle=False, memory_store=_MEMORY)
             if session_store:
                 session_store.save_all(session_key, messages)
@@ -293,4 +316,5 @@ async def agent_loop(
             try:
                 await consolidate_memory(messages, store=_MEMORY)
             except Exception as e:
-                _console.print(f"[dim red]  [memory] error: {e}[/dim red]")
+                if emit_output:
+                    _console.print(f"[dim red]  [memory] error: {e}[/dim red]")

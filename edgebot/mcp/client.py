@@ -1,182 +1,426 @@
 """
 edgebot/mcp/client.py - MCP (Model Context Protocol) client.
 
-Connects to MCP servers via stdio, SSE, or streamableHttp.
-Manages session lifecycle with AsyncExitStack.
-Tool names are prefixed: mcp_{server_name}_{tool_name}
+Connects to MCP servers via stdio, SSE, or streamable HTTP.
+Registers tools, resources, and prompts using OpenAI-compatible schemas.
 """
+
+from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
 from typing import Any
 
+import httpx
 
-def _normalize_schema(schema: Any) -> dict:
-    """
-    Normalize an MCP JSON schema to be OpenAI-compatible.
-    Handles nullable unions, missing properties, etc.
-    """
+from edgebot.mcp.config import MCPServerConfig
+
+
+def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None:
+    """Return the single non-null branch for nullable unions."""
+    if not isinstance(options, list):
+        return None
+
+    non_null: list[dict[str, Any]] = []
+    saw_null = False
+    for option in options:
+        if not isinstance(option, dict):
+            return None
+        if option.get("type") == "null":
+            saw_null = True
+            continue
+        non_null.append(option)
+
+    if saw_null and len(non_null) == 1:
+        return non_null[0], True
+    return None
+
+
+def _normalize_schema(schema: Any) -> dict[str, Any]:
+    """Normalize MCP JSON schema to be OpenAI-compatible."""
     if not isinstance(schema, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
-    result = dict(schema)
+    normalized = dict(schema)
 
-    # Normalize type: ["string", "null"] → {"type": "string", "nullable": true}
-    if isinstance(result.get("type"), list):
-        types = result["type"]
-        non_null = [t for t in types if t != "null"]
-        if non_null:
-            result["type"] = non_null[0] if len(non_null) == 1 else non_null
-        if "null" in types:
-            result["nullable"] = True
+    raw_type = normalized.get("type")
+    if isinstance(raw_type, list):
+        non_null = [item for item in raw_type if item != "null"]
+        if "null" in raw_type and len(non_null) == 1:
+            normalized["type"] = non_null[0]
+            normalized["nullable"] = True
 
-    # Recursively normalize properties
-    if "properties" in result and isinstance(result["properties"], dict):
-        result["properties"] = {
-            k: _normalize_schema(v)
-            for k, v in result["properties"].items()
+    for key in ("oneOf", "anyOf"):
+        nullable_branch = _extract_nullable_branch(normalized.get(key))
+        if nullable_branch is not None:
+            branch, _ = nullable_branch
+            merged = {k: v for k, v in normalized.items() if k != key}
+            merged.update(branch)
+            normalized = merged
+            normalized["nullable"] = True
+            break
+
+    if "properties" in normalized and isinstance(normalized["properties"], dict):
+        normalized["properties"] = {
+            name: _normalize_schema(prop) if isinstance(prop, dict) else prop
+            for name, prop in normalized["properties"].items()
         }
 
-    # Normalize array items
-    if "items" in result:
-        result["items"] = _normalize_schema(result["items"])
+    if "items" in normalized and isinstance(normalized["items"], dict):
+        normalized["items"] = _normalize_schema(normalized["items"])
 
-    # Ensure object type has properties key
-    if result.get("type") == "object" and "properties" not in result:
-        result["properties"] = {}
+    if normalized.get("type") == "object":
+        normalized.setdefault("properties", {})
+        normalized.setdefault("required", [])
 
-    return result
+    return normalized
 
 
 class MCPClient:
     """
-    Manages connections to multiple MCP servers and exposes their tools.
+    Manages connections to multiple MCP servers and exposes their capabilities.
 
-    Usage:
-        client = MCPClient(servers_config)
-        await client.start()
-        # client.tool_schemas  -> list of OpenAI tool dicts
-        # client.tool_handlers -> {prefixed_name: async callable}
-        await client.call("mcp_server_tool", {"arg": "value"})
-        await client.close()
+    Public fields:
+      - tool_schemas: OpenAI tool definitions
+      - tool_handlers: async callables keyed by tool name
+      - connected_servers: server names that connected successfully
     """
 
-    def __init__(self, servers_config: dict):
-        """
-        servers_config: {server_name: {type, command, args, env, url, headers, tool_timeout}}
-        """
+    def __init__(self, servers_config: dict[str, MCPServerConfig]):
         self._servers_config = servers_config
-        self._stack = AsyncExitStack()
-        self._sessions: dict[str, Any] = {}   # server_name → ClientSession
-        self._tool_map: dict[str, tuple[str, str]] = {}  # prefixed_name → (server_name, original_name)
-        self.tool_schemas: list[dict] = []
-        self.tool_handlers: dict = {}
+        self._server_stacks: dict[str, AsyncExitStack] = {}
+        self.tool_schemas: list[dict[str, Any]] = []
+        self.tool_handlers: dict[str, Any] = {}
+        self.connected_servers: list[str] = []
 
     async def start(self) -> None:
-        """Connect to all configured MCP servers and discover their tools."""
-        await self._stack.__aenter__()
-        for server_name, cfg in self._servers_config.items():
-            try:
-                await self._connect_server(server_name, cfg)
-            except Exception as e:
-                print(f"[mcp] Failed to connect '{server_name}': {e}")
+        """Connect to all configured MCP servers in parallel."""
+        tasks = [
+            asyncio.create_task(self._connect_single_server(name, cfg))
+            for name, cfg in self._servers_config.items()
+        ]
+        if not tasks:
+            return
 
-    async def _connect_server(self, server_name: str, cfg: dict) -> None:
-        from mcp import ClientSession
-        from mcp.client.stdio import StdioServerParameters, stdio_client
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        names = list(self._servers_config.keys())
+        for idx, result in enumerate(results):
+            server_name = names[idx]
+            if isinstance(result, BaseException):
+                if not isinstance(result, asyncio.CancelledError):
+                    print(f"[mcp] Failed to connect '{server_name}': {result}")
+                continue
+            if result is None:
+                continue
+            self._server_stacks[server_name] = result
+            self.connected_servers.append(server_name)
 
-        transport_type = cfg.get("type")
+    async def _connect_single_server(
+        self, server_name: str, cfg: MCPServerConfig
+    ) -> AsyncExitStack | None:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.sse import sse_client
+        from mcp.client.stdio import stdio_client
+        from mcp.client.streamable_http import streamable_http_client
 
-        if transport_type == "stdio" or (not cfg.get("url") and cfg.get("command")):
-            # stdio transport
-            params = StdioServerParameters(
-                command=cfg["command"],
-                args=cfg.get("args", []),
-                env=cfg.get("env") or None,
-            )
-            read, write = await self._stack.enter_async_context(stdio_client(params))
+        server_stack = AsyncExitStack()
+        await server_stack.__aenter__()
 
-        elif transport_type == "sse" or (cfg.get("url", "").rstrip("/").endswith("/sse")):
-            # SSE transport
-            from mcp.client.sse import sse_client
-            import httpx
-
-            headers = cfg.get("headers", {})
-            url = cfg["url"]
-            read, write = await self._stack.enter_async_context(
-                sse_client(url, httpx.AsyncClient(headers=headers, timeout=None))
-            )
-
-        else:
-            # streamableHttp transport
-            from mcp.client.streamable_http import streamablehttp_client
-            import httpx
-
-            headers = cfg.get("headers", {})
-            url = cfg["url"]
-            read, write = await self._stack.enter_async_context(
-                streamablehttp_client(url, httpx.AsyncClient(headers=headers, timeout=None))
-            )
-
-        session = await self._stack.enter_async_context(
-            ClientSession(read, write)
-        )
-        await session.initialize()
-        self._sessions[server_name] = session
-
-        # Discover tools
-        tool_timeout = cfg.get("tool_timeout", 30)
-        result = await session.list_tools()
-        for tool in result.tools:
-            prefixed = f"mcp_{server_name}_{tool.name}"
-            self._tool_map[prefixed] = (server_name, tool.name, tool_timeout)
-
-            # Build OpenAI-compatible schema
-            schema = _normalize_schema(
-                tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
-            )
-            self.tool_schemas.append({
-                "type": "function",
-                "function": {
-                    "name": prefixed,
-                    "description": tool.description or "",
-                    "parameters": schema,
-                },
-            })
-
-            # Build async handler (capture variables)
-            def _make_handler(sname: str, tname: str, timeout: int):
-                async def handler(**kwargs):
-                    return await self.call(sname, tname, kwargs, timeout=timeout)
-                return handler
-
-            self.tool_handlers[prefixed] = _make_handler(server_name, tool.name, tool_timeout)
-
-        print(f"[mcp] Connected '{server_name}': {len(result.tools)} tools")
-
-    async def call(self, server_name: str, tool_name: str, arguments: dict, timeout: int = 30) -> str:
-        """Execute a tool call on the specified MCP server."""
-        session = self._sessions.get(server_name)
-        if not session:
-            return f"Error: MCP server '{server_name}' not connected"
         try:
-            result = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments=arguments),
-                timeout=timeout,
-            )
-            # Extract text content from result
-            parts = []
-            for content in result.content:
-                if hasattr(content, "text"):
-                    parts.append(content.text)
+            transport_type = cfg.type
+            if not transport_type:
+                if cfg.command:
+                    transport_type = "stdio"
+                elif cfg.url:
+                    transport_type = "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
                 else:
-                    parts.append(str(content))
+                    print(f"[mcp] Skipping '{server_name}': no command or url configured")
+                    await server_stack.aclose()
+                    return None
+
+            if transport_type == "stdio":
+                params = StdioServerParameters(
+                    command=cfg.command,
+                    args=cfg.args,
+                    env=cfg.env or None,
+                )
+                read, write = await server_stack.enter_async_context(stdio_client(params))
+            elif transport_type == "sse":
+                def httpx_client_factory(
+                    headers: dict[str, Any] | None = None,
+                    timeout: httpx.Timeout | None = None,
+                    auth: httpx.Auth | None = None,
+                ) -> httpx.AsyncClient:
+                    merged_headers = {
+                        "Accept": "application/json, text/event-stream",
+                        **cfg.headers,
+                        **(headers or {}),
+                    }
+                    return httpx.AsyncClient(
+                        headers=merged_headers or None,
+                        follow_redirects=True,
+                        timeout=timeout,
+                        auth=auth,
+                    )
+
+                read, write = await server_stack.enter_async_context(
+                    sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
+                )
+            elif transport_type == "streamableHttp":
+                http_client = await server_stack.enter_async_context(
+                    httpx.AsyncClient(
+                        headers=cfg.headers or None,
+                        follow_redirects=True,
+                        timeout=None,
+                    )
+                )
+                read, write, _ = await server_stack.enter_async_context(
+                    streamable_http_client(cfg.url, http_client=http_client)
+                )
+            else:
+                print(f"[mcp] Skipping '{server_name}': unknown transport type '{transport_type}'")
+                await server_stack.aclose()
+                return None
+
+            session = await server_stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+
+            registered_count = 0
+            tools_result = await session.list_tools()
+            enabled_tools = set(cfg.enabled_tools)
+            allow_all_tools = "*" in enabled_tools
+            matched_enabled_tools: set[str] = set()
+            available_raw_names = [tool_def.name for tool_def in tools_result.tools]
+            available_wrapped_names = [
+                f"mcp_{server_name}_{tool_def.name}" for tool_def in tools_result.tools
+            ]
+
+            for tool_def in tools_result.tools:
+                wrapped_name = f"mcp_{server_name}_{tool_def.name}"
+                if (
+                    not allow_all_tools
+                    and tool_def.name not in enabled_tools
+                    and wrapped_name not in enabled_tools
+                ):
+                    continue
+
+                schema = _normalize_schema(
+                    tool_def.inputSchema or {"type": "object", "properties": {}, "required": []}
+                )
+                self.tool_schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": wrapped_name,
+                        "description": tool_def.description or tool_def.name,
+                        "parameters": schema,
+                    },
+                })
+                self.tool_handlers[wrapped_name] = self._make_tool_handler(
+                    session,
+                    tool_name=tool_def.name,
+                    timeout=cfg.tool_timeout,
+                )
+                registered_count += 1
+
+                if tool_def.name in enabled_tools:
+                    matched_enabled_tools.add(tool_def.name)
+                if wrapped_name in enabled_tools:
+                    matched_enabled_tools.add(wrapped_name)
+
+            if enabled_tools and not allow_all_tools:
+                unmatched = sorted(enabled_tools - matched_enabled_tools)
+                if unmatched:
+                    print(
+                        f"[mcp] Server '{server_name}': enabled_tools not found: "
+                        f"{', '.join(unmatched)}. Available raw names: "
+                        f"{', '.join(available_raw_names) or '(none)'}. Available wrapped names: "
+                        f"{', '.join(available_wrapped_names) or '(none)'}"
+                    )
+
+            try:
+                resources_result = await session.list_resources()
+                for resource in resources_result.resources:
+                    wrapped_name = f"mcp_{server_name}_resource_{resource.name}"
+                    self.tool_schemas.append({
+                        "type": "function",
+                        "function": {
+                            "name": wrapped_name,
+                            "description": (
+                                f"[MCP Resource] {resource.description or resource.name}\n"
+                                f"URI: {resource.uri}"
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                            },
+                        },
+                    })
+                    self.tool_handlers[wrapped_name] = self._make_resource_handler(
+                        session,
+                        uri=resource.uri,
+                        timeout=cfg.tool_timeout,
+                    )
+                    registered_count += 1
+            except Exception as exc:
+                print(f"[mcp] Server '{server_name}': resources unavailable: {exc}")
+
+            try:
+                prompts_result = await session.list_prompts()
+                for prompt in prompts_result.prompts:
+                    properties: dict[str, Any] = {}
+                    required: list[str] = []
+                    for arg in prompt.arguments or []:
+                        prop: dict[str, Any] = {"type": "string"}
+                        if getattr(arg, "description", None):
+                            prop["description"] = arg.description
+                        properties[arg.name] = prop
+                        if getattr(arg, "required", False):
+                            required.append(arg.name)
+
+                    wrapped_name = f"mcp_{server_name}_prompt_{prompt.name}"
+                    self.tool_schemas.append({
+                        "type": "function",
+                        "function": {
+                            "name": wrapped_name,
+                            "description": (
+                                f"[MCP Prompt] {prompt.description or prompt.name}\n"
+                                "Returns a filled prompt template that can be used as a workflow guide."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": properties,
+                                "required": required,
+                            },
+                        },
+                    })
+                    self.tool_handlers[wrapped_name] = self._make_prompt_handler(
+                        session,
+                        prompt_name=prompt.name,
+                        timeout=cfg.tool_timeout,
+                    )
+                    registered_count += 1
+            except Exception as exc:
+                print(f"[mcp] Server '{server_name}': prompts unavailable: {exc}")
+
+            print(f"[mcp] Connected '{server_name}': {registered_count} capabilities")
+            return server_stack
+        except Exception as exc:
+            hint = self._build_error_hint(exc)
+            print(f"[mcp] Failed to connect '{server_name}': {exc}{hint}")
+            try:
+                await server_stack.aclose()
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def _build_error_hint(exc: Exception) -> str:
+        text = str(exc).lower()
+        if any(
+            marker in text
+            for marker in ("parse error", "invalid json", "unexpected token", "jsonrpc", "content-length")
+        ):
+            return (
+                " Hint: this looks like stdio protocol pollution. Make sure the MCP server writes "
+                "only JSON-RPC to stdout and sends logs/debug output to stderr instead."
+            )
+        return ""
+
+    @staticmethod
+    def _stringify_content_block(content: Any) -> str:
+        text = getattr(content, "text", None)
+        if text is not None:
+            return str(text)
+        return str(content)
+
+    def _make_tool_handler(self, session: Any, tool_name: str, timeout: int):
+        async def handler(**kwargs: Any) -> str:
+            try:
+                result = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments=kwargs),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return f"Error: MCP tool '{tool_name}' timed out after {timeout}s"
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling() > 0:
+                    raise
+                return "Error: MCP tool call was cancelled"
+            except Exception as exc:
+                return f"Error: MCP tool '{tool_name}' failed - {type(exc).__name__}: {exc}"
+
+            parts = [self._stringify_content_block(block) for block in getattr(result, "content", [])]
             return "\n".join(parts) if parts else "(no output)"
-        except asyncio.TimeoutError:
-            return f"Error: MCP tool '{tool_name}' timed out after {timeout}s"
-        except Exception as e:
-            return f"Error: MCP tool '{tool_name}' failed — {e}"
+
+        return handler
+
+    def _make_resource_handler(self, session: Any, uri: str, timeout: int):
+        async def handler(**_: Any) -> str:
+            try:
+                result = await asyncio.wait_for(
+                    session.read_resource(uri),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return f"Error: MCP resource '{uri}' timed out after {timeout}s"
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling() > 0:
+                    raise
+                return "Error: MCP resource read was cancelled"
+            except Exception as exc:
+                return f"Error: MCP resource '{uri}' failed - {type(exc).__name__}: {exc}"
+
+            parts: list[str] = []
+            for block in getattr(result, "contents", []):
+                text = getattr(block, "text", None)
+                if text is not None:
+                    parts.append(str(text))
+                    continue
+                blob = getattr(block, "blob", None)
+                if blob is not None:
+                    parts.append(f"[Binary resource: {len(blob)} bytes]")
+                    continue
+                parts.append(str(block))
+            return "\n".join(parts) if parts else "(no output)"
+
+        return handler
+
+    def _make_prompt_handler(self, session: Any, prompt_name: str, timeout: int):
+        async def handler(**kwargs: Any) -> str:
+            try:
+                result = await asyncio.wait_for(
+                    session.get_prompt(prompt_name, arguments=kwargs),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return f"Error: MCP prompt '{prompt_name}' timed out after {timeout}s"
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling() > 0:
+                    raise
+                return "Error: MCP prompt call was cancelled"
+            except Exception as exc:
+                return f"Error: MCP prompt '{prompt_name}' failed - {type(exc).__name__}: {exc}"
+
+            parts: list[str] = []
+            for message in getattr(result, "messages", []):
+                content = getattr(message, "content", None)
+                if isinstance(content, list):
+                    parts.extend(self._stringify_content_block(block) for block in content)
+                elif content is not None:
+                    parts.append(self._stringify_content_block(content))
+            return "\n".join(parts) if parts else "(no output)"
+
+        return handler
 
     async def close(self) -> None:
         """Shut down all MCP connections."""
-        await self._stack.__aexit__(None, None, None)
+        for stack in self._server_stacks.values():
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+        self._server_stacks.clear()

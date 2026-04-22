@@ -1,9 +1,12 @@
 {
   "mcpServers": {
     "example-server": {
+      "type": "stdio",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-everything"],
-      "env": {}
+      "env": {},
+      "toolTimeout": 30,
+      "enabledTools": ["*"]
     }
   }
 }

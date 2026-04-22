@@ -118,6 +118,8 @@ def _time_ago(dt) -> str:
 async def main():
     # --- Seed workspace templates (first run) ---
     seed_workspace_templates()
+    # Skill loader is instantiated at import time; refresh after first-run seeding.
+    SKILLS.reload()
 
     # --- One-shot dedup cleanup of accumulated memory files ---
     cleanup_memory_files_once()

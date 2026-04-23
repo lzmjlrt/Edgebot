@@ -15,6 +15,7 @@ from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import radiolist_dialog
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -122,6 +123,7 @@ _HELP_TEXT = """\
 
 _REPLAY_TAIL = 10  # How many visible turns to replay on /resume
 _MEMORY_JOB_ID = "memory_consolidation"
+_SESSION_PICK_LIMIT = 20
 
 
 def _render_mcp_startup(mcp_client) -> None:
@@ -384,6 +386,40 @@ def _resolve_session_summary(state: dict) -> str | None:
     return extract_session_summary(state.get("messages", []))
 
 
+async def _pick_session_interactive(
+    sessions: list[dict],
+    *,
+    current_session_key: str,
+) -> dict | None:
+    """Interactive session picker for bare /resume."""
+    if not sessions:
+        return None
+
+    visible = sessions[:_SESSION_PICK_LIMIT]
+    values: list[tuple[str, HTML]] = []
+    for item in visible:
+        ago = _time_ago(item["updated_at"])
+        current = "  [current]" if item["key"] == current_session_key else ""
+        label = (
+            f"<b>{item['key']}</b>\n"
+            f"<style fg='ansigray'>{item['message_count']} msgs, {ago}{current}</style>"
+        )
+        values.append((item["key"], HTML(label)))
+
+    with patch_stdout():
+        selected = await radiolist_dialog(
+            title="Resume Session",
+            text="Use Up/Down to choose a session, Enter to resume, Esc to cancel.",
+            values=values,
+            ok_text="Resume",
+            cancel_text="Cancel",
+        ).run_async()
+
+    if not selected:
+        return None
+    return next((item for item in visible if item["key"] == selected), None)
+
+
 async def main():
     # --- Seed workspace templates (first run) ---
     seed_workspace_templates()
@@ -597,20 +633,29 @@ async def main():
 
             if query.startswith("/resume"):
                 arg = query[len("/resume"):].strip()
-                if not arg:
-                    console.print("[dim]  Usage: /resume <#> or /resume <session_key>[/dim]")
-                    continue
                 sessions = store.list_sessions()
                 target = None
-                try:
-                    idx = int(arg) - 1
-                    if 0 <= idx < len(sessions):
-                        target = sessions[idx]
-                except ValueError:
-                    for s in sessions:
-                        if s["key"] == arg:
-                            target = s
-                            break
+                if not arg:
+                    if not sessions:
+                        console.print("[dim]  No saved sessions.[/dim]")
+                        continue
+                    target = await _pick_session_interactive(
+                        sessions,
+                        current_session_key=session_key,
+                    )
+                    if target is None:
+                        console.print("[dim]  Resume cancelled.[/dim]")
+                        continue
+                else:
+                    try:
+                        idx = int(arg) - 1
+                        if 0 <= idx < len(sessions):
+                            target = sessions[idx]
+                    except ValueError:
+                        for s in sessions:
+                            if s["key"] == arg:
+                                target = s
+                                break
                 if target:
                     session_key = target["key"]
                     state = store.load_state(session_key)

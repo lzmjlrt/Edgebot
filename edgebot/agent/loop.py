@@ -14,7 +14,7 @@ from edgebot.agent.context import merge_runtime_context_into_messages
 from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.cli.tool_hints import format_tool_hint
 from edgebot.config import API_BASE, API_KEY, MODEL, TOKEN_THRESHOLD, WORKDIR
-from edgebot.tools.registry import set_tool_runtime_context
+from edgebot.tools.registry import execute_registered_tool, get_tool_instance, set_tool_runtime_context
 
 _console = Console()
 _CONSOLIDATION_INTERVAL = 15
@@ -237,7 +237,10 @@ async def agent_loop(
 
             handler = tool_handlers.get(name)
             try:
-                if handler is None:
+                tool_instance = get_tool_instance(name)
+                if tool_instance is not None:
+                    output = await execute_registered_tool(name, args)
+                elif handler is None:
                     output = f"Unknown tool: {name}"
                 else:
                     result = handler(**args)

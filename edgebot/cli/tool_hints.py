@@ -34,6 +34,8 @@ def format_tool_hint(name: str, args: dict) -> str:
         return f"write {args.get('path', '')}"
     if name == "edit_file":
         return f"edit {args.get('path', '')}"
+    if name == "list_dir":
+        return f"ls {args.get('path', '')}"
     if name == "task":
         return f"subagent: {_trunc(args.get('prompt', ''), 50)}"
     if name == "load_skill":

@@ -233,3 +233,6 @@ SOUL.md
 USER.md
 memory/MEMORY.md
 skills/summarize/SKILL.md
+.tmp_smoke/
+.claude/
+.edgebot/

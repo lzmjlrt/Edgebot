@@ -41,6 +41,36 @@ def get_tool_instance(name: str):
     return _TOOL_INSTANCES.get(name)
 
 
+def prepare_call(name: str, params: dict) -> tuple[object | None, dict, str | None]:
+    """Resolve a tool and validate its parameters before execution."""
+    if not isinstance(params, dict):
+        return None, params, (
+            f"Error: Tool '{name}' parameters must be a JSON object, got {type(params).__name__}"
+        )
+
+    tool = _TOOL_INSTANCES.get(name)
+    if tool is None:
+        return None, params, f"Error: Tool '{name}' not found"
+
+    cast_params = tool.cast_params(params)
+    errors = tool.validate_params(cast_params)
+    if errors:
+        return tool, cast_params, f"Error: Invalid parameters for tool '{name}': {'; '.join(errors)}"
+    return tool, cast_params, None
+
+
+async def execute_registered_tool(name: str, params: dict) -> object:
+    """Execute a registered tool with parameter preparation/validation."""
+    tool, cast_params, error = prepare_call(name, params)
+    if error:
+        return error
+    assert tool is not None
+    result = tool.execute(**cast_params)
+    if hasattr(result, "__await__"):
+        return await result
+    return result
+
+
 def set_tool_runtime_context(
     *,
     channel: str = "cli",
@@ -56,7 +86,7 @@ def set_tool_runtime_context(
 
 def init_builtin_tools() -> None:
     from edgebot.tools.builtin.cron import CronTool
-    from edgebot.tools.builtin.filesystem import EditFileTool, ReadFileTool, WriteFileTool
+    from edgebot.tools.builtin.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
     from edgebot.tools.builtin.shell import BashTool
     from edgebot.tools.builtin.tasks import (
         ClaimTaskTool,
@@ -86,6 +116,7 @@ def init_builtin_tools() -> None:
         ReadFileTool(),
         WriteFileTool(),
         EditFileTool(),
+        ListDirTool(),
         BashTool(),
         TaskCreateTool(),
         TaskGetTool(),

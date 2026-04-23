@@ -99,8 +99,16 @@ API_BASE=https://api.deepseek.com   # optional: for proxy routers or custom endp
 **3. Run**
 
 ```bash
-python -m edgebot
+edgebot
 ```
+
+If you are running from source, install the CLI once:
+
+```bash
+pip install -e .
+```
+
+`python -m edgebot` also continues to work.
 
 > [!TIP]
 > **Magic Bootstrap**: On its very first run, Edgebot will automatically generate `AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, a sample `skills/` directory, and an `mcp_servers.json` template!

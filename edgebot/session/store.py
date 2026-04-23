@@ -9,6 +9,7 @@ adding enough state to recover interrupted turns.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,23 +43,107 @@ def find_legal_start(messages: list[dict]) -> int:
 
 
 class SessionStore:
-    def __init__(self, sessions_dir: Path):
+    def __init__(
+        self,
+        sessions_dir: Path,
+        *,
+        workspace: Path | None = None,
+        legacy_sessions_dir: Path | None = None,
+    ):
         self.sessions_dir = sessions_dir
+        self.workspace = workspace.resolve() if workspace else None
+        self.legacy_sessions_dir = legacy_sessions_dir
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, session_key: str) -> Path:
         safe = session_key.replace("/", "_").replace(":", "_")
         return self.sessions_dir / f"{safe}.jsonl"
 
+    def _legacy_path(self, session_key: str) -> Path | None:
+        if not self.legacy_sessions_dir:
+            return None
+        safe = session_key.replace("/", "_").replace(":", "_")
+        return self.legacy_sessions_dir / f"{safe}.jsonl"
+
+    def _workspace_value(self) -> str | None:
+        return str(self.workspace) if self.workspace else None
+
+    def _apply_workspace_metadata(self, state: dict[str, Any]) -> bool:
+        workspace_value = self._workspace_value()
+        if not workspace_value:
+            return False
+        metadata = state.setdefault("metadata", {})
+        if metadata.get("workspace") == workspace_value:
+            return False
+        metadata["workspace"] = workspace_value
+        return True
+
+    def _read_metadata_line(self, path: Path) -> dict[str, Any] | None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                first_line = f.readline().strip()
+        except OSError:
+            return None
+        if not first_line:
+            return None
+        try:
+            data = json.loads(first_line)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(data, dict) and data.get("_type") == "metadata":
+            return data
+        return None
+
+    def _maybe_migrate_legacy_session(self, session_key: str) -> bool:
+        if self._path(session_key).exists():
+            return False
+        legacy_path = self._legacy_path(session_key)
+        if legacy_path is None or not legacy_path.exists():
+            return False
+
+        metadata = self._read_metadata_line(legacy_path) or {}
+        legacy_workspace = (metadata.get("metadata") or {}).get("workspace")
+        workspace_value = self._workspace_value()
+        if workspace_value and legacy_workspace != workspace_value:
+            return False
+
+        try:
+            shutil.move(str(legacy_path), str(self._path(session_key)))
+            return True
+        except Exception:
+            return False
+
+    def _migrate_visible_legacy_sessions(self) -> None:
+        if not self.legacy_sessions_dir or not self.legacy_sessions_dir.exists():
+            return
+        workspace_value = self._workspace_value()
+        if not workspace_value:
+            return
+
+        for legacy_path in self.legacy_sessions_dir.glob("*.jsonl"):
+            target_path = self.sessions_dir / legacy_path.name
+            if target_path.exists():
+                continue
+            metadata = self._read_metadata_line(legacy_path) or {}
+            legacy_workspace = (metadata.get("metadata") or {}).get("workspace")
+            if legacy_workspace != workspace_value:
+                continue
+            try:
+                shutil.move(str(legacy_path), str(target_path))
+            except Exception:
+                continue
+
     def _default_state(self, session_key: str) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
-        return {
+        state = {
             "key": session_key,
             "created_at": now,
             "updated_at": now,
             "metadata": {},
             "messages": [],
         }
+        self._apply_workspace_metadata(state)
+        return state
 
     def _serialize_metadata_line(self, state: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -146,6 +231,8 @@ class SessionStore:
         """Load full state for *session_key*, restoring interrupted turns if needed."""
         path = self._path(session_key)
         if not path.exists():
+            self._maybe_migrate_legacy_session(session_key)
+        if not path.exists():
             return self._default_state(session_key)
 
         state = self._default_state(session_key)
@@ -188,7 +275,10 @@ class SessionStore:
             messages = messages[start:]
         state["messages"] = messages
 
-        if self._restore_state(state):
+        touched = self._restore_state(state)
+        if self._apply_workspace_metadata(state):
+            touched = True
+        if touched:
             self._write_state(path, state)
         return state
 
@@ -206,6 +296,7 @@ class SessionStore:
             "metadata": dict(state.get("metadata", {})),
             "messages": list(state.get("messages", [])),
         }
+        self._apply_workspace_metadata(state)
         self._write_state(path, state)
 
     def append(self, session_key: str, message: dict) -> None:
@@ -254,6 +345,7 @@ class SessionStore:
         List all saved sessions, sorted by most recently updated.
         Returns [{key, path, updated_at, message_count}].
         """
+        self._migrate_visible_legacy_sessions()
         sessions = []
         for f in self.sessions_dir.glob("*.jsonl"):
             try:

@@ -11,11 +11,14 @@ from datetime import datetime
 from pathlib import Path
 
 from prompt_toolkit import PromptSession, print_formatted_text
-from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.shortcuts import radiolist_dialog
+from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -28,6 +31,7 @@ from edgebot.cron.service import _get_croniter
 from edgebot.cron.types import CronSchedule
 from edgebot.config import (
     HEARTBEAT_INTERVAL_SECONDS,
+    LEGACY_SESSION_DIR,
     MCP_CONFIG_PATH,
     MEMORY_CONSOLIDATION_INTERVAL_SECONDS,
     MODEL,
@@ -391,33 +395,79 @@ async def _pick_session_interactive(
     *,
     current_session_key: str,
 ) -> dict | None:
-    """Interactive session picker for bare /resume."""
+    """Inline arrow-key session picker for bare /resume."""
     if not sessions:
         return None
 
     visible = sessions[:_SESSION_PICK_LIMIT]
-    values: list[tuple[str, HTML]] = []
-    for item in visible:
-        ago = _time_ago(item["updated_at"])
-        current = "  [current]" if item["key"] == current_session_key else ""
-        label = (
-            f"<b>{item['key']}</b>\n"
-            f"<style fg='ansigray'>{item['message_count']} msgs, {ago}{current}</style>"
-        )
-        values.append((item["key"], HTML(label)))
+    selected_index = next(
+        (idx for idx, item in enumerate(visible) if item["key"] == current_session_key),
+        0,
+    )
+
+    def _render_picker():
+        fragments: list[tuple[str, str]] = [
+            ("class:title", "Resume session\n"),
+            ("class:hint", "Up/Down select, Enter resume, Esc cancel.\n\n"),
+        ]
+        for idx, item in enumerate(visible):
+            ago = _time_ago(item["updated_at"])
+            pointer = "> " if idx == selected_index else "  "
+            key_style = "class:selected" if idx == selected_index else "class:item"
+            meta_style = "class:selected-meta" if idx == selected_index else "class:meta"
+            current = "  [current]" if item["key"] == current_session_key else ""
+            fragments.append((key_style, f"{pointer}{item['key']}{current}\n"))
+            fragments.append((meta_style, f"   {item['message_count']} msgs, {ago}\n"))
+            fragments.append(("", "\n"))
+        if len(sessions) > len(visible):
+            fragments.append(
+                ("class:hint", f"Showing latest {len(visible)} of {len(sessions)} sessions.\n")
+            )
+        return fragments
+
+    body = FormattedTextControl(_render_picker, focusable=True, show_cursor=False)
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _move_up(event) -> None:
+        nonlocal selected_index
+        selected_index = (selected_index - 1) % len(visible)
+        event.app.invalidate()
+
+    @kb.add("down")
+    @kb.add("j")
+    def _move_down(event) -> None:
+        nonlocal selected_index
+        selected_index = (selected_index + 1) % len(visible)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _accept(event) -> None:
+        event.app.exit(result=visible[selected_index])
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        event.app.exit(result=None)
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+        style=Style.from_dict({
+            "title": "bold",
+            "hint": "ansibrightblack",
+            "item": "",
+            "meta": "ansibrightblack",
+            "selected": "reverse bold",
+            "selected-meta": "reverse",
+        }),
+    )
 
     with patch_stdout():
-        selected = await radiolist_dialog(
-            title="Resume Session",
-            text="Use Up/Down to choose a session, Enter to resume, Esc to cancel.",
-            values=values,
-            ok_text="Resume",
-            cancel_text="Cancel",
-        ).run_async()
-
-    if not selected:
-        return None
-    return next((item for item in visible if item["key"] == selected), None)
+        return await app.run_async()
 
 
 async def main():
@@ -430,7 +480,11 @@ async def main():
     cleanup_memory_files_once()
 
     # --- Start fresh session (no picker) ---
-    store = SessionStore(SESSION_DIR)
+    store = SessionStore(
+        SESSION_DIR,
+        workspace=WORKDIR,
+        legacy_sessions_dir=LEGACY_SESSION_DIR,
+    )
     session_key = f"session_{int(time.time())}"
     history: list[dict] = []
     session_summary: str | None = None
@@ -622,6 +676,7 @@ async def main():
                 if not sessions:
                     console.print("[dim]  No saved sessions.[/dim]")
                 else:
+                    console.print(f"[dim]  Workspace sessions: {WORKDIR}[/dim]")
                     for i, s in enumerate(sessions[:15], 1):
                         ago = _time_ago(s["updated_at"])
                         cur = " [bold cyan]<-[/bold cyan]" if s["key"] == session_key else ""

@@ -44,6 +44,8 @@ RUNTIME_DIR = WORKDIR / ".edgebot"
 SKILLS_DIR = RUNTIME_DIR / "skills"
 MEMORY_DIR = RUNTIME_DIR / "memory"
 CRON_DIR = RUNTIME_DIR / "cron"
+SESSION_DIR = RUNTIME_DIR / "sessions"
+LEGACY_SESSION_DIR = Path.home() / ".edgebot" / "sessions"
 CRON_STORE_PATH = CRON_DIR / "jobs.json"
 MCP_CONFIG_PATH = RUNTIME_DIR / "mcp_servers.json"
 AGENTS_MD_PATH = RUNTIME_DIR / "AGENTS.md"
@@ -52,7 +54,6 @@ USER_MD_PATH = RUNTIME_DIR / "USER.md"
 TOOLS_MD_PATH = RUNTIME_DIR / "TOOLS.md"
 HEARTBEAT_MD_PATH = RUNTIME_DIR / "HEARTBEAT.md"
 LEGACY_SKILLS_DIR = WORKDIR / "skills"
-SESSION_DIR = Path.home() / ".edgebot" / "sessions"
 
 # --- Tuning constants ---
 TOKEN_THRESHOLD = 100_000

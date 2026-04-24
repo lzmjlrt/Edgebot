@@ -8,9 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
-import litellm
-
-from edgebot.config import API_BASE, API_KEY, HEARTBEAT_MD_PATH, MODEL
+from edgebot.config import HEARTBEAT_MD_PATH, MODEL, create_provider
+from edgebot.providers.base import ToolCallRequest
 
 _HEARTBEAT_TOOL = [
     {
@@ -131,7 +130,8 @@ class HeartbeatService:
                 continue
 
     async def _decide(self, content: str) -> tuple[str, str]:
-        response = await litellm.acompletion(
+        provider = create_provider()
+        response = await provider.chat_with_retry(
             model=MODEL,
             messages=[
                 {
@@ -147,17 +147,13 @@ class HeartbeatService:
                 },
             ],
             tools=_HEARTBEAT_TOOL,
-            tool_choice={"type": "function", "function": {"name": "heartbeat"}},
             max_tokens=300,
-            api_key=API_KEY,
-            api_base=API_BASE,
+            temperature=0.3,
         )
-        message = response.choices[0].message
-        tool_calls = getattr(message, "tool_calls", None) or []
-        if not tool_calls:
+        if not response.tool_calls:
             return "skip", ""
         try:
-            args = json.loads(tool_calls[0].function.arguments or "{}")
+            args = response.tool_calls[0].arguments
         except Exception:
             args = {}
         return args.get("action", "skip"), args.get("tasks", "")
@@ -166,7 +162,8 @@ class HeartbeatService:
         if not result.strip():
             return False, "empty result"
         try:
-            response = await litellm.acompletion(
+            provider = create_provider()
+            response = await provider.chat_with_retry(
                 model=MODEL,
                 messages=[
                     {
@@ -186,15 +183,11 @@ class HeartbeatService:
                     },
                 ],
                 tools=_HEARTBEAT_NOTIFY_TOOL,
-                tool_choice={"type": "function", "function": {"name": "heartbeat_notify"}},
                 max_tokens=200,
-                api_key=API_KEY,
-                api_base=API_BASE,
+                temperature=0.3,
             )
-            message = response.choices[0].message
-            tool_calls = getattr(message, "tool_calls", None) or []
-            if tool_calls:
-                args = json.loads(tool_calls[0].function.arguments or "{}")
+            if response.tool_calls:
+                args = response.tool_calls[0].arguments
                 return args.get("action") == "notify", args.get("reason", "")
         except Exception:
             pass

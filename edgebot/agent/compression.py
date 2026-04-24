@@ -5,9 +5,7 @@ edgebot/agent/compression.py - Context compression utilities.
 import json
 import time
 
-import litellm
-
-from edgebot.config import API_BASE, API_KEY, MODEL, TRANSCRIPT_DIR
+from edgebot.config import MODEL, TRANSCRIPT_DIR, create_provider
 from edgebot.session.store import find_legal_start
 
 _COMPACT_PREFIX = "[System: Context auto-compressed"
@@ -82,14 +80,15 @@ async def auto_compact(
             
     conv_text = json.dumps(prefix, ensure_ascii=False, default=str)[:80000]
     prompt = f"Summarize the earlier parts of this conversation for continuity:\n{conv_text}"
-    
-    resp = await litellm.acompletion(
-        model=MODEL,
+
+    provider = create_provider()
+    resp = await provider.chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
+        model=MODEL,
         max_tokens=2000,
-        api_key=API_KEY, api_base=API_BASE,
+        temperature=0.3,
     )
-    summary = resp.choices[0].message.content
+    summary = resp.content
 
     if memory_store and summary:
         archived_label = (

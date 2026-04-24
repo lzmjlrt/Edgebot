@@ -1,9 +1,10 @@
 """
 edgebot/cli/repl.py - Interactive REPL (async) with Rich UI and prompt_toolkit.
 
-REPL commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /team /inbox /status /help
+REPL commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /bg /team /inbox /status /help
 """
 
+import asyncio
 import json
 import shlex
 import time
@@ -25,12 +26,13 @@ from rich.table import Table
 
 from edgebot.agent.compression import auto_compact, extract_session_summary
 from edgebot.agent.context import build_system_prompt, seed_workspace_templates
-from edgebot.agent.loop import agent_loop
+from edgebot.agent.loop import agent_loop, get_autocompact
 from edgebot.agent.memory import MemoryStore, cleanup_memory_files_once, consolidate_memory
 from edgebot.cron.service import _get_croniter
 from edgebot.cron.types import CronSchedule
 from edgebot.config import (
     HEARTBEAT_INTERVAL_SECONDS,
+    IDLE_COMPACT_MINUTES,
     LEGACY_SESSION_DIR,
     MCP_CONFIG_PATH,
     MEMORY_CONSOLIDATION_INTERVAL_SECONDS,
@@ -42,7 +44,19 @@ from edgebot.cron.types import CronJob, CronPayload
 from edgebot.heartbeat.service import HeartbeatService
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
-from edgebot.tools.registry import BG, BUS, CRON, SKILLS, SUBAGENT, TASK_MGR, TEAM, TODO, TOOL_HANDLERS, TOOLS
+from edgebot.tools.registry import (
+    BG,
+    BUS,
+    CRON,
+    SKILLS,
+    SUBAGENT,
+    TASK_MGR,
+    TEAM,
+    TODO,
+    TOOL_HANDLERS,
+    TOOLS,
+    set_permission_prompt_handler,
+)
 
 console = Console()
 _MEMORY = MemoryStore(Path.cwd())
@@ -97,32 +111,69 @@ async def _interactive_response(label: str, body: str) -> None:
         )
     )
 
+
+async def _permission_prompt(request: dict) -> dict | None:
+    message = str(request.get("message", "")).strip()
+    await _interactive_print(
+        lambda c: (
+            c.print("[yellow]Permission required[/yellow]"),
+            c.print(escape(message), highlight=False, soft_wrap=True),
+            c.print("[dim]Allow once: y | session rule: s | persist rule: a | deny: n[/dim]"),
+            c.print(),
+        )
+    )
+
+    while True:
+        with patch_stdout():
+            line = await _prompt_session.prompt_async(
+                HTML("<b><ansiyellow>Approval:</ansiyellow></b> ")
+            )
+        choice = (line or "").strip().lower()
+        if choice in {"y", "yes"}:
+            return {"action": "allow"}
+        if choice in {"s", "session"}:
+            scope = "allow_prefix" if request.get("tool") == "bash" else "allow_tool"
+            return {"action": "allow", "scope": scope, "persist": False}
+        if choice in {"a", "always"}:
+            scope = "allow_prefix" if request.get("tool") == "bash" else "allow_tool"
+            return {"action": "allow", "scope": scope, "persist": True}
+        if choice in {"n", "no", ""}:
+            return {"action": "deny"}
+        await _interactive_notice("Use y / s / a / n.")
+
 _HELP_TEXT = """\
 [bold]Edgebot commands:[/bold]
-  /new            Start a new conversation
-  /sessions       List saved sessions
-  /resume <#|key> Resume a previous session
-  /compact        Compress conversation context
-  /memory         Run memory consolidation now
-  /cron           Show cron jobs and service state
-  /cron list      List jobs in detail
-  /cron status    Show cron service status
-  /cron run <id>  Run a job immediately
-  /cron rm <id>   Remove a job
-  /cron on <id>   Enable a job
-  /cron off <id>  Disable a job
+  /new                Start a new conversation
+  /sessions           List saved sessions
+  /resume             Interactively pick a session to resume
+  /resume <#|key>     Resume a specific session
+  /compact            Compress conversation context
+  /memory             Run memory consolidation now
+  /cron               Show cron jobs and service state
+  /cron run <id>      Run a job immediately
+  /cron rm <id>       Remove a job
+  /cron on/off <id>   Enable or disable a job
   /cron add every <seconds> <message>
   /cron add at <iso-datetime> <message>
   /cron add expr <cron-expr> <message> [tz]
-  /heartbeat      Trigger one heartbeat tick now
-  /mcp            Show MCP servers and loaded capabilities
-  /tasks          Show task board
-  /team           List teammates
-  /subagents      List one-shot subagents
-  /inbox          Read inbox
-  /status         Show current session info
-  /help           Show this help
-  exit            Quit"""
+  /heartbeat          Trigger one heartbeat tick now
+  /mcp                Show MCP servers and loaded capabilities
+  /tasks              Show task board
+  /bg                 Show all background tasks
+  /bg <id>            Show one background task
+  /bg output <id>     Show task output
+  /team               List teammates
+  /subagents          List subagents
+  /subagents <id>     Show subagent details
+  /subagents output <id>
+  /subagents transcript <id>
+  /subagents fg <id>  Move subagent to foreground
+  /subagents bg <id>  Move subagent to background
+  /subagents stop <id> [reason]
+  /inbox              Read inbox
+  /status             Show current session info
+  /help               Show this help
+  /exit                Quit"""
 
 
 _REPLAY_TAIL = 10  # How many visible turns to replay on /resume
@@ -320,7 +371,7 @@ async def _handle_cron_command(query: str) -> None:
             console.print(f"[dim]  Created job {job.id} ({job.name}).[/dim]")
             return
 
-    console.print("[dim]  Unknown /cron usage. Type /help.[/dim]")
+    console.print("[dim]  Unknown /cron usage. Subcommands: list, run, rm, on, off, add[/dim]")
 
 
 def _render_history(history: list[dict]) -> None:
@@ -379,6 +430,75 @@ def _time_ago(dt) -> str:
     if delta < 86400:
         return f"{int(delta // 3600)}h ago"
     return f"{int(delta // 86400)}d ago"
+
+
+def _format_timestamp(ts: float | None) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _render_subagent_list() -> None:
+    tasks = SUBAGENT.list_all()
+    if not tasks:
+        console.print("[dim]  No subagents.[/dim]")
+        return
+
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Mode", no_wrap=True)
+    table.add_column("Capability", no_wrap=True)
+    table.add_column("Tools", no_wrap=True)
+    table.add_column("Started", no_wrap=True)
+    table.add_column("Description")
+
+    for task in tasks:
+        mode = "bg" if task.get("is_backgrounded", True) else "fg"
+        table.add_row(
+            task["task_id"],
+            task["status"],
+            mode,
+            task.get("capability", "-"),
+            str(task.get("tool_uses", 0)),
+            _format_timestamp(task.get("started_at")),
+            task.get("description", ""),
+        )
+    console.print(table)
+
+
+def _print_subagent_blob(title: str, body: str) -> None:
+    console.rule(f"[dim]{title}[/dim]", style="dim")
+    console.print(escape(body) if body else "[dim](empty)[/dim]", highlight=False, soft_wrap=True)
+
+
+def _render_subagent_detail(task: dict[str, object]) -> None:
+    if task.get("error") and "task_id" not in task:
+        console.print(f"[dim]  {task['error']}[/dim]")
+        return
+
+    status = str(task.get("status", "-"))
+    mode = "background" if task.get("is_backgrounded", True) else "foreground"
+    console.print(f"[cyan]{escape(str(task.get('task_id', '-')))}[/cyan] [dim]({escape(status)} / {mode})[/dim]")
+    console.print(f"[dim]  Capability : {escape(str(task.get('capability', '-')))}[/dim]")
+    console.print(f"[dim]  Description: {escape(str(task.get('description', '')))}[/dim]")
+    console.print(f"[dim]  Started    : {_format_timestamp(task.get('started_at'))}[/dim]")
+    console.print(f"[dim]  Finished   : {_format_timestamp(task.get('finished_at'))}[/dim]")
+    console.print(f"[dim]  Tool uses  : {task.get('tool_uses', 0)}[/dim]")
+    console.print(f"[dim]  Output     : {escape(str(task.get('output_file', '-')))}[/dim]")
+    console.print(f"[dim]  Transcript : {escape(str(task.get('transcript_file', '-')))}[/dim]")
+    if task.get("stop_requested"):
+        console.print(f"[dim]  Stop req   : {escape(str(task.get('stop_reason') or 'requested'))}[/dim]")
+    if task.get("error") and status not in {"running"}:
+        console.print(f"[dim]  Error      : {escape(str(task.get('error')))}[/dim]")
+
+    output_preview = str(task.get("output_preview", "") or "")
+    transcript_preview = str(task.get("transcript_preview", "") or "")
+    if output_preview:
+        _print_subagent_blob("output preview", output_preview)
+    if transcript_preview:
+        _print_subagent_blob("transcript preview", transcript_preview)
+    console.print()
 
 
 def _resolve_session_summary(state: dict) -> str | None:
@@ -470,6 +590,30 @@ async def _pick_session_interactive(
         return await app.run_async()
 
 
+_LOGO = r"""
+[bold cyan]    ,──────.    [/bold cyan]
+[bold cyan]   / ,────. \   [/bold cyan]    [bold white]E D G E B O T[/bold white]
+[bold blue]  / / ,──┐ \ \  [/bold blue]    [dim]Autonomous Workspace Agent[/dim]
+[bold blue]  \ \ └──/ / /  [/bold blue]
+[bold magenta]   \ ─────/ /   [/bold magenta]    [dim]Model:[/dim] [cyan]{model}[/cyan]
+[bold purple]    `──────'    [/bold purple]
+"""
+
+
+def _print_banner(heartbeat) -> None:
+    console.print(_LOGO.format(model=MODEL))
+    for line in _format_cron_snapshot():
+        console.print(f"[dim]{line}[/dim]")
+    hb = heartbeat.status()
+    console.print(
+        f"[dim]  Heartbeat: {'running' if hb['running'] else 'stopped'}, "
+        f"every {hb['interval_s']}s, file={'yes' if hb['present'] else 'no'}[/dim]"
+    )
+    if hb.get("last_action"):
+        console.print(f"[dim]  Heartbeat last: {hb['last_action']} ({hb.get('last_reason') or 'n/a'})[/dim]")
+    console.print("  [dim]Type [bold]/help[/bold] for commands, [bold]exit[/bold] to quit[/dim]\n")
+
+
 async def main():
     # --- Seed workspace templates (first run) ---
     seed_workspace_templates()
@@ -497,6 +641,7 @@ async def main():
         all_tools.extend(mcp_client.tool_schemas)
         all_handlers.update(mcp_client.tool_handlers)
         _render_mcp_startup(mcp_client)
+    set_permission_prompt_handler(_permission_prompt)
 
     async def _run_background_turn(
         prompt: str,
@@ -577,29 +722,40 @@ async def main():
         schedule=CronSchedule(kind="every", every_ms=MEMORY_CONSOLIDATION_INTERVAL_SECONDS * 1000),
         payload=CronPayload(kind="system_event"),
     ))
+
+    # AutoCompact periodic scan (runs alongside heartbeat interval)
+    _AUTOCOMPACT_JOB_ID = "autocompact_scan"
+
+    async def _autocompact_cron_handler(job):
+        ac = get_autocompact(store)
+        if ac is not None:
+            ac.check_expired(
+                lambda coro: asyncio.create_task(coro),
+                active_session_keys=set(),
+            )
+        return None
+
+    if IDLE_COMPACT_MINUTES > 0:
+        original_handler = CRON._handler
+
+        async def _combined_handler(job):
+            if job.id == _AUTOCOMPACT_JOB_ID:
+                return await _autocompact_cron_handler(job)
+            return await original_handler(job)
+
+        CRON._handler = _combined_handler
+        CRON.register_system_job(CronJob(
+            id=_AUTOCOMPACT_JOB_ID,
+            name="autocompact_idle_scan",
+            schedule=CronSchedule(kind="every", every_ms=HEARTBEAT_INTERVAL_SECONDS * 1000),
+            payload=CronPayload(kind="system_event"),
+        ))
+
     await CRON.start()
     await heartbeat.start()
 
     # --- Welcome banner ---
-    _LOGO = r"""
-[bold cyan]    ,──────.    [/bold cyan]
-[bold cyan]   / ,────. \   [/bold cyan]    [bold white]E D G E B O T[/bold white]
-[bold blue]  / / ,──┐ \ \  [/bold blue]    [dim]Autonomous Workspace Agent[/dim]
-[bold blue]  \ \ └──/ / /  [/bold blue]
-[bold magenta]   \ ─────/ /   [/bold magenta]    [dim]Model:[/dim] [cyan]{model}[/cyan]
-[bold purple]    `──────'    [/bold purple]
-"""
-    console.print(_LOGO.format(model=MODEL))
-    for line in _format_cron_snapshot():
-        console.print(f"[dim]{line}[/dim]")
-    hb = heartbeat.status()
-    console.print(
-        f"[dim]  Heartbeat: {'running' if hb['running'] else 'stopped'}, "
-        f"every {hb['interval_s']}s, file={'yes' if hb['present'] else 'no'}[/dim]"
-    )
-    if hb.get("last_action"):
-        console.print(f"[dim]  Heartbeat last: {hb['last_action']} ({hb.get('last_reason') or 'n/a'})[/dim]")
-    console.print("  [dim]Type [bold]/help[/bold] for commands, [bold]exit[/bold] to quit[/dim]\n")
+    _print_banner(heartbeat)
 
     try:
         while True:
@@ -668,7 +824,8 @@ async def main():
                 session_key = f"session_{int(time.time())}"
                 history.clear()
                 session_summary = None
-                console.print("[dim]  New session started.[/dim]")
+                console.clear()
+                _print_banner(heartbeat)
                 continue
 
             if query == "/sessions":
@@ -740,7 +897,7 @@ async def main():
                         f"[dim]  Resumed '{session_key}' ({len(history)} messages).[/dim]"
                     )
                 else:
-                    console.print("[dim]  Session not found.[/dim]")
+                    console.print("[dim]  Session not found. Use /resume (bare) for picker, /resume <#> for index, or /resume <key>.[/dim]")
                 continue
 
             if query == "/compact":
@@ -762,16 +919,98 @@ async def main():
                 console.print(TASK_MGR.list_all())
                 continue
 
+            if query.startswith("/bg"):
+                parts = shlex.split(query)
+                if len(parts) == 1:
+                    console.print(BG.check())
+                    continue
+                if len(parts) == 2:
+                    console.print(BG.check(parts[1]))
+                    continue
+                if len(parts) >= 3 and parts[1].lower() == "output":
+                    console.print(
+                        json.dumps(
+                            BG.task_output(parts[2], block=False, timeout_ms=0),
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                    continue
+                console.print("[dim]  Usage: /bg | /bg <task_id> | /bg output <task_id>[/dim]")
+                continue
+
             if query == "/team":
                 console.print(TEAM.list_all())
                 continue
 
-            if query == "/subagents":
-                sa = SUBAGENT.list_all()
-                if not sa:
-                    console.print("[dim]  No subagents.[/dim]")
-                else:
-                    console.print(json.dumps(sa, indent=2))
+            if query.startswith("/subagents"):
+                parts = shlex.split(query)
+                if len(parts) == 1:
+                    _render_subagent_list()
+                    continue
+
+                if len(parts) == 2:
+                    _render_subagent_detail(SUBAGENT.status(parts[1]))
+                    continue
+
+                sub = parts[1].lower()
+                if sub in {"output", "transcript"}:
+                    if len(parts) < 3:
+                        console.print(f"[dim]  Usage: /subagents {sub} <task_id>[/dim]")
+                        continue
+                    detail = SUBAGENT.detail(parts[2])
+                    if detail.get("error"):
+                        console.print(f"[dim]  {detail['error']}[/dim]")
+                        continue
+                    body = detail.get(sub, "")
+                    _print_subagent_blob(f"{sub} {parts[2]}", str(body or ""))
+                    console.print()
+                    continue
+
+                if sub in {"fg", "foreground", "wait"}:
+                    if len(parts) < 3:
+                        console.print("[dim]  Usage: /subagents fg <task_id>[/dim]")
+                        continue
+                    result = await SUBAGENT.wait(
+                        parts[2],
+                        timeout_ms=None,
+                        foreground=True,
+                        include_output=True,
+                    )
+                    if result.get("retrieval_status") == "not_found":
+                        console.print(f"[dim]  Unknown task_id: {parts[2]}[/dim]")
+                        continue
+                    task = result.get("task") or {}
+                    console.print(f"[dim]  Foreground wait finished: {task.get('status', 'unknown')}[/dim]")
+                    _render_subagent_detail(SUBAGENT.status(parts[2]))
+                    continue
+
+                if sub in {"bg", "background"}:
+                    if len(parts) < 3:
+                        console.print("[dim]  Usage: /subagents bg <task_id>[/dim]")
+                        continue
+                    result = SUBAGENT.set_backgrounded(parts[2], True)
+                    if result.get("error"):
+                        console.print(f"[dim]  {result['error']}[/dim]")
+                    else:
+                        console.print(f"[dim]  {parts[2]} moved to background.[/dim]")
+                    continue
+
+                if sub in {"stop", "interrupt", "kill"}:
+                    if len(parts) < 3:
+                        console.print("[dim]  Usage: /subagents stop <task_id> [reason][/dim]")
+                        continue
+                    reason = " ".join(parts[3:]).strip() or "stopped by user"
+                    result = SUBAGENT.stop(parts[2], reason=reason)
+                    if result.get("error"):
+                        console.print(f"[dim]  {result['error']}[/dim]")
+                    else:
+                        console.print(f"[dim]  stop requested for {parts[2]}.[/dim]")
+                    continue
+
+                console.print(
+                    "[dim]  Unknown subcommand. Try: /subagents output|transcript|fg|bg|stop <id>[/dim]"
+                )
                 continue
 
             if query == "/inbox":
@@ -779,7 +1018,8 @@ async def main():
                 continue
 
             if query.startswith("/"):
-                console.print(f"[dim]  Unknown command: {query}. Type /help.[/dim]")
+                console.print(f"[dim]  Unknown command: {query}[/dim]")
+                console.print("[dim]  Commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /bg /team /subagents /inbox /status /help[/dim]")
                 continue
 
             # ---- Normal message ----
@@ -806,6 +1046,7 @@ async def main():
             print()
 
     finally:
+        set_permission_prompt_handler(None)
         await heartbeat.stop()
         await CRON.stop()
         if mcp_client:

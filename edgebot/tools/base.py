@@ -50,9 +50,19 @@ class BaseTool(abc.ABC):
         """Run the tool."""
         pass
 
-    @property
-    def concurrency_safe(self) -> bool:
+    def is_read_only(self, params: dict[str, Any] | None = None) -> bool:
+        """Whether this tool invocation is read-only."""
         return False
+
+    def concurrency_safe(self, params: dict[str, Any] | None = None) -> bool:
+        """
+        Whether this tool invocation may run concurrently.
+
+        Mirrors claude-code's shape where concurrency safety is decided from the
+        input of the current call. By default, Edgebot treats read-only tool
+        invocations as concurrency-safe.
+        """
+        return self.is_read_only(params)
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Best-effort JSON-schema-based parameter coercion."""

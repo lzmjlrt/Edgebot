@@ -1,8 +1,12 @@
 """
-edgebot/agent/memory.py - Memory store and two-phase memory consolidation.
+edgebot/agent/memory.py - Memory store and two-phase Dream consolidation.
 
-Adds a structured middle history layer so compressed context can still feed
-later long-term memory updates and prompt construction.
+Phase 1: LLM analyzes conversation history + archived entries, extracts
+         structured facts tagged [USER|SOUL|MEMORY].
+
+Phase 2: AgentRunner with read_file / edit_file tools performs targeted,
+         incremental edits to USER.md, SOUL.md, MEMORY.md — instead of
+         fragile text-parsing.
 """
 
 from __future__ import annotations
@@ -12,11 +16,13 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-import litellm
 from rich.console import Console
 
-from edgebot.config import API_BASE, API_KEY, MEMORY_DIR, MODEL, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
+from edgebot.config import MEMORY_DIR, MODEL, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
+from edgebot.providers.base import LLMProvider
+from edgebot.tools.base import BaseTool
 
 _console = Console()
 
@@ -25,7 +31,6 @@ HISTORY_FILE = MEMORY_DIR / "history.jsonl"
 CURSOR_FILE = MEMORY_DIR / ".cursor"
 DREAM_CURSOR_FILE = MEMORY_DIR / ".dream_cursor"
 
-# How many recent messages to analyze per consolidation
 _MAX_MESSAGES = 30
 _MAX_ARCHIVED_BATCH = 20
 
@@ -49,16 +54,13 @@ REJECT AGGRESSIVELY:
 - Code patterns or facts derivable from reading the codebase
 - Anything already in USER.md / SOUL.md / MEMORY.md (even paraphrased)
 - Assistant's own behavior unless user EXPLICITLY corrected it
-- Any key-value fact (e.g. "Technical Level: expert") whose key already has a value
-  in USER.md — even if the value differs. Upsert is handled by code; don't re-emit
+- Any key-value fact whose key already has a value in USER.md
 
 Category rules:
 [USER]   Only identity/preferences/habits the user stated with emphasis
-         (e.g. "I always use Python 3.12", "I prefer Chinese")
 [SOUL]   Only when user EXPLICITLY corrects the assistant's tone/style
-         (e.g. "please answer more briefly from now on")
 [MEMORY] Only new architectural decisions, confirmed solutions, or long-lived
-         project facts (e.g. "project uses LiteLLM, not direct SDKs")
+         project facts
 
 If in doubt, SKIP. Polluting memory is worse than missing one fact.
 If nothing qualifies: [SKIP] no high-value information
@@ -76,47 +78,36 @@ If nothing qualifies: [SKIP] no high-value information
 {conversation}
 """
 
-PHASE2_PROMPT = """\
-Based on the analysis below, output the exact edits needed.
-For each edit, use this EXACT format (including the === markers):
+PHASE2_SYSTEM_PROMPT = """\
+You are a memory maintenance agent. Your job is to update long-term memory
+files based on the analysis provided.
 
-===FILE: USER.md===
-===ACTION: append===
-- New fact to add
+You have access to read_file and edit_file tools. Follow this workflow:
 
-===FILE: SOUL.md===
-===ACTION: append===
-- New behavior note
+1. Read the current contents of USER.md, SOUL.md, and MEMORY.md
+2. For each fact in the analysis:
+   - Check if it's already present (exact or paraphrased)
+   - If new, use edit_file to append it to the correct file
+3. Rules:
+   - For USER.md: treat "- Key: value" lines as upserts (update if key exists)
+   - For SOUL.md and MEMORY.md: append only, never delete existing content
+   - Keep entries as concise bullet points
+   - Never duplicate information already present
+   - If nothing to update, do nothing and respond with "No updates needed."
 
-===FILE: MEMORY.md===
-===ACTION: append===
-- New knowledge entry
-
-Rules:
-- ACTION can be: append (add lines to end of file) or skip (no changes)
-- Only output files that actually need changes
-- Preserve all existing correct content — only ADD new information
-- Keep entries as concise bullet points
-- If nothing to update, output only: [SKIP]
-
-## Analysis
-{phase1_output}
-
-## Current File Contents
-
-### USER.md
-{user_content}
-
-### SOUL.md
-{soul_content}
-
-### MEMORY.md
-{memory_content}
+Files are located at:
+- USER.md:   {user_path}
+- SOUL.md:   {soul_path}
+- MEMORY.md: {memory_path}
 """
 
 
+# ---------------------------------------------------------------------------
+# MemoryStore — pure file I/O layer
+# ---------------------------------------------------------------------------
+
 class MemoryStore:
-    """Pure file I/O layer for Edgebot memory files."""
+    """Pure file I/O for Edgebot memory files."""
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -174,7 +165,6 @@ class MemoryStore:
             return None
 
     def append_history(self, content: str) -> int:
-        """Append summarized archived history and return its cursor."""
         cursor = self._next_cursor()
         record = {
             "cursor": cursor,
@@ -219,6 +209,10 @@ class MemoryStore:
 _STORE = MemoryStore(WORKDIR)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _read_file(path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -227,13 +221,12 @@ def _read_file(path) -> str:
 
 
 def _format_messages(messages: list[dict]) -> str:
-    """Format messages into a readable conversation transcript."""
     lines = []
     for msg in messages:
         role = msg.get("role", "?")
         content = msg.get("content", "")
         if role == "tool":
-            continue  # Skip tool results for brevity
+            continue
         if not content:
             continue
         if isinstance(content, str):
@@ -242,11 +235,7 @@ def _format_messages(messages: list[dict]) -> str:
 
 
 def _filter_dedup(analysis: str, existing_blob: str) -> str:
-    """
-    Drop Phase 1 lines whose factual content is substantially covered by the
-    existing memory blob (USER+SOUL+MEMORY concatenated).
-    Uses a simple word-overlap heuristic.
-    """
+    """Drop Phase 1 lines substantially covered by existing memory."""
     existing_lower = existing_blob.lower()
     kept: list[str] = []
     for raw in analysis.splitlines():
@@ -263,167 +252,59 @@ def _filter_dedup(analysis: str, existing_blob: str) -> str:
         if tag == "SKIP":
             kept.append(raw)
             continue
-        words = [w for w in re.findall(r"[a-z0-9_]+", content) if len(w) > 3]
+        words = [w for w in re.findall(r"[a-z0-9_一-鿿]+", content) if len(w) > 1]
         if not words:
             kept.append(raw)
             continue
         hit = sum(1 for w in words if w in existing_lower)
         if hit / len(words) >= 0.7:
-            continue  # too similar to existing — drop
+            continue
         kept.append(raw)
     return "\n".join(kept)
 
 
-def _parse_phase2(output: str) -> list[dict]:
-    """
-    Parse Phase 2 LLM output into edit operations.
-    Returns [{file, action, content}].
-    """
-    edits = []
-    blocks = re.split(r"===FILE:\s*(.+?)===", output)
-    # blocks: ['preamble', 'USER.md', '\n===ACTION: append===\n- fact\n', 'SOUL.md', ...]
-    i = 1
-    while i < len(blocks) - 1:
-        filename = blocks[i].strip()
-        body = blocks[i + 1]
-        action_match = re.search(r"===ACTION:\s*(\w+)===", body)
-        action = action_match.group(1) if action_match else "skip"
-        # Content is everything after the ACTION line
-        content = re.sub(r"===ACTION:\s*\w+===\s*", "", body).strip()
-        if action != "skip" and content:
-            edits.append({"file": filename, "action": action, "content": content})
-        i += 2
-    return edits
-
-
 def _normalize_line(line: str) -> str:
-    """Normalize a bullet line for duplicate detection."""
     s = line.strip().lstrip("-*").strip()
     s = re.sub(r"\*\*|__|\*|_", "", s)
     s = re.sub(r"\s+", " ", s).lower()
     return s
 
 
-_KV_RE = re.compile(r"^[\s\-*]*\*?\*?([A-Za-z][A-Za-z \w/]*?)\*?\*?\s*:\s*(.+)$")
-
-
-def _parse_kv(text: str) -> tuple[dict, list[str]]:
-    """
-    Split *text* into key/value upserts (`Language: Chinese`) and everything else
-    (headers, blanks, free prose). Returns ({normalized_key: original_line}, non_kv_lines_in_order).
-    """
-    kvs: dict[str, str] = {}
-    rest: list[str] = []
-    for line in text.splitlines():
-        m = _KV_RE.match(line.strip())
-        if m and m.group(2).strip():
-            key = _normalize_line(m.group(1))
-            # Real values always win over placeholder-only values like "(your name)".
-            is_placeholder = m.group(2).strip().startswith("(")
-            existing = kvs.get(key)
-            if existing is None or not is_placeholder:
-                # Latest real value wins; placeholders never overwrite an existing entry.
-                kvs[key] = line.rstrip()
-        else:
-            rest.append(line.rstrip())
-    return kvs, rest
-
-
-def _apply_user_upsert(path, new_block: str) -> bool:
-    """
-    For USER.md: treat '- Key: value' lines as upserts; preserve non-KV content.
-    Returns True if the file was rewritten.
-    """
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    old_kvs, old_rest = _parse_kv(existing)
-    new_kvs, _ = _parse_kv(new_block)
-    if not new_kvs:
-        return False
-    merged = {**old_kvs, **new_kvs}  # new overrides
-    rebuilt = "\n".join(old_rest).rstrip() + "\n\n" + "\n".join(merged.values()) + "\n"
-    if rebuilt == existing:
-        return False
-    path.write_text(rebuilt, encoding="utf-8")
-    return True
-
-
-def _apply_line_dedup_append(path, new_block: str) -> bool:
-    """For SOUL.md / MEMORY.md: append only lines not already present."""
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    existing_norm = {n for n in (_normalize_line(l) for l in existing.splitlines()) if n}
-    kept: list[str] = []
-    for raw in new_block.splitlines():
-        n = _normalize_line(raw)
-        if not n:
-            kept.append(raw)
-            continue
-        if n in existing_norm:
-            continue
-        existing_norm.add(n)
-        kept.append(raw)
-    while kept and not kept[0].strip():
-        kept.pop(0)
-    while kept and not kept[-1].strip():
-        kept.pop()
-    if not kept:
-        return False
-    new_content = existing.rstrip() + "\n\n" + "\n".join(kept) + "\n"
-    path.write_text(new_content, encoding="utf-8")
-    return True
-
-
-def _apply_edits(edits: list[dict]) -> set[str]:
-    """Apply parsed edits to workspace files. Returns the set of file names updated."""
-    file_map = {
-        "USER.md": USER_MD_PATH,
-        "SOUL.md": SOUL_MD_PATH,
-        "MEMORY.md": MEMORY_FILE,
-    }
-    updated: set[str] = set()
-    for edit in edits:
-        path = file_map.get(edit["file"])
-        if not path or edit["action"] != "append":
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if edit["file"] == "USER.md":
-            changed = _apply_user_upsert(path, edit["content"])
-        else:
-            changed = _apply_line_dedup_append(path, edit["content"])
-        if changed:
-            updated.add(edit["file"])
-    return updated
-
-
 def cleanup_memory_files_once() -> None:
-    """
-    One-shot cleanup for existing USER.md/SOUL.md/MEMORY.md accumulated duplicates.
-    Leaves a marker so it runs at most once per workspace.
-    """
+    """One-shot cleanup for duplicates in USER.md / SOUL.md / MEMORY.md."""
     marker = MEMORY_DIR / ".memory_cleaned"
     if marker.exists():
         return
+    _KV_RE = re.compile(r"^[\s\-*]*\*?\*?([A-Za-z][A-Za-z \w/]*?)\*?\*?\s*:\s*(.+)$")
     results: list[str] = []
     for fname, path in (
-        ("USER.md",   USER_MD_PATH),
-        ("SOUL.md",   SOUL_MD_PATH),
+        ("USER.md", USER_MD_PATH),
+        ("SOUL.md", SOUL_MD_PATH),
         ("MEMORY.md", MEMORY_FILE),
     ):
         if not path.exists():
             continue
         original = path.read_text(encoding="utf-8")
         if fname == "USER.md":
-            kvs, rest = _parse_kv(original)
+            kvs: dict[str, str] = {}
+            rest: list[str] = []
+            for ln in original.splitlines():
+                m = _KV_RE.match(ln.strip())
+                if m and m.group(2).strip():
+                    kvs[_normalize_line(m.group(1))] = ln.rstrip()
+                else:
+                    rest.append(ln.rstrip())
             rebuilt = "\n".join(rest).rstrip() + ("\n\n" + "\n".join(kvs.values()) if kvs else "") + "\n"
         else:
             seen: set[str] = set()
             kept: list[str] = []
-            for line in original.splitlines():
-                n = _normalize_line(line)
+            for ln in original.splitlines():
+                n = _normalize_line(ln)
                 if n and n in seen:
                     continue
                 if n:
                     seen.add(n)
-                kept.append(line)
+                kept.append(ln)
             rebuilt = "\n".join(kept).rstrip() + "\n"
         if rebuilt != original:
             path.write_text(rebuilt, encoding="utf-8")
@@ -438,58 +319,47 @@ def cleanup_memory_files_once() -> None:
         )
 
 
-class DreamProcessor:
-    """
-    Dream-like memory processor for Edgebot.
+# ---------------------------------------------------------------------------
+# Dream processor
+# ---------------------------------------------------------------------------
 
-    This sits between short-lived session history and long-term memory files.
-    It consumes archived history in batches, optionally mixes in recent live
-    conversation, and then performs the existing two-phase extraction flow.
+class DreamProcessor:
+    """Two-phase memory processor using the provider abstraction.
+
+    Phase 1: LLM analyzes conversation + archived history → structured facts.
+    Phase 2: AgentRunner with read_file / edit_file tools makes targeted edits.
     """
 
     def __init__(
         self,
         store: MemoryStore,
+        provider: LLMProvider,
         *,
         model: str = MODEL,
-        api_key: str = API_KEY,
-        api_base: str | None = API_BASE,
         max_live_messages: int = _MAX_MESSAGES,
         max_archived_batch: int = _MAX_ARCHIVED_BATCH,
         emit_output: bool = True,
     ):
         self.store = store
+        self.provider = provider
         self.model = model
-        self.api_key = api_key
-        self.api_base = api_base
         self.max_live_messages = max_live_messages
         self.max_archived_batch = max_archived_batch
         self.emit_output = emit_output
 
+    # ---- input preparation ----
+
     def _select_archived_batch(self) -> list[dict]:
-        entries = self.store.read_unprocessed_history(self.store.get_last_dream_cursor())
-        return entries[: self.max_archived_batch]
+        entries = self.store.read_unprocessed_history(
+            self.store.get_last_dream_cursor()
+        )
+        return entries[:self.max_archived_batch]
 
     def _select_live_messages(self, messages: list[dict]) -> list[dict]:
-        return messages[-self.max_live_messages :]
-
-    def _build_inputs(self, messages: list[dict]) -> dict[str, object]:
-        live_messages = self._select_live_messages(messages)
-        archived_batch = self._select_archived_batch()
-        substantive = [
-            message
-            for message in live_messages
-            if message.get("role") in ("user", "assistant") and message.get("content")
-        ]
-        return {
-            "live_messages": live_messages,
-            "archived_batch": archived_batch,
-            "has_signal": bool(archived_batch) or len(substantive) >= 6,
-        }
+        return messages[-self.max_live_messages:]
 
     def _build_conversation_context(
         self,
-        *,
         archived_batch: list[dict],
         live_messages: list[dict],
     ) -> str:
@@ -498,7 +368,6 @@ class DreamProcessor:
             for entry in archived_batch
         )
         recent_conversation = _format_messages(live_messages)
-
         parts: list[str] = []
         if archived_history:
             parts.append(f"## Archived History\n{archived_history}")
@@ -506,13 +375,14 @@ class DreamProcessor:
             parts.append(f"## Live Conversation\n{recent_conversation}")
         return "\n\n".join(parts)
 
+    # ---- Phase 1: analysis (plain LLM call, no tools) ----
+
     async def _phase1_analyze(
         self,
-        *,
+        conversation: str,
         user_content: str,
         soul_content: str,
         memory_content: str,
-        conversation: str,
     ) -> str | None:
         prompt = PHASE1_PROMPT.format(
             user_content=user_content,
@@ -521,65 +391,113 @@ class DreamProcessor:
             conversation=conversation,
         )
         try:
-            response = await litellm.acompletion(
-                model=self.model,
+            response = await self.provider.chat_with_retry(
                 messages=[{"role": "user", "content": prompt}],
+                tools=None,
+                model=self.model,
                 max_tokens=2000,
-                api_key=self.api_key,
-                api_base=self.api_base,
+                temperature=0.3,
             )
-            return response.choices[0].message.content or ""
+            if response.finish_reason == "error":
+                return None
+            return response.content or ""
         except Exception as exc:
             if self.emit_output:
                 _console.print(f"[dim red]  [memory] phase 1 failed: {exc}[/dim red]")
             return None
 
-    async def _phase2_plan_edits(
+    # ---- Phase 2: agent-runner with read_file / edit_file ----
+
+    async def _phase2_execute(
         self,
-        *,
         analysis: str,
         user_content: str,
         soul_content: str,
         memory_content: str,
-    ) -> str | None:
-        prompt = PHASE2_PROMPT.format(
-            phase1_output=analysis,
-            user_content=user_content,
-            soul_content=soul_content,
-            memory_content=memory_content,
+    ) -> list[dict[str, str]]:
+        """Run Phase 2 via AgentRunner with read_file and edit_file tools."""
+        from edgebot.agent.runner import AgentRunner, AgentRunSpec
+
+        # Build a minimal tool set for the dream agent
+        tools, handlers = self._build_dream_tools()
+
+        system_prompt = PHASE2_SYSTEM_PROMPT.format(
+            user_path=str(self.store.user_file),
+            soul_path=str(self.store.soul_file),
+            memory_path=str(self.store.memory_file),
         )
-        try:
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                api_key=self.api_key,
-                api_base=self.api_base,
-            )
-            return response.choices[0].message.content or ""
-        except Exception as exc:
-            if self.emit_output:
-                _console.print(f"[dim red]  [memory] phase 2 failed: {exc}[/dim red]")
-            return None
+        user_prompt = (
+            f"## Analysis Result\n{analysis}\n\n"
+            f"## Current File Contents\n\n"
+            f"### USER.md\n{user_content}\n\n"
+            f"### SOUL.md\n{soul_content}\n\n"
+            f"### MEMORY.md\n{memory_content}"
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        runner = AgentRunner(self.provider)
+        result = await runner.run(AgentRunSpec(
+            initial_messages=messages,
+            provider=self.provider,
+            tools=tools,
+            tool_handlers=handlers,
+            model=self.model,
+            max_iterations=15,
+            max_tokens=4000,
+            max_tool_result_chars=16_000,
+            emit_output=self.emit_output,
+            assistant_label="Dream",
+        ))
+
+        changelog: list[dict[str, str]] = []
+        for ev in result.tool_names_used:
+            if ev.startswith("edit_file") or ev.startswith("write_file"):
+                changelog.append({"name": ev, "status": "ok", "detail": "file updated"})
+        return changelog
+
+    def _build_dream_tools(self) -> tuple[list[dict], dict[str, Any]]:
+        """Build read_file + edit_file tools scoped to the memory workspace."""
+        from edgebot.tools.base import safe_path
+        from edgebot.config import WORKDIR
+
+        tools: list[dict] = []
+        handlers: dict[str, Any] = {}
+
+        read_tool = _DreamReadTool(self.store.workspace)
+        edit_tool = _DreamEditTool(self.store.workspace)
+
+        tools.append(read_tool.to_openai())
+        handlers[read_tool.name] = read_tool.execute
+        tools.append(edit_tool.to_openai())
+        handlers[edit_tool.name] = edit_tool.execute
+
+        return tools, handlers
+
+    # ---- cursor management ----
 
     def _advance_cursor(self, archived_batch: list[dict]) -> None:
         if archived_batch:
             self.store.set_last_dream_cursor(archived_batch[-1]["cursor"])
 
+    # ---- main entry ----
+
     async def run(self, messages: list[dict]) -> bool:
-        """
-        Process one Dream cycle. Returns True if memory files changed.
-        """
-        inputs = self._build_inputs(messages)
-        archived_batch = inputs["archived_batch"]
-        live_messages = inputs["live_messages"]
-        if not inputs["has_signal"]:
+        """Run one Dream cycle. Returns True if memory files changed."""
+        live_messages = self._select_live_messages(messages)
+        archived_batch = self._select_archived_batch()
+
+        substantive = [
+            m for m in live_messages
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        has_signal = bool(archived_batch) or len(substantive) >= 6
+        if not has_signal:
             return False
 
-        conversation = self._build_conversation_context(
-            archived_batch=archived_batch,
-            live_messages=live_messages,
-        )
+        conversation = self._build_conversation_context(archived_batch, live_messages)
         if not conversation.strip():
             return False
 
@@ -587,11 +505,9 @@ class DreamProcessor:
         soul_content = self.store.read_soul()
         memory_content = self.store.read_memory()
 
+        # Phase 1: extract structured facts
         analysis = await self._phase1_analyze(
-            user_content=user_content,
-            soul_content=soul_content,
-            memory_content=memory_content,
-            conversation=conversation,
+            conversation, user_content, soul_content, memory_content,
         )
         if analysis is None:
             return False
@@ -599,40 +515,115 @@ class DreamProcessor:
             self._advance_cursor(archived_batch)
             return False
 
+        # Dedup against existing content
         existing_blob = "\n".join([user_content, soul_content, memory_content])
-        filtered_analysis = _filter_dedup(analysis, existing_blob)
+        filtered = _filter_dedup(analysis, existing_blob)
         if not any(
             re.match(r"^\s*\[(USER|SOUL|MEMORY)\]", line)
-            for line in filtered_analysis.splitlines()
+            for line in filtered.splitlines()
         ):
             self._advance_cursor(archived_batch)
             return False
 
-        edit_output = await self._phase2_plan_edits(
-            analysis=filtered_analysis,
-            user_content=user_content,
-            soul_content=soul_content,
-            memory_content=memory_content,
-        )
-        if edit_output is None:
-            return False
-        if "[SKIP]" in edit_output:
-            self._advance_cursor(archived_batch)
-            return False
-
-        edits = _parse_phase2(edit_output)
-        if not edits:
-            self._advance_cursor(archived_batch)
-            return False
-
-        updated = _apply_edits(edits)
-        self._advance_cursor(archived_batch)
-        if updated:
+        # Phase 2: agent edits files via tools
+        try:
+            changelog = await self._phase2_execute(
+                filtered, user_content, soul_content, memory_content,
+            )
+        except Exception as exc:
             if self.emit_output:
-                _console.print(f"[dim]  [memory] updated {', '.join(sorted(updated))}[/dim]")
+                _console.print(f"[dim red]  [memory] phase 2 failed: {exc}[/dim red]")
+            self._advance_cursor(archived_batch)
+            return False
+
+        self._advance_cursor(archived_batch)
+
+        if changelog:
+            if self.emit_output:
+                files = [ev["name"] for ev in changelog]
+                _console.print(
+                    f"[dim]  [memory] Dream updated: {', '.join(files)}[/dim]"
+                )
             return True
         return False
 
+
+# ---------------------------------------------------------------------------
+# Dream-scoped tools (read/edit restricted to workspace memory files)
+# ---------------------------------------------------------------------------
+
+class _DreamReadTool(BaseTool):
+    """read_file scoped to the workspace for Dream agent."""
+
+    @property
+    def name(self) -> str:
+        return "read_file"
+
+    @property
+    def description(self) -> str:
+        return "Read file contents. Use this to check current memory file contents."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to file to read."},
+            },
+            "required": ["path"],
+        }
+
+    def is_read_only(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
+    def __init__(self, workspace: Path):
+        self._workspace = workspace
+
+    def execute(self, **kwargs: Any) -> Any:
+        from edgebot.tools.filesystem import run_read
+        return run_read(kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1))
+
+
+class _DreamEditTool(BaseTool):
+    """edit_file scoped to workspace memory files for Dream agent."""
+
+    @property
+    def name(self) -> str:
+        return "edit_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Replace exact text in a file. Use this to update USER.md, "
+            "SOUL.md, or MEMORY.md with new information."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File to edit."},
+                "old_text": {"type": "string", "description": "Exact text to find."},
+                "new_text": {"type": "string", "description": "Replacement text."},
+            },
+            "required": ["path", "old_text", "new_text"],
+        }
+
+    def __init__(self, workspace: Path):
+        self._workspace = workspace
+
+    def execute(self, **kwargs: Any) -> Any:
+        from edgebot.tools.filesystem import run_edit
+        return run_edit(
+            kwargs["path"], kwargs["old_text"], kwargs["new_text"],
+            kwargs.get("replace_all", False),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 _DREAMS: dict[tuple[Path, bool], DreamProcessor] = {}
 
@@ -643,11 +634,17 @@ def get_dream_processor(
     emit_output: bool = True,
 ) -> DreamProcessor:
     """Return a cached DreamProcessor for the given store/workspace."""
+    from edgebot.config import create_provider
+
     target_store = store or _STORE
     key = (target_store.workspace.resolve(), emit_output)
     processor = _DREAMS.get(key)
     if processor is None:
-        processor = DreamProcessor(target_store, emit_output=emit_output)
+        processor = DreamProcessor(
+            target_store,
+            provider=create_provider(),
+            emit_output=emit_output,
+        )
         _DREAMS[key] = processor
     return processor
 
@@ -658,7 +655,5 @@ async def consolidate_memory(
     *,
     emit_output: bool = True,
 ) -> bool:
-    """
-    Backward-compatible wrapper around the Dream-like processor.
-    """
+    """Run one Dream consolidation cycle."""
     return await get_dream_processor(store, emit_output=emit_output).run(messages)

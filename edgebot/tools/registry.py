@@ -6,8 +6,9 @@ and tool handler dispatch dict.
 from __future__ import annotations
 
 from edgebot.background.manager import BackgroundManager
-from edgebot.config import CRON_STORE_PATH, LEGACY_SKILLS_DIR, SKILLS_DIR
+from edgebot.config import CRON_STORE_PATH, LEGACY_SKILLS_DIR, PERMISSIONS_FILE, SKILLS_DIR
 from edgebot.cron.service import CronService
+from edgebot.permissions import PermissionManager
 from edgebot.skills.loader import SkillLoader
 from edgebot.subagent.runner import SubagentRunner
 from edgebot.tasks.manager import TaskManager
@@ -23,6 +24,7 @@ BUS = MessageBus()
 TEAM = TeammateManager(BUS, TASK_MGR)
 SUBAGENT = SubagentRunner()
 CRON = CronService(CRON_STORE_PATH)
+PERMISSIONS = PermissionManager(PERMISSIONS_FILE)
 
 TOOL_HANDLERS: dict[str, object] = {}
 TOOLS: list[dict] = []
@@ -39,6 +41,11 @@ def register_tool(tool_instance) -> None:
 def get_tool_instance(name: str):
     """Return a registered tool instance by name."""
     return _TOOL_INSTANCES.get(name)
+
+
+def set_permission_prompt_handler(handler) -> None:
+    """Register an async permission prompt handler for interactive sessions."""
+    PERMISSIONS.set_prompt_handler(handler)
 
 
 def prepare_call(name: str, params: dict) -> tuple[object | None, dict, str | None]:
@@ -95,22 +102,30 @@ def init_builtin_tools() -> None:
         TaskListTool,
         TaskUpdateTool,
     )
-    from edgebot.tools.builtin.team_manager import (
+    from edgebot.tools.builtin.background import (
         BackgroundRunTool,
-        BroadcastTool,
         CheckBackgroundTool,
-        CompressTool,
+        TaskOutputTool,
+    )
+    from edgebot.tools.builtin.skills import LoadSkillTool
+    from edgebot.tools.builtin.subagent import (
+        CheckSubagentTool,
+        ControlSubagentTool,
+        ListSubagentsTool,
+        TaskTool,
+        WaitSubagentTool,
+    )
+    from edgebot.tools.builtin.team import (
+        BroadcastTool,
         IdleTool,
         ListTeammatesTool,
-        LoadSkillTool,
         PlanApprovalTool,
         ReadInboxTool,
         SendMessageTool,
         ShutdownRequestTool,
         SpawnTeammateTool,
-        TaskTool,
-        TodoWriteTool,
     )
+    from edgebot.tools.builtin.todo import CompressTool, TodoWriteTool
 
     for tool in [
         ReadFileTool(),
@@ -136,6 +151,11 @@ def init_builtin_tools() -> None:
         PlanApprovalTool(),
         BackgroundRunTool(),
         CheckBackgroundTool(),
+        CheckSubagentTool(),
+        ListSubagentsTool(),
+        ControlSubagentTool(),
+        WaitSubagentTool(),
+        TaskOutputTool(),
         CompressTool(),
         CronTool(CRON),
     ]:

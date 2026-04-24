@@ -2,7 +2,7 @@
 edgebot/tools/builtin/filesystem.py - File tools ported to BaseTool.
 """
 from typing import Any
-from edgebot.tools.base import safe_path, BaseTool
+from edgebot.tools.base import BaseTool
 from edgebot.tools.filesystem import run_edit, run_list_dir, run_read, run_write
 
 class ReadFileTool(BaseTool):
@@ -12,6 +12,7 @@ class ReadFileTool(BaseTool):
     def description(self) -> str: return "Read file contents."
     @property
     def parameters(self) -> dict: return {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 1}}, "required": ["path"]}
+    def is_read_only(self, params: dict[str, Any] | None = None) -> bool: return True
     def execute(self, **kwargs: Any) -> Any: return run_read(kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1))
 
 class WriteFileTool(BaseTool):
@@ -39,4 +40,5 @@ class ListDirTool(BaseTool):
     def description(self) -> str: return "List directory contents."
     @property
     def parameters(self) -> dict: return {"type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000}}, "required": ["path"]}
+    def is_read_only(self, params: dict[str, Any] | None = None) -> bool: return True
     def execute(self, **kwargs: Any) -> Any: return run_list_dir(kwargs["path"], kwargs.get("recursive", False), kwargs.get("max_entries", 200))

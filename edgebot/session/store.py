@@ -42,6 +42,39 @@ def find_legal_start(messages: list[dict]) -> int:
     return start
 
 
+def _dedup_messages(messages: list[dict]) -> list[dict]:
+    """Remove duplicate messages loaded from a session file.
+
+    Rules:
+    1. For tool results, keep only the LAST occurrence per tool_call_id.
+    2. Drop consecutive messages that are identical (same role + content).
+    """
+    # Pass 1: deduplicate tool_call_id — keep last occurrence
+    last_tc_idx: dict[str, int] = {}
+    for i, msg in enumerate(messages):
+        tcid = msg.get("tool_call_id")
+        if tcid:
+            last_tc_idx[tcid] = i
+    if last_tc_idx:
+        keep_tc = set(last_tc_idx.values())
+        messages = [m for i, m in enumerate(messages) if m.get("role") != "tool" or i in keep_tc]
+
+    # Pass 2: drop consecutive identical messages (same role + content)
+    deduped: list[dict] = []
+    for msg in messages:
+        if deduped:
+            prev = deduped[-1]
+            if (
+                msg.get("role") == prev.get("role")
+                and msg.get("content") == prev.get("content")
+                and msg.get("tool_call_id") == prev.get("tool_call_id")
+                and msg.get("tool_calls") == prev.get("tool_calls")
+            ):
+                continue
+        deduped.append(msg)
+    return deduped
+
+
 class SessionStore:
     def __init__(
         self,
@@ -169,7 +202,7 @@ class SessionStore:
             restored = True
 
         checkpoint = metadata.get("runtime_checkpoint")
-        if isinstance(checkpoint, dict):
+        if isinstance(checkpoint, dict) and checkpoint.get("phase") != "final_response":
             assistant_message = checkpoint.get("assistant_message")
             completed_tool_results = checkpoint.get("completed_tool_results") or []
             pending_tool_calls = checkpoint.get("pending_tool_calls") or []
@@ -273,6 +306,7 @@ class SessionStore:
         start = find_legal_start(messages)
         if start:
             messages = messages[start:]
+        messages = _dedup_messages(messages)
         state["messages"] = messages
 
         touched = self._restore_state(state)
@@ -303,6 +337,13 @@ class SessionStore:
         """Append a single message dict to the session file."""
         state = self.load_state(session_key)
         state["messages"].append(message)
+        state["updated_at"] = datetime.now(timezone.utc)
+        self.save_state(session_key, state)
+
+    def batch_append(self, session_key: str, new_messages: list[dict]) -> None:
+        """Append multiple messages in a single load/save cycle."""
+        state = self.load_state(session_key)
+        state["messages"].extend(new_messages)
         state["updated_at"] = datetime.now(timezone.utc)
         self.save_state(session_key, state)
 

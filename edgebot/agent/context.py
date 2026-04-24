@@ -22,8 +22,6 @@ from edgebot.config import (
     USER_MD_PATH,
     WORKDIR,
 )
-from edgebot.agent.memory import MemoryStore
-from edgebot.skills.loader import SkillLoader
 
 BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
 _SEEDED_ONLY_FILES = ["HEARTBEAT.md"]
@@ -36,8 +34,6 @@ _BOOTSTRAP_PATHS = {
 _SEEDED_ONLY_PATHS = {
     "HEARTBEAT.md": HEARTBEAT_MD_PATH,
 }
-_SKILLS = SkillLoader(SKILLS_DIR, extra_workspace_dirs=[LEGACY_SKILLS_DIR] if LEGACY_SKILLS_DIR.exists() else None)
-_MEMORY = MemoryStore(WORKDIR)
 _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
 _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
@@ -121,27 +117,31 @@ def build_system_prompt(skills_descriptions: str | None = None) -> str:
                 pass
 
     # 3. Long-term memory (memory/MEMORY.md)
-    memory_context = _MEMORY.get_memory_context()
+    from edgebot.agent.memory import _STORE as _memory
+
+    memory_context = _memory.get_memory_context()
     if memory_context:
         parts.append(memory_context)
 
     # 4. Active always-skills
-    _SKILLS.reload()
-    always_skills = _SKILLS.get_always_skills()
+    from edgebot.tools.registry import SKILLS as _skills
+
+    _skills.reload()
+    always_skills = _skills.get_always_skills()
     if always_skills:
-        always_content = _SKILLS.load_skills_for_context(always_skills)
+        always_content = _skills.load_skills_for_context(always_skills)
         if always_content:
             parts.append(f"## Active Skills\n\n{always_content}")
 
     # 5. Skills summary
     summary = skills_descriptions
     if summary is None:
-        summary = _SKILLS.build_skills_summary(exclude=set(always_skills))
+        summary = _skills.build_skills_summary(exclude=set(always_skills))
     if summary and summary != "(no skills)":
         parts.append(f"## Available Skills\n\n{summary}")
 
     # 6. Recent archived history that has not yet been folded into MEMORY.md
-    recent_history_entries = _MEMORY.read_unprocessed_history(_MEMORY.get_last_dream_cursor())
+    recent_history_entries = _memory.read_unprocessed_history(_memory.get_last_dream_cursor())
     if recent_history_entries:
         recent_lines = [
             f"- [{entry['timestamp']}] {entry['content']}"

@@ -51,6 +51,7 @@ class AgentRunSpec:
     on_stream_end: Callable[..., Awaitable[None]] | None = None
     on_retry_wait: Callable[[str], Awaitable[None]] | None = None
     checkpoint_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    injection_callback: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None
 
 
 @dataclass(slots=True)
@@ -211,13 +212,17 @@ class AgentRunner:
                     "pending_tool_calls": [],
                 })
 
+                # Injection: drain external events (notifications, subagent results)
+                if spec.injection_callback is not None:
+                    injected = await spec.injection_callback()
+                    if injected:
+                        messages.extend(injected)
+
                 empty_content_retries = 0
                 continue
 
-            # ---- No tool calls: this is the final response ----
-            if spec.on_stream_end is not None:
-                await spec.on_stream_end(resuming=False)
-
+            # ---- No tool calls: potentially the final response ----
+            # Determine final_content BEFORE calling injection_callback.
             clean = response.content
             if response.finish_reason != "error" and not (clean or "").strip():
                 empty_content_retries += 1
@@ -233,6 +238,23 @@ class AgentRunner:
                 stop_reason = "empty_final_response"
             else:
                 final_content = clean
+
+            # Check injection_callback — if new messages arrived, keep looping.
+            injected_messages: list[dict[str, Any]] = []
+            if spec.injection_callback is not None:
+                injected_messages = await spec.injection_callback()
+            if injected_messages:
+                if final_content:
+                    messages.append({"role": "assistant", "content": final_content})
+                messages.extend(injected_messages)
+                if spec.on_stream_end is not None:
+                    await spec.on_stream_end(resuming=True)
+                empty_content_retries = 0
+                continue
+
+            # Truly final — no more work
+            if spec.on_stream_end is not None:
+                await spec.on_stream_end(resuming=False)
 
             if final_content:
                 messages.append({"role": "assistant", "content": final_content})

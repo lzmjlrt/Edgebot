@@ -93,7 +93,6 @@ async def agent_loop(
 ):
     provider = create_provider()
     runner = AgentRunner(provider)
-    rounds_without_todo = 0
     final_response = ""
 
     # Reset per-session turn counter for Dream gating
@@ -107,27 +106,29 @@ async def agent_loop(
         if ac_summary:
             session_summary = ac_summary
 
-    while True:
-        set_tool_runtime_context(
-            channel=channel, chat_id=chat_id, session_key=session_key,
+    # ---- Pre-processing (once) ----
+    set_tool_runtime_context(
+        channel=channel, chat_id=chat_id, session_key=session_key,
+    )
+
+    microcompact(messages)
+    if estimate_tokens(messages) > TOKEN_THRESHOLD:
+        if emit_output:
+            _console.print("[dim]  Auto-compressing context...[/dim]")
+        messages[:] = await auto_compact(
+            messages, is_idle=False, memory_store=_MEMORY,
         )
-
-        # s06: compression pipeline (pre-loop)
-        microcompact(messages)
-        if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            if emit_output:
-                _console.print("[dim]  Auto-compressing context...[/dim]")
-            messages[:] = await auto_compact(
-                messages, is_idle=False, memory_store=_MEMORY,
+        if session_store:
+            session_store.save_all(session_key, messages)
+            session_store.update_metadata(
+                session_key,
+                session_summary=extract_session_summary(messages) or "",
             )
-            if session_store:
-                session_store.save_all(session_key, messages)
-                session_store.update_metadata(
-                    session_key,
-                    session_summary=extract_session_summary(messages) or "",
-                )
 
-        # s08: drain background notifications
+    # ---- Injection callback: drains mid-turn notifications into the runner ----
+    async def _injection_callback() -> list[dict]:
+        injected: list[dict] = []
+
         notifs = bg_mgr.drain()
         if notifs:
             txt = "\n".join(
@@ -137,11 +138,10 @@ async def agent_loop(
                 )
                 for n in notifs
             )
-            messages.append({
+            injected.append({
                 "role": "user",
                 "content": f"<background-results>\n{txt}\n</background-results>",
             })
-            messages.append({"role": "assistant", "content": "Noted background results."})
 
         agent_notifs = await SUBAGENT.drain()
         if agent_notifs:
@@ -152,146 +152,125 @@ async def agent_loop(
                 )
                 for n in agent_notifs
             )
-            messages.append({
+            injected.append({
                 "role": "user",
                 "content": f"<background-results>\n{txt}\n</background-results>",
             })
-            messages.append({"role": "assistant", "content": "Noted agent task results."})
 
-        # s09/s10: check lead inbox
         inbox = bus.read_inbox("lead")
         if inbox:
-            messages.append({
+            injected.append({
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
-            messages.append({"role": "assistant", "content": "Noted inbox messages."})
 
-        # ---- Build the full prompt for the runner ----
-        call_messages = [{"role": "system", "content": system}] + merge_runtime_context_into_messages(
-            messages,
-            channel=channel,
-            chat_id=chat_id,
-            session_key=session_key,
-            session_summary=session_summary,
+        return injected
+
+    # Drain any notifications that arrived before this turn.
+    pre_notifs = await _injection_callback()
+    if pre_notifs:
+        messages.extend(pre_notifs)
+
+    # ---- Build the full prompt for the runner ----
+    call_messages = [{"role": "system", "content": system}] + merge_runtime_context_into_messages(
+        messages,
+        channel=channel,
+        chat_id=chat_id,
+        session_key=session_key,
+        session_summary=session_summary,
+    )
+
+    # ---- Session checkpoint callback ----
+    async def _checkpoint(payload: dict) -> None:
+        if session_store is None:
+            return
+        session_store.update_metadata(session_key, runtime_checkpoint=payload)
+
+    # ---- Streaming callbacks for Rich UI ----
+
+    async def _on_stream(delta: str) -> None:
+        if emit_output:
+            _console.print(delta, end="", highlight=False, soft_wrap=True)
+
+    async def _on_stream_end(*, resuming: bool) -> None:
+        if emit_output:
+            _console.print()
+
+    async def _on_retry_wait(msg: str) -> None:
+        if emit_output:
+            _console.print(f"[dim yellow]  {msg}[/dim yellow]")
+
+    # ---- Run the agent (single call, runner handles tool loop internally) ----
+    result = await runner.run(AgentRunSpec(
+        initial_messages=call_messages,
+        provider=provider,
+        tools=tools,
+        tool_handlers=tool_handlers,
+        model=MODEL,
+        max_iterations=200,
+        max_tokens=8000,
+        retry_mode="standard",
+        emit_output=emit_output,
+        assistant_label=assistant_label,
+        on_stream=_on_stream,
+        on_stream_end=_on_stream_end,
+        on_retry_wait=_on_retry_wait,
+        checkpoint_callback=_checkpoint,
+        injection_callback=_injection_callback,
+    ))
+
+    final_response = result.final_content or ""
+    _flush_stdin()
+
+    # ---- Extract new messages from the runner result ----
+    original_count = len(call_messages)
+    new_msgs = result.messages[original_count:]
+
+    # Update the caller's messages list
+    messages.extend(new_msgs)
+
+    # Save to session — clear checkpoint FIRST to prevent _restore_state
+    # from re-adding messages that we're about to append explicitly.
+    if session_store:
+        session_store.clear_metadata_keys(
+            session_key, "runtime_checkpoint",
+        )
+        session_store.batch_append(session_key, new_msgs)
+        session_store.clear_metadata_keys(
+            session_key, "pending_user_turn",
         )
 
-        # ---- Session checkpoint callback ----
-        async def _checkpoint(payload: dict) -> None:
-            if session_store is None:
-                return
-            session_store.update_metadata(session_key, runtime_checkpoint=payload)
+    # ---- Post-processing (once) ----
 
-        # ---- Streaming callbacks for Rich UI ----
-
-        async def _on_stream(delta: str) -> None:
-            if emit_output:
-                _console.print(delta, end="", highlight=False, soft_wrap=True)
-
-        async def _on_stream_end(*, resuming: bool) -> None:
-            if emit_output:
-                _console.print()
-
-        async def _on_retry_wait(msg: str) -> None:
-            if emit_output:
-                _console.print(f"[dim yellow]  {msg}[/dim yellow]")
-
-        # ---- Run the agent inner loop ----
-        result = await runner.run(AgentRunSpec(
-            initial_messages=call_messages,
-            provider=provider,
-            tools=tools,
-            tool_handlers=tool_handlers,
-            model=MODEL,
-            max_iterations=200,
-            max_tokens=8000,
-            retry_mode="standard",
-            emit_output=emit_output,
-            assistant_label=assistant_label,
-            on_stream=_on_stream,
-            on_stream_end=_on_stream_end,
-            on_retry_wait=_on_retry_wait,
-            checkpoint_callback=_checkpoint,
-        ))
-
-        final_response = result.final_content or ""
-        _flush_stdin()
-
-        # ---- Extract new messages from the runner result ----
-        # The runner returns the full message list; we need to extract
-        # only the new messages added beyond what we sent in.
-        original_count = len(call_messages)
-        new_msgs = result.messages[original_count:]
-
-        # Update the caller's messages list
-        messages.extend(new_msgs)
-
-        # Save to session — clear checkpoint FIRST to prevent _restore_state
-        # from re-adding messages that we're about to append explicitly.
-        if session_store:
-            session_store.clear_metadata_keys(
-                session_key, "runtime_checkpoint",
-            )
-            session_store.batch_append(session_key, new_msgs)
-
-        # Determine if we should continue the outer loop.
-        # Only check the LAST assistant message — earlier ones may have
-        # tool_calls that were already resolved by the runner's inner loop.
-        last_asst = next(
-            (m for m in reversed(new_msgs) if m.get("role") == "assistant"),
-            None,
+    # Handle manual compress
+    if "compress" in result.tool_names_used:
+        if emit_output:
+            _console.print("[dim]  Compressing...[/dim]")
+        messages[:] = await auto_compact(
+            messages, is_idle=False, memory_store=_MEMORY,
         )
-        has_tool_calls = bool(last_asst and last_asst.get("tool_calls"))
-
-        if not has_tool_calls:
-            if session_store:
-                session_store.clear_metadata_keys(
-                    session_key, "pending_user_turn",
-                )
-            return final_response
-
-        # ---- Post-tool-execution processing ----
-        used_todo = any("TodoWrite" in n for n in result.tool_names_used)
-        manual_compress = "compress" in result.tool_names_used
-
-        # s03: nag reminder
-        rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
-        if todo_mgr.has_open_items() and rounds_without_todo >= 3:
-            messages.append({
-                "role": "user",
-                "content": "<reminder>Update your todos.</reminder>",
-            })
-
-        # s06: manual compress
-        if manual_compress:
-            if emit_output:
-                _console.print("[dim]  Compressing...[/dim]")
-            messages[:] = await auto_compact(
-                messages, is_idle=False, memory_store=_MEMORY,
-            )
-            if session_store:
-                session_store.save_all(session_key, messages)
-                session_store.update_metadata(
-                    session_key,
-                    session_summary=extract_session_summary(messages) or "",
-                )
-
         if session_store:
-            session_store.clear_metadata_keys(session_key, "runtime_checkpoint")
+            session_store.save_all(session_key, messages)
+            session_store.update_metadata(
+                session_key,
+                session_summary=extract_session_summary(messages) or "",
+            )
 
-        # Archive turn summary to history.jsonl for Dream
-        if final_response:
-            _archive_turn_summary(messages, final_response)
+    # Archive turn summary to history.jsonl for Dream
+    if final_response:
+        _archive_turn_summary(messages, final_response)
 
-        # Memory consolidation (gated by interval + minimum history)
-        _turn_counter += 1
-        if (
-            _turn_counter >= _CONSOLIDATION_INTERVAL
-            and len(messages) >= _MIN_HISTORY_FOR_MEMORY
-        ):
-            _turn_counter = 0
-            try:
-                await consolidate_memory(messages, store=_MEMORY)
-            except Exception as e:
-                if emit_output:
-                    _console.print(f"[dim red]  [memory] error: {e}[/dim red]")
+    # Memory consolidation (gated by interval + minimum history)
+    _turn_counter += 1
+    if (
+        _turn_counter >= _CONSOLIDATION_INTERVAL
+        and len(messages) >= _MIN_HISTORY_FOR_MEMORY
+    ):
+        _turn_counter = 0
+        try:
+            await consolidate_memory(messages, store=_MEMORY)
+        except Exception as e:
+            if emit_output:
+                _console.print(f"[dim red]  [memory] error: {e}[/dim red]")
+
+    return final_response

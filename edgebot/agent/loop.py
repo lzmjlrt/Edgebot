@@ -234,11 +234,14 @@ async def agent_loop(
             )
             session_store.batch_append(session_key, new_msgs)
 
-        # Determine if we should continue the outer loop
-        has_tool_calls = any(
-            msg.get("tool_calls") for msg in new_msgs
-            if msg.get("role") == "assistant"
+        # Determine if we should continue the outer loop.
+        # Only check the LAST assistant message — earlier ones may have
+        # tool_calls that were already resolved by the runner's inner loop.
+        last_asst = next(
+            (m for m in reversed(new_msgs) if m.get("role") == "assistant"),
+            None,
         )
+        has_tool_calls = bool(last_asst and last_asst.get("tool_calls"))
 
         if not has_tool_calls:
             if session_store:

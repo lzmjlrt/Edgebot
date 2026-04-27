@@ -35,10 +35,19 @@ _MAX_MESSAGES = 30
 _MAX_ARCHIVED_BATCH = 20
 
 PHASE1_PROMPT = """\
-Extract ONLY high-value, stable information from the recent conversation.
-Output one finding per line with the format:
-[USER|SOUL|MEMORY] atomic fact
+You have TWO equally important tasks:
+1. Extract new facts from conversation history
+2. Deduplicate existing memory files — find and flag redundant, overlapping, \
+or stale content even if NOT mentioned in history
 
+Output one line per finding:
+[FILE] atomic fact              (FILE = USER, SOUL, or MEMORY)
+[FILE-REMOVE] content to remove, reason why
+
+Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY \
+(knowledge, project context)
+
+## Task 1 — New fact extraction
 STRICT INCLUSION CRITERIA — a fact must meet ALL of:
 1. Stable — not transient, one-off, or debugging noise
 2. Non-obvious — not derivable from the code or context
@@ -54,15 +63,34 @@ REJECT AGGRESSIVELY:
 - Code patterns or facts derivable from reading the codebase
 - Anything already in USER.md / SOUL.md / MEMORY.md (even paraphrased)
 - Assistant's own behavior unless user EXPLICITLY corrected it
-- Any key-value fact whose key already has a value in USER.md
 
 Category rules:
 [USER]   Only identity/preferences/habits the user stated with emphasis
 [SOUL]   Only when user EXPLICITLY corrects the assistant's tone/style
-[MEMORY] Only new architectural decisions, confirmed solutions, or long-lived
+[MEMORY] Only new architectural decisions, confirmed solutions, or long-lived \
          project facts
 
-If in doubt, SKIP. Polluting memory is worse than missing one fact.
+## Task 2 — Deduplication and staleness
+Scan ALL memory files for these redundancy patterns:
+- Same fact stated in multiple places (e.g., "communicates in Chinese" in both \
+  USER.md and MEMORY.md)
+- Overlapping or nested sections covering the same topic
+- Information in MEMORY.md that is already captured in USER.md or SOUL.md
+- Verbose entries that can be condensed without losing information
+- Corrections: "location is Tokyo, not Osaka" → update USER.md
+
+For each issue found, output [FILE-REMOVE] with the exact content to remove \
+and why. Prefer keeping facts in their canonical location (USER.md for \
+identity/preferences, SOUL.md for behavior, MEMORY.md for project knowledge).
+
+Staleness rules:
+- User habits/preferences/personality traits in USER.md are permanent — only \
+  update with explicit corrections
+- SOUL.md entries are permanent — only update with explicit corrections
+- MEMORY.md entries should be pruned if objectively outdated: passed events, \
+  resolved issues, superseded approaches
+- When uncertain whether to delete, keep but add "(verify currency)"
+
 If nothing qualifies: [SKIP] no high-value information
 
 ## Current USER.md
@@ -85,14 +113,19 @@ files based on the analysis provided.
 You have access to read_file and edit_file tools. Follow this workflow:
 
 1. Read the current contents of USER.md, SOUL.md, and MEMORY.md
-2. For each fact in the analysis:
-   - Check if it's already present (exact or paraphrased)
-   - If new, use edit_file to append it to the correct file
+2. For each entry in the analysis:
+   - [FILE] entries: check if already present (exact or paraphrased). \
+If new, append to the correct file.
+   - [FILE-REMOVE] entries: find the matching content and delete it using \
+edit_file (replace with empty string).
 3. Rules:
    - For USER.md: treat "- Key: value" lines as upserts (update if key exists)
-   - For SOUL.md and MEMORY.md: append only, never delete existing content
+   - For SOUL.md and MEMORY.md: append new content, delete flagged content
+   - When deleting: include surrounding context (blank lines, section header) \
+in old_text to ensure unique match
    - Keep entries as concise bullet points
    - Never duplicate information already present
+   - Surgical edits only — never rewrite entire files
    - If nothing to update, do nothing and respond with "No updates needed."
 
 Files are located at:
@@ -205,6 +238,31 @@ class MemoryStore:
     def set_last_dream_cursor(self, cursor: int) -> None:
         self.dream_cursor_file.write_text(str(cursor), encoding="utf-8")
 
+    _MAX_HISTORY_ENTRIES = 1000
+
+    def compact_history(self) -> None:
+        """Drop oldest entries if history.jsonl exceeds the cap."""
+        if self._MAX_HISTORY_ENTRIES <= 0:
+            return
+        entries = []
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        except FileNotFoundError:
+            return
+        if len(entries) <= self._MAX_HISTORY_ENTRIES:
+            return
+        kept = entries[-self._MAX_HISTORY_ENTRIES:]
+        with open(self.history_file, "w", encoding="utf-8") as f:
+            for entry in kept:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
 
 _STORE = MemoryStore(WORKDIR)
 
@@ -235,7 +293,9 @@ def _format_messages(messages: list[dict]) -> str:
 
 
 def _filter_dedup(analysis: str, existing_blob: str) -> str:
-    """Drop Phase 1 lines substantially covered by existing memory."""
+    """Drop Phase 1 lines substantially covered by existing memory.
+    Pass through [FILE-REMOVE] and [SKIP] lines unconditionally.
+    """
     existing_lower = existing_blob.lower()
     kept: list[str] = []
     for raw in analysis.splitlines():
@@ -243,13 +303,16 @@ def _filter_dedup(analysis: str, existing_blob: str) -> str:
         if not line:
             kept.append(raw)
             continue
-        m = re.match(r"^\[(USER|SOUL|MEMORY|SKIP)\]\s*(.*)$", line, re.I)
+        m = re.match(
+            r"^\[(USER|SOUL|MEMORY|SKIP|(?:USER|SOUL|MEMORY)-REMOVE)\]\s*(.*)$",
+            line, re.I,
+        )
         if not m:
             kept.append(raw)
             continue
         tag = m.group(1).upper()
         content = m.group(2).lower()
-        if tag == "SKIP":
+        if tag == "SKIP" or tag.endswith("-REMOVE"):
             kept.append(raw)
             continue
         words = [w for w in re.findall(r"[a-z0-9_一-鿿]+", content) if len(w) > 1]
@@ -481,6 +544,7 @@ class DreamProcessor:
     def _advance_cursor(self, archived_batch: list[dict]) -> None:
         if archived_batch:
             self.store.set_last_dream_cursor(archived_batch[-1]["cursor"])
+            self.store.compact_history()
 
     # ---- main entry ----
 
@@ -519,7 +583,7 @@ class DreamProcessor:
         existing_blob = "\n".join([user_content, soul_content, memory_content])
         filtered = _filter_dedup(analysis, existing_blob)
         if not any(
-            re.match(r"^\s*\[(USER|SOUL|MEMORY)\]", line)
+            re.match(r"^\s*\[(USER|SOUL|MEMORY)(?:-REMOVE)?\]", line)
             for line in filtered.splitlines()
         ):
             self._advance_cursor(archived_batch)

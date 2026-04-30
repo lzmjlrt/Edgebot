@@ -28,9 +28,15 @@ class SkillLoader:
     lightweight metadata in memory and returns full bodies on demand.
     """
 
-    def __init__(self, skills_dir: Path, builtin_skills_dir: Path | None = None):
+    def __init__(
+        self,
+        skills_dir: Path,
+        builtin_skills_dir: Path | None = None,
+        extra_workspace_dirs: list[Path] | None = None,
+    ):
         self.skills_dir = skills_dir
         self.builtin_skills_dir = builtin_skills_dir or _BUILTIN_SKILLS_DIR
+        self.extra_workspace_dirs = list(extra_workspace_dirs or [])
         self._skill_entries: dict[str, dict[str, str]] = {}
         self.reload()
 
@@ -42,9 +48,10 @@ class SkillLoader:
         for entry in builtin_entries:
             self._skill_entries[entry["name"]] = entry
 
-        workspace_entries = self._entries_from_dir(self.skills_dir, "workspace")
-        for entry in workspace_entries:
-            self._skill_entries[entry["name"]] = entry
+        for workspace_dir in [self.skills_dir, *self.extra_workspace_dirs]:
+            workspace_entries = self._entries_from_dir(workspace_dir, "workspace")
+            for entry in workspace_entries:
+                self._skill_entries[entry["name"]] = entry
 
     def _entries_from_dir(self, base_dir: Path, source: str) -> list[dict[str, str]]:
         if not base_dir.exists():

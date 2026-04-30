@@ -34,8 +34,11 @@ def format_tool_hint(name: str, args: dict) -> str:
         return f"write {args.get('path', '')}"
     if name == "edit_file":
         return f"edit {args.get('path', '')}"
+    if name == "list_dir":
+        return f"ls {args.get('path', '')}"
     if name == "task":
-        return f"subagent: {_trunc(args.get('prompt', ''), 50)}"
+        mode = "bg " if args.get("run_in_background", True) else ""
+        return f"{mode}subagent: {_trunc(args.get('prompt', ''), 50)}"
     if name == "load_skill":
         return f"load skill: {args.get('name', '')}"
     if name == "task_create":
@@ -59,16 +62,25 @@ def format_tool_hint(name: str, args: dict) -> str:
     if name == "check_background":
         tid = args.get("task_id")
         return f"bg check{(' ' + tid) if tid else ''}"
+    if name == "task_output":
+        tid = args.get("task_id", "")
+        return f"bg output {tid}".strip()
+    if name == "check_subagent":
+        return f"subagent? {args.get('task_id', '?')}"
+    if name == "list_subagents":
+        return "subagents (list)"
+    if name == "control_subagent":
+        action = args.get("action", "?")
+        return f"subagent {action} {args.get('task_id', '?')}"
+    if name == "wait_subagent":
+        prefix = "fg " if args.get("foreground") else ""
+        return f"{prefix}subagent wait {args.get('task_id', '?')}".strip()
     if name == "web_fetch":
         return f"fetch {_trunc(args.get('url', ''), 60)}"
     if name == "web_search":
         return f"search: {_trunc(args.get('query', ''), 50)}"
     if name == "spawn_subagent":
         return f"subagent+ [{args.get('capability','?')}] {_trunc(args.get('prompt',''), 50)}"
-    if name == "check_subagent":
-        return f"subagent? {args.get('task_id','?')}"
-    if name == "list_subagents":
-        return "subagents (list)"
     if name == "spawn_teammate":
         return f"spawn {args.get('name', '?')} ({args.get('role', '?')})"
     if name == "list_teammates":

@@ -11,8 +11,8 @@ class TaskCreateTool(BaseTool):
     @property
     def description(self) -> str: return "Create a new task"
     @property
-    def parameters(self) -> dict: return {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}
-    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.create(kwargs["subject"], kwargs.get("description", ""))
+    def parameters(self) -> dict: return {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}, "active_form": {"type": "string"}, "owner": {"type": "string"}, "metadata": {"type": "object"}}, "required": ["subject"]}
+    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.create(kwargs["subject"], kwargs.get("description", ""), active_form=kwargs.get("active_form"), owner=kwargs.get("owner"), metadata=kwargs.get("metadata"))
 
 class TaskGetTool(BaseTool):
     @property
@@ -21,7 +21,8 @@ class TaskGetTool(BaseTool):
     def description(self) -> str: return "Get a task by id"
     @property
     def parameters(self) -> dict: return {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}
-    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.get(kwargs["task_id"])
+    def is_read_only(self, params: dict[str, Any] | None = None) -> bool: return True
+    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.get(int(kwargs["task_id"]))
 
 class TaskUpdateTool(BaseTool):
     @property
@@ -29,8 +30,8 @@ class TaskUpdateTool(BaseTool):
     @property
     def description(self) -> str: return "Update a task"
     @property
-    def parameters(self) -> dict: return {"type": "object", "properties": {"task_id": {"type": "string"}, "status": {"type": "string"}, "add_blocked_by": {"type": "string"}, "add_blocks": {"type": "string"}}, "required": ["task_id"]}
-    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.update(kwargs["task_id"], kwargs.get("status"), kwargs.get("add_blocked_by"), kwargs.get("add_blocks"))
+    def parameters(self) -> dict: return {"type": "object", "properties": {"task_id": {"type": "string"}, "subject": {"type": "string"}, "description": {"type": "string"}, "active_form": {"type": "string"}, "owner": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "blocked", "deleted"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "add_blocks": {"type": "array", "items": {"type": "integer"}}, "metadata": {"type": "object"}}, "required": ["task_id"]}
+    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.update(int(kwargs["task_id"]), kwargs.get("status"), kwargs.get("add_blocked_by"), kwargs.get("add_blocks"), subject=kwargs.get("subject"), description=kwargs.get("description"), active_form=kwargs.get("active_form"), owner=kwargs.get("owner"), metadata=kwargs.get("metadata"))
 
 class TaskListTool(BaseTool):
     @property
@@ -39,6 +40,7 @@ class TaskListTool(BaseTool):
     def description(self) -> str: return "List all tasks"
     @property
     def parameters(self) -> dict: return {"type": "object", "properties": {}}
+    def is_read_only(self, params: dict[str, Any] | None = None) -> bool: return True
     def execute(self, **kwargs: Any) -> Any: return TASK_MGR.list_all()
 
 class ClaimTaskTool(BaseTool):
@@ -48,4 +50,4 @@ class ClaimTaskTool(BaseTool):
     def description(self) -> str: return "Claim a task to work on"
     @property
     def parameters(self) -> dict: return {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}
-    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.claim(kwargs["task_id"], "lead")
+    def execute(self, **kwargs: Any) -> Any: return TASK_MGR.claim(int(kwargs["task_id"]), "lead")

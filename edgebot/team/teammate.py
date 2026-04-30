@@ -5,12 +5,13 @@ edgebot/team/teammate.py - Persistent autonomous teammate agents.
 import asyncio
 import json
 import threading
+from typing import Any
 
-import litellm
 from rich.console import Console
 
 from edgebot.cli.tool_hints import format_tool_hint
-from edgebot.config import API_BASE, API_KEY, IDLE_TIMEOUT, MODEL, POLL_INTERVAL, TASKS_DIR, TEAM_DIR
+from edgebot.config import IDLE_TIMEOUT, MODEL, POLL_INTERVAL, TASKS_DIR, TEAM_DIR, create_provider
+from edgebot.providers.base import LLMResponse
 from edgebot.tasks.manager import TaskManager
 from edgebot.team.bus import MessageBus
 from edgebot.tools.filesystem import run_edit, run_read, run_write
@@ -113,14 +114,16 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 call_messages = [{"role": "system", "content": sys_prompt}] + messages
-                response = None
+                response: LLMResponse | None = None
                 for attempt in range(3):
                     try:
+                        provider = create_provider()
                         response = await asyncio.wait_for(
-                            litellm.acompletion(
-                                model=MODEL, messages=call_messages,
-                                tools=tools, max_tokens=8000,
-                                api_key=API_KEY, api_base=API_BASE,
+                            provider.chat_with_retry(
+                                model=MODEL,
+                                messages=call_messages,
+                                tools=tools,
+                                max_tokens=8000,
                             ),
                             timeout=120,
                         )
@@ -132,22 +135,17 @@ class TeammateManager:
                             return
                         print(f"  [{name}] API attempt {attempt + 1} failed: {e}; retrying...")
                         await asyncio.sleep(2 ** attempt)
-                choice = response.choices[0]
                 # Store assistant message
-                asst_msg = {"role": "assistant", "content": choice.message.content}
-                if choice.message.tool_calls:
-                    asst_msg["tool_calls"] = [
-                        {"id": tc.id, "type": "function",
-                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                        for tc in choice.message.tool_calls
-                    ]
+                asst_msg: dict[str, Any] = {"role": "assistant", "content": response.content or ""}
+                if response.tool_calls:
+                    asst_msg["tool_calls"] = [tc.to_openai_tool_call() for tc in response.tool_calls]
                 messages.append(asst_msg)
-                if choice.finish_reason != "tool_calls":
+                if not response.should_execute_tools:
                     break
                 idle_requested = False
-                for tc in choice.message.tool_calls or []:
-                    fn_name = tc.function.name
-                    args = json.loads(tc.function.arguments)
+                for tc in response.tool_calls:
+                    fn_name = tc.name
+                    args = tc.arguments if isinstance(tc.arguments, dict) else {}
                     if fn_name == "idle":
                         idle_requested = True
                         output = "Entering idle phase."

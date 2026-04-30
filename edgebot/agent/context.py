@@ -10,13 +10,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from edgebot.config import SKILLS_DIR, WORKDIR
-from edgebot.agent.memory import MemoryStore
-from edgebot.skills.loader import SkillLoader
+from edgebot.config import (
+    AGENTS_MD_PATH,
+    HEARTBEAT_MD_PATH,
+    LEGACY_SKILLS_DIR,
+    MCP_CONFIG_PATH,
+    RUNTIME_DIR,
+    SKILLS_DIR,
+    SOUL_MD_PATH,
+    TOOLS_MD_PATH,
+    USER_MD_PATH,
+    WORKDIR,
+)
 
 BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
-_SKILLS = SkillLoader(SKILLS_DIR)
-_MEMORY = MemoryStore(WORKDIR)
+_SEEDED_ONLY_FILES = ["HEARTBEAT.md"]
+_BOOTSTRAP_PATHS = {
+    "AGENTS.md": AGENTS_MD_PATH,
+    "SOUL.md": SOUL_MD_PATH,
+    "USER.md": USER_MD_PATH,
+    "TOOLS.md": TOOLS_MD_PATH,
+}
+_SEEDED_ONLY_PATHS = {
+    "HEARTBEAT.md": HEARTBEAT_MD_PATH,
+}
 _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
 _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
@@ -29,26 +46,38 @@ def seed_workspace_templates() -> None:
     Copy default template files to the workspace if they don't already exist.
     Called once at startup — never overwrites user-edited files.
     """
-    for filename in BOOTSTRAP_FILES:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    for filename in BOOTSTRAP_FILES + _SEEDED_ONLY_FILES:
         src = _TEMPLATES_DIR / filename
-        dst = WORKDIR / filename
+        dst = _BOOTSTRAP_PATHS.get(filename) or _SEEDED_ONLY_PATHS[filename]
+        legacy = WORKDIR / filename
         if not dst.exists() and src.exists():
-            shutil.copy2(src, dst)
-            print(f"[setup] Created {filename}")
+            if legacy.exists():
+                shutil.copy2(legacy, dst)
+                print(f"[setup] Imported {filename} into .edgebot/")
+            else:
+                shutil.copy2(src, dst)
+                print(f"[setup] Created .edgebot/{filename}")
             
     # Seed skills
     skills_src_dir = _TEMPLATES_DIR / "skills"
-    skills_dst_dir = WORKDIR / "skills"
+    skills_dst_dir = SKILLS_DIR
     if not skills_dst_dir.exists() and skills_src_dir.exists():
         shutil.copytree(skills_src_dir, skills_dst_dir)
-        print("[setup] Created sample skills directory")
+        print("[setup] Created .edgebot/skills directory")
         
     # Seed MCP config
     mcp_src = _TEMPLATES_DIR / "mcp_servers.json"
-    mcp_dst = WORKDIR / "mcp_servers.json"
+    mcp_dst = MCP_CONFIG_PATH
+    legacy_mcp = WORKDIR / "mcp_servers.json"
     if not mcp_dst.exists() and mcp_src.exists():
-        shutil.copy2(mcp_src, mcp_dst)
-        print("[setup] Created mcp_servers.json")
+        if legacy_mcp.exists():
+            shutil.copy2(legacy_mcp, mcp_dst)
+            print("[setup] Imported mcp_servers.json into .edgebot/")
+        else:
+            shutil.copy2(mcp_src, mcp_dst)
+            print("[setup] Created .edgebot/mcp_servers.json")
 
 
 def build_system_prompt(skills_descriptions: str | None = None) -> str:
@@ -77,9 +106,9 @@ def build_system_prompt(skills_descriptions: str | None = None) -> str:
         f"## Workspace\n{WORKDIR}"
     )
 
-    # 2. Bootstrap files from workspace
+    # 2. Bootstrap files from Edgebot runtime directory
     for filename in BOOTSTRAP_FILES:
-        path = WORKDIR / filename
+        path = _BOOTSTRAP_PATHS[filename]
         if path.exists():
             try:
                 content = path.read_text(encoding="utf-8")
@@ -88,27 +117,31 @@ def build_system_prompt(skills_descriptions: str | None = None) -> str:
                 pass
 
     # 3. Long-term memory (memory/MEMORY.md)
-    memory_context = _MEMORY.get_memory_context()
+    from edgebot.agent.memory import _STORE as _memory
+
+    memory_context = _memory.get_memory_context()
     if memory_context:
         parts.append(memory_context)
 
     # 4. Active always-skills
-    _SKILLS.reload()
-    always_skills = _SKILLS.get_always_skills()
+    from edgebot.tools.registry import SKILLS as _skills
+
+    _skills.reload()
+    always_skills = _skills.get_always_skills()
     if always_skills:
-        always_content = _SKILLS.load_skills_for_context(always_skills)
+        always_content = _skills.load_skills_for_context(always_skills)
         if always_content:
             parts.append(f"## Active Skills\n\n{always_content}")
 
     # 5. Skills summary
     summary = skills_descriptions
     if summary is None:
-        summary = _SKILLS.build_skills_summary(exclude=set(always_skills))
+        summary = _skills.build_skills_summary(exclude=set(always_skills))
     if summary and summary != "(no skills)":
         parts.append(f"## Available Skills\n\n{summary}")
 
     # 6. Recent archived history that has not yet been folded into MEMORY.md
-    recent_history_entries = _MEMORY.read_unprocessed_history(_MEMORY.get_last_dream_cursor())
+    recent_history_entries = _memory.read_unprocessed_history(_memory.get_last_dream_cursor())
     if recent_history_entries:
         recent_lines = [
             f"- [{entry['timestamp']}] {entry['content']}"

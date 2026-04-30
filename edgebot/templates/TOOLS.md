@@ -18,16 +18,29 @@ This file documents non-obvious constraints and usage patterns.
 
 ## task (subagent)
 
-- "Explore" type: read-only access (bash + read_file)
-- "general-purpose" type: full access (bash + read/write/edit)
-- Use Explore for investigation, general-purpose for implementation
-- Subagents run up to 30 iterations
+- "Explore" type: isolated read-only subagent task
+- "general-purpose" type: isolated builder subagent task
+- Subagents have their own conversation state, transcript, and output file
+- Use `check_subagent`, `list_subagents`, `wait_subagent`, `control_subagent`, or `task_output` to inspect/control them after launch
 
-## background_run / check_background
+## background_run / check_background / task_output
 
 - Runs commands in a background thread (default timeout 120s)
 - Use check_background with the returned task_id to poll status
+- Use task_output to wait for completion or read the task's output/log path
 - Background task notifications are automatically drained each turn
+
+## Permissions
+
+- Sensitive tools (bash, file writes/edits, background_run, teammate lifecycle) require approval
+- Approval rules can be granted for the current session or persisted in `.edgebot/permissions.json`
+
+## cron
+
+- Schedules one-shot or recurring agent tasks
+- `add` supports `every_seconds`, `at`, or `cron_expr`
+- Cron expressions require optional dependency `croniter`
+- Jobs are persisted in `.edgebot/cron/jobs.json`
 
 ## task_create / task_update / task_list
 

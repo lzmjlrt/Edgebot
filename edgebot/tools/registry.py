@@ -108,6 +108,7 @@ def init_builtin_tools() -> None:
         TaskOutputTool,
     )
     from edgebot.tools.builtin.skills import LoadSkillTool
+    from edgebot.tools.builtin.ask import AskUserTool
     from edgebot.tools.builtin.subagent import (
         CheckSubagentTool,
         ControlSubagentTool,
@@ -156,6 +157,7 @@ def init_builtin_tools() -> None:
         ControlSubagentTool(),
         WaitSubagentTool(),
         TaskOutputTool(),
+        AskUserTool(),
         CompressTool(),
         CronTool(CRON),
     ]:

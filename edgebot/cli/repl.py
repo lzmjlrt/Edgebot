@@ -44,6 +44,7 @@ from edgebot.cron.types import CronJob, CronPayload
 from edgebot.heartbeat.service import HeartbeatService
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
+from edgebot.tools.builtin.ask import set_ask_handler
 from edgebot.tools.registry import (
     BG,
     BUS,
@@ -141,8 +142,83 @@ async def _permission_prompt(request: dict) -> dict | None:
             return {"action": "deny"}
         await _interactive_notice("Use y / s / a / n.")
 
-_HELP_TEXT = """\
-[bold]Edgebot commands:[/bold]
+
+async def _ask_user_handler(question: str, options: list[str] | None) -> str:
+    """Interactive ask_user prompt with arrow-key option picker."""
+    safe_q = escape(question)
+    if options:
+        selected_index = 0
+
+        def _render_ask():
+            fragments: list[tuple[str, str]] = [
+                ("class:title", f"{question}\n\n"),
+                ("class:hint", "Up/Down select, Enter confirm, Esc/type for free text.\n\n"),
+            ]
+            for idx, opt in enumerate(options):
+                pointer = "> " if idx == selected_index else "  "
+                style = "class:selected" if idx == selected_index else "class:item"
+                fragments.append((style, f"{pointer}{opt}\n"))
+            return fragments
+
+        body = FormattedTextControl(_render_ask, focusable=True, show_cursor=False)
+        kb = KeyBindings()
+
+        @kb.add("up")
+        @kb.add("k")
+        def _move_up(event) -> None:
+            nonlocal selected_index
+            selected_index = (selected_index - 1) % len(options)
+            event.app.invalidate()
+
+        @kb.add("down")
+        @kb.add("j")
+        def _move_down(event) -> None:
+            nonlocal selected_index
+            selected_index = (selected_index + 1) % len(options)
+            event.app.invalidate()
+
+        @kb.add("enter")
+        def _accept(event) -> None:
+            event.app.exit(result=options[selected_index])
+
+        @kb.add("escape")
+        @kb.add("c-c")
+        def _free_text(event) -> None:
+            event.app.exit(result=None)
+
+        app = Application(
+            layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
+            key_bindings=kb,
+            full_screen=False,
+            mouse_support=False,
+            style=Style.from_dict({
+                "title": "bold",
+                "hint": "ansibrightblack",
+                "item": "",
+                "selected": "reverse bold",
+            }),
+        )
+
+        with patch_stdout():
+            result = await app.run_async()
+
+        if result is not None:
+            return result
+
+        # User pressed Esc — fall through to free-text input
+
+    await _interactive_print(
+        lambda c: (
+            c.print(f"[bold]{safe_q}[/bold]"),
+            c.print(),
+        )
+    )
+    with patch_stdout():
+        line = await _prompt_session.prompt_async(
+            HTML("<b><ansicyan>You:</ansicyan></b> ")
+        )
+    return (line or "").strip() or "(no response)"
+_HELP_TEXT = """[bold]Edgebot commands:[/bold]
   /new                Start a new conversation
   /sessions           List saved sessions
   /resume             Interactively pick a session to resume
@@ -590,13 +666,13 @@ async def _pick_session_interactive(
         return await app.run_async()
 
 
-_LOGO = r"""
-[bold cyan]    ,──────.    [/bold cyan]
-[bold cyan]   / ,────. \   [/bold cyan]    [bold white]E D G E B O T[/bold white]
-[bold blue]  / / ,──┐ \ \  [/bold blue]    [dim]Autonomous Workspace Agent[/dim]
-[bold blue]  \ \ └──/ / /  [/bold blue]
-[bold magenta]   \ ─────/ /   [/bold magenta]    [dim]Model:[/dim] [cyan]{model}[/cyan]
-[bold purple]    `──────'    [/bold purple]
+_LOGO = """
+[bold cyan]    ,------.    [/bold cyan]
+[bold cyan]   / ,----. \\   [/bold cyan]    [bold white]E D G E B O T[/bold white]
+[bold blue]  / / ,--| \\ \\  [/bold blue]    [dim]Autonomous Workspace Agent[/dim]
+[bold blue]  \\ \\ `--/ / /  [/bold blue]
+[bold magenta]   \\ -----/ /   [/bold magenta]    [dim]Model:[/dim] [cyan]{model}[/cyan]
+[bold purple]    `------'    [/bold purple]
 """
 
 
@@ -642,6 +718,7 @@ async def main():
         all_handlers.update(mcp_client.tool_handlers)
         _render_mcp_startup(mcp_client)
     set_permission_prompt_handler(_permission_prompt)
+    set_ask_handler(_ask_user_handler)
 
     async def _run_background_turn(
         prompt: str,
@@ -1023,30 +1100,37 @@ async def main():
                 continue
 
             # ---- Normal message ----
+            system = build_system_prompt()
             user_msg = {"role": "user", "content": query}
             store.update_metadata(session_key, pending_user_turn=True)
             history.append(user_msg)
             store.append(session_key, user_msg)
-            system = build_system_prompt()
 
-            await agent_loop(
-                messages=history,
-                system=system,
-                tools=all_tools,
-                tool_handlers=all_handlers,
-                todo_mgr=TODO,
-                bg_mgr=BG,
-                bus=BUS,
-                session_store=store,
-                session_key=session_key,
-                channel="cli",
-                chat_id="direct",
-                session_summary=session_summary,
-            )
+            try:
+                await agent_loop(
+                    messages=history,
+                    system=system,
+                    tools=all_tools,
+                    tool_handlers=all_handlers,
+                    todo_mgr=TODO,
+                    bg_mgr=BG,
+                    bus=BUS,
+                    session_store=store,
+                    session_key=session_key,
+                    channel="cli",
+                    chat_id="direct",
+                    session_summary=session_summary,
+                )
+            except Exception as e:
+                console.print(f"[red]  Error in agent loop: {e}[/red]")
+                console.print(
+                    "[dim yellow]  Tip: use /compact to shrink context or /new to start fresh.[/dim yellow]"
+                )
             print()
 
     finally:
         set_permission_prompt_handler(None)
+        set_ask_handler(None)
         await heartbeat.stop()
         await CRON.stop()
         if mcp_client:

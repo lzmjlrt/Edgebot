@@ -77,12 +77,15 @@ class PermissionManager:
         )
 
     def _tool_is_sensitive(self, tool_name: str, params: dict[str, Any], tool: Any) -> bool:
-        if tool_name in self._TOOL_ALWAYS_ASK:
-            return True
+        # Read-only tools never need approval
+        if getattr(tool, "is_read_only", lambda _: False)(params):
+            return False
+        # bash commands classified as read-only are safe
         if tool_name == "bash":
             command = str(params.get("command", "")).strip()
-            return bool(command) and not getattr(tool, "is_read_only", lambda _: False)(params)
-        return not getattr(tool, "is_read_only", lambda _: False)(params)
+            if not command:
+                return False
+        return tool_name in self._TOOL_ALWAYS_ASK or not getattr(tool, "is_read_only", lambda _: False)(params)
 
     def _matches_allow_rule(self, tool_name: str, params: dict[str, Any]) -> bool:
         allow_tools = set(self._rules.get("allow_tools", [])) | set(self._session_rules.get("allow_tools", []))

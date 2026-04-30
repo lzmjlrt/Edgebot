@@ -11,6 +11,31 @@ from edgebot.session.store import find_legal_start
 _COMPACT_PREFIX = "[System: Context auto-compressed"
 _IDLE_PREFIX = "[System: User was idle"
 
+_COMPACT_PROMPT = """\
+Summarize the conversation below for continuity, following these rules:
+
+## Priority (high to low — do NOT summarize away high-priority items)
+1. Architecture decisions — preserve verbatim, do not paraphrase
+2. File modifications and key changes — keep file paths, what changed, and why
+3. Verification results — pass/fail status for each test/check performed
+4. Unresolved TODOs, rollback notes, and pending actions
+5. Tool outputs — discard full output, keep only the conclusion (pass/fail/error + key metric)
+6. General conversation — compress to one line per topic
+
+## Identifier preservation
+CRITICAL: these must be copied verbatim, never paraphrased or truncated:
+- UUIDs, commit hashes, PR/issue numbers
+- IP addresses, ports, URLs
+- File paths and filenames
+- Tool call IDs
+- Branch names, tag names
+If you change even one character of an identifier, downstream tool calls will fail.
+
+## Format
+Output a concise summary in bullet points. Each bullet should be self-contained.
+Do NOT include a preamble or commentary — just the facts.
+If the conversation is trivial, output: (nothing)"""
+
 
 def estimate_tokens(messages: list) -> int:
     return len(json.dumps(messages, default=str)) // 4
@@ -79,7 +104,7 @@ async def auto_compact(
             f.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
             
     conv_text = json.dumps(prefix, ensure_ascii=False, default=str)[:80000]
-    prompt = f"Summarize the earlier parts of this conversation for continuity:\n{conv_text}"
+    prompt = f"{_COMPACT_PROMPT}\n\n## Conversation\n{conv_text}"
 
     provider = create_provider()
     resp = await provider.chat_with_retry(

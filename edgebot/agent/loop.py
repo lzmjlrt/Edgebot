@@ -222,6 +222,16 @@ async def agent_loop(
     final_response = result.final_content or ""
     _flush_stdin()
 
+    if result.stop_reason in ("error", "empty_final_response") and emit_output:
+        _console.print(
+            f"[red]  Agent stopped ({result.stop_reason}): "
+            f"{final_response[:200]}[/red]"
+        )
+        if result.stop_reason == "empty_final_response":
+            _console.print(
+                "[dim yellow]  Tip: use /compact to shrink context or /new to start fresh.[/dim yellow]"
+            )
+
     # ---- Extract new messages from the runner result ----
     original_count = len(call_messages)
     new_msgs = result.messages[original_count:]
@@ -229,16 +239,12 @@ async def agent_loop(
     # Update the caller's messages list
     messages.extend(new_msgs)
 
-    # Save to session — clear checkpoint FIRST to prevent _restore_state
-    # from re-adding messages that we're about to append explicitly.
+    # Save to session
     if session_store:
         session_store.clear_metadata_keys(
             session_key, "runtime_checkpoint",
         )
         session_store.batch_append(session_key, new_msgs)
-        session_store.clear_metadata_keys(
-            session_key, "pending_user_turn",
-        )
 
     # ---- Post-processing (once) ----
 

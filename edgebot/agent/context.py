@@ -23,7 +23,7 @@ from edgebot.config import (
     WORKDIR,
 )
 
-BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+BOOTSTRAP_FILES = [ "SOUL.md","AGENTS.md", "USER.md", "TOOLS.md"]
 _SEEDED_ONLY_FILES = ["HEARTBEAT.md"]
 _BOOTSTRAP_PATHS = {
     "AGENTS.md": AGENTS_MD_PATH,

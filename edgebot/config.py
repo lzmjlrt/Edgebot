@@ -37,8 +37,6 @@ except KeyError as exc:
 API_BASE = os.getenv("API_BASE")  # optional, for proxies or custom endpoints
 
 # --- Workspace paths ---
-TEAM_DIR = WORKDIR / ".team"
-INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 RUNTIME_DIR = WORKDIR / ".edgebot"
@@ -67,15 +65,6 @@ IDLE_TIMEOUT = 60
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL_SECONDS", "21600"))
 IDLE_COMPACT_MINUTES = int(os.getenv("IDLE_COMPACT_MINUTES", "0"))
-
-# --- Messaging protocol ---
-VALID_MSG_TYPES = {
-    "message",
-    "broadcast",
-    "shutdown_request",
-    "shutdown_response",
-    "plan_approval_response",
-}
 
 # --- Provider singleton ---
 _PROVIDER = None

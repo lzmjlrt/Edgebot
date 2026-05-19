@@ -1,7 +1,7 @@
 """
 edgebot/cli/repl.py - Interactive REPL (async) with Rich UI and prompt_toolkit.
 
-REPL commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /bg /team /inbox /status /help
+REPL commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /bg /subagents /permissions /status /help
 """
 
 import asyncio
@@ -47,12 +47,10 @@ from edgebot.session.store import SessionStore
 from edgebot.tools.builtin.ask import set_ask_handler
 from edgebot.tools.registry import (
     BG,
-    BUS,
     CRON,
     SKILLS,
     SUBAGENT,
     TASK_MGR,
-    TEAM,
     TODO,
     TOOL_HANDLERS,
     TOOLS,
@@ -132,11 +130,10 @@ async def _permission_prompt(request: dict) -> dict | None:
         choice = (line or "").strip().lower()
         if choice in {"y", "yes"}:
             return {"action": "allow"}
+        scope = str(request.get("scope_hint") or "allow_tool")
         if choice in {"s", "session"}:
-            scope = "allow_prefix" if request.get("tool") == "bash" else "allow_tool"
             return {"action": "allow", "scope": scope, "persist": False}
         if choice in {"a", "always"}:
-            scope = "allow_prefix" if request.get("tool") == "bash" else "allow_tool"
             return {"action": "allow", "scope": scope, "persist": True}
         if choice in {"n", "no", ""}:
             return {"action": "deny"}
@@ -238,7 +235,6 @@ _HELP_TEXT = """[bold]Edgebot commands:[/bold]
   /bg                 Show all background tasks
   /bg <id>            Show one background task
   /bg output <id>     Show task output
-  /team               List teammates
   /subagents          List subagents
   /subagents <id>     Show subagent details
   /subagents output <id>
@@ -246,7 +242,7 @@ _HELP_TEXT = """[bold]Edgebot commands:[/bold]
   /subagents fg <id>  Move subagent to foreground
   /subagents bg <id>  Move subagent to background
   /subagents stop <id> [reason]
-  /inbox              Read inbox
+  /permissions        Show permission rules (persisted + session)
   /status             Show current session info
   /help               Show this help
   /exit                Quit"""
@@ -460,7 +456,6 @@ def _render_history(history: list[dict]) -> None:
             return False
         skip_prefixes = (
             "<background-results>",
-            "<inbox>",
             "<reminder>",
             "[System: Context auto-compressed",
             "[System: User was idle",
@@ -743,7 +738,6 @@ async def main():
             tool_handlers=all_handlers,
             todo_mgr=TODO,
             bg_mgr=BG,
-            bus=BUS,
             session_store=store,
             session_key=run_session_key,
             channel=run_channel,
@@ -1016,10 +1010,6 @@ async def main():
                 console.print("[dim]  Usage: /bg | /bg <task_id> | /bg output <task_id>[/dim]")
                 continue
 
-            if query == "/team":
-                console.print(TEAM.list_all())
-                continue
-
             if query.startswith("/subagents"):
                 parts = shlex.split(query)
                 if len(parts) == 1:
@@ -1090,13 +1080,14 @@ async def main():
                 )
                 continue
 
-            if query == "/inbox":
-                console.print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            if query == "/permissions":
+                from edgebot.tools.registry import PERMISSIONS
+                console.print(json.dumps(PERMISSIONS.list_rules(), indent=2, ensure_ascii=False))
                 continue
 
             if query.startswith("/"):
                 console.print(f"[dim]  Unknown command: {query}[/dim]")
-                console.print("[dim]  Commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /bg /team /subagents /inbox /status /help[/dim]")
+                console.print("[dim]  Commands: /new /sessions /resume /compact /memory /cron /heartbeat /mcp /tasks /bg /subagents /permissions /status /help[/dim]")
                 continue
 
             # ---- Normal message ----
@@ -1114,7 +1105,6 @@ async def main():
                     tool_handlers=all_handlers,
                     todo_mgr=TODO,
                     bg_mgr=BG,
-                    bus=BUS,
                     session_store=store,
                     session_key=session_key,
                     channel="cli",

@@ -1,12 +1,14 @@
 """
 edgebot/subagent/runner.py - Isolated subagent task runner.
 
-Claude Code's AgentTool uses a dedicated agent runtime plus an explicit task
-object. This module mirrors the same core ideas in a smaller Edgebot form:
- - each subagent has an isolated conversation state
- - each subagent gets an explicit allowed tool pool
- - execution is tracked as a local_agent task with transcript/output files
- - callers can poll status or wait for task output later
+Each subagent has:
+ - isolated conversation state
+ - an explicit allowed tool pool (capability-defined)
+ - a local_agent task entry with transcript + output files
+
+Execution delegates to AgentRunner so the LLM-call / tool-execution loop is
+shared with the main agent (and inherits PERMISSIONS.authorize gating via
+tools.orchestration.execute_tool_batches).
 """
 
 from __future__ import annotations
@@ -19,12 +21,10 @@ from pathlib import Path
 from typing import Any
 
 from edgebot.config import MODEL, SUBAGENT_DIR, create_provider
-from edgebot.providers.base import ToolCallRequest
 from edgebot.subagent.capabilities import CAPABILITIES
 
 _MAX_TURNS = 20
 _WALLCLOCK_SECONDS = 300
-_TASK_TIMEOUT_SECONDS = 120
 _RESULT_PREVIEW_CHARS = 4000
 _TERMINAL_STATUSES = {"completed", "failed", "stopped"}
 
@@ -190,7 +190,6 @@ class SubagentRunner:
             "is_backgrounded": backgrounded,
             "stop_requested": False,
             "stop_reason": None,
-            "messages": [],
             "event": asyncio.Event(),
             "runner_task": None,
         }
@@ -333,103 +332,110 @@ class SubagentRunner:
         )
 
     async def _run(self, task_id: str) -> None:
+        """Delegate to AgentRunner; persist transcript + output via checkpoints."""
+        from edgebot.agent.runner import AgentRunner, AgentRunSpec
+        from edgebot.tools.registry import TOOL_HANDLERS
+
         rec = self._tasks[task_id]
         cap = CAPABILITIES[rec["capability"]]
         transcript_path = Path(rec["transcript_file"])
         output_path = Path(rec["output_file"])
-        messages: list[dict[str, Any]] = [{"role": "user", "content": rec["prompt"]}]
-        rec["messages"] = messages
-        self._append_jsonl(transcript_path, messages[0])
-        deadline = time.time() + _WALLCLOCK_SECONDS
+
+        initial_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": cap["system"]},
+            {"role": "user", "content": rec["prompt"]},
+        ]
+        # Persist the initial user prompt to the transcript.
+        self._append_jsonl(transcript_path, initial_messages[1])
+
+        tool_schemas = [
+            schema for schema in (self._tool_schema(n) for n in cap["allowed_tools"]) if schema
+        ]
+
+        # AgentRunner uses execute_tool_batches which resolves tools via the
+        # registry directly; passing TOOL_HANDLERS here is for API parity.
+        tool_handlers = dict(TOOL_HANDLERS)
+
         provider = create_provider()
+        runner = AgentRunner(provider)
 
-        try:
-            for _ in range(_MAX_TURNS):
-                if rec["stop_requested"]:
-                    raise asyncio.CancelledError()
-                if time.time() > deadline:
-                    raise TimeoutError(f"subagent timeout after {_WALLCLOCK_SECONDS} seconds")
+        transcript_seen = 0  # how many messages of `result.messages` we've persisted
 
-                tool_schemas = [schema for schema in (self._tool_schema(name) for name in cap["allowed_tools"]) if schema]
-                try:
-                    response = await asyncio.wait_for(
-                        provider.chat_with_retry(
-                            model=MODEL,
-                            messages=[{"role": "system", "content": cap["system"]}] + messages,
-                            tools=tool_schemas or None,
-                            max_tokens=8000,
-                        ),
-                        timeout=_TASK_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    raise TimeoutError(f"LLM call timed out after {_TASK_TIMEOUT_SECONDS}s")
-                if response.finish_reason == "error":
-                    raise RuntimeError(response.content or "LLM call failed")
-
-                assistant_message: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": response.content or "",
-                }
-                if response.tool_calls:
-                    assistant_message["tool_calls"] = [
-                        tc.to_openai_tool_call() for tc in response.tool_calls
-                    ]
-                messages.append(assistant_message)
-                self._append_jsonl(transcript_path, assistant_message)
-
-                content = (response.content or "").strip()
+        async def _checkpoint(payload: dict[str, Any]) -> None:
+            nonlocal transcript_seen
+            # Persist assistant + tool messages emitted during this iteration.
+            assistant_msg = payload.get("assistant_message")
+            if assistant_msg and isinstance(assistant_msg, dict):
+                self._append_jsonl(transcript_path, assistant_msg)
+                content = (assistant_msg.get("content") or "").strip() if isinstance(assistant_msg.get("content"), str) else ""
                 if content:
                     rec["partial_result"] = content[:_RESULT_PREVIEW_CHARS]
                     output_path.write_text(content, encoding="utf-8")
+            for tool_msg in payload.get("completed_tool_results") or []:
+                self._append_jsonl(transcript_path, tool_msg)
+                rec["tool_uses"] += 1
+            transcript_seen += 1
 
-                if not response.should_execute_tools:
-                    rec["result"] = response.content or ""
-                    rec["status"] = "completed"
-                    break
+        async def _injection() -> list[dict[str, Any]]:
+            # Honor explicit stop requests from the parent.
+            if rec["stop_requested"]:
+                raise asyncio.CancelledError()
+            return []
 
-                for tc in response.tool_calls:
-                    if rec["stop_requested"]:
-                        raise asyncio.CancelledError()
-                    rec["tool_uses"] += 1
-                    tool_name = tc.name
-                    args = tc.arguments if isinstance(tc.arguments, dict) else {}
+        spec = AgentRunSpec(
+            initial_messages=initial_messages,
+            provider=provider,
+            tools=tool_schemas,
+            tool_handlers=tool_handlers,
+            model=MODEL,
+            max_iterations=_MAX_TURNS,
+            max_tokens=8000,
+            retry_mode="standard",
+            emit_output=False,
+            assistant_label=f"subagent[{rec['capability']}]",
+            on_stream=None,
+            on_stream_end=None,
+            on_retry_wait=None,
+            checkpoint_callback=_checkpoint,
+            injection_callback=_injection,
+        )
 
-                    if tool_name not in cap["allowed_tools"]:
-                        output = f"Error: Tool '{tool_name}' is not allowed for capability '{rec['capability']}'"
-                    else:
-                        from edgebot.tools.registry import prepare_call
-
-                        tool, cast_params, error = prepare_call(tool_name, args)
-                        if error:
-                            output = error
-                        elif tool is None:
-                            output = f"Unknown tool: {tool_name}"
-                        else:
-                            result = tool.execute(**cast_params)
-                            output = await result if hasattr(result, "__await__") else result
-
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": str(output),
-                    }
-                    messages.append(tool_message)
-                    self._append_jsonl(transcript_path, tool_message)
-
-            if rec["status"] in {"running", "stopping"}:
-                rec["status"] = "completed"
-                rec["result"] = rec["partial_result"] or ""
+        try:
+            result = await asyncio.wait_for(runner.run(spec), timeout=_WALLCLOCK_SECONDS)
         except asyncio.CancelledError:
             rec["status"] = "stopped"
             rec["error"] = rec.get("stop_reason") or "stopped"
             rec["result"] = rec["partial_result"] or ""
             if not output_path.read_text(encoding="utf-8"):
                 output_path.write_text(rec["result"] or rec["error"], encoding="utf-8")
+            return
+        except asyncio.TimeoutError:
+            rec["status"] = "failed"
+            rec["error"] = f"subagent timeout after {_WALLCLOCK_SECONDS} seconds"
+            rec["result"] = rec["partial_result"] or ""
+            if not output_path.read_text(encoding="utf-8"):
+                output_path.write_text(rec["error"], encoding="utf-8")
+            return
         except Exception as exc:
             rec["status"] = "failed"
             rec["error"] = str(exc)
             rec["result"] = rec["partial_result"] or ""
             if not output_path.read_text(encoding="utf-8"):
                 output_path.write_text(rec["error"], encoding="utf-8")
-        finally:
-            self._finalize_record(rec)
+            return
+
+        final = result.final_content or rec["partial_result"] or ""
+        if result.stop_reason == "completed":
+            rec["status"] = "completed"
+            rec["result"] = final
+        elif result.stop_reason == "max_iterations":
+            rec["status"] = "completed"
+            rec["result"] = final
+            rec["error"] = "max_iterations"
+        else:
+            rec["status"] = "failed"
+            rec["error"] = result.stop_reason
+            rec["result"] = final
+
+        if final:
+            output_path.write_text(final, encoding="utf-8")

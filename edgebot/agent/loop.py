@@ -82,7 +82,6 @@ async def agent_loop(
     tool_handlers: dict,
     todo_mgr,
     bg_mgr,
-    bus,
     session_store=None,
     session_key: str = "default",
     channel: str = "cli",
@@ -155,13 +154,6 @@ async def agent_loop(
             injected.append({
                 "role": "user",
                 "content": f"<background-results>\n{txt}\n</background-results>",
-            })
-
-        inbox = bus.read_inbox("lead")
-        if inbox:
-            injected.append({
-                "role": "user",
-                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
 
         return injected

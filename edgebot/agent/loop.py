@@ -94,10 +94,6 @@ async def agent_loop(
     runner = AgentRunner(provider)
     final_response = ""
 
-    # Reset per-session turn counter for Dream gating
-    global _turn_counter
-    _turn_counter = 0
-
     # AutoCompact: check if this session was idle and auto-compressed
     autocompact = get_autocompact(session_store)
     if autocompact is not None and session_summary is None:
@@ -259,6 +255,7 @@ async def agent_loop(
         _archive_turn_summary(messages, final_response)
 
     # Memory consolidation (gated by interval + minimum history)
+    global _turn_counter
     _turn_counter += 1
     if (
         _turn_counter >= _CONSOLIDATION_INTERVAL

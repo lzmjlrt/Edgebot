@@ -82,7 +82,6 @@ async def agent_loop(
     tool_handlers: dict,
     todo_mgr,
     bg_mgr,
-    bus,
     session_store=None,
     session_key: str = "default",
     channel: str = "cli",
@@ -94,10 +93,6 @@ async def agent_loop(
     provider = create_provider()
     runner = AgentRunner(provider)
     final_response = ""
-
-    # Reset per-session turn counter for Dream gating
-    global _turn_counter
-    _turn_counter = 0
 
     # AutoCompact: check if this session was idle and auto-compressed
     autocompact = get_autocompact(session_store)
@@ -155,13 +150,6 @@ async def agent_loop(
             injected.append({
                 "role": "user",
                 "content": f"<background-results>\n{txt}\n</background-results>",
-            })
-
-        inbox = bus.read_inbox("lead")
-        if inbox:
-            injected.append({
-                "role": "user",
-                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
 
         return injected
@@ -267,6 +255,7 @@ async def agent_loop(
         _archive_turn_summary(messages, final_response)
 
     # Memory consolidation (gated by interval + minimum history)
+    global _turn_counter
     _turn_counter += 1
     if (
         _turn_counter >= _CONSOLIDATION_INTERVAL

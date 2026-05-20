@@ -32,8 +32,10 @@ This file documents non-obvious constraints and usage patterns.
 
 ## Permissions
 
-- Sensitive tools (bash, file writes/edits, background_run, teammate lifecycle) require approval
-- Approval rules can be granted for the current session or persisted in `.edgebot/permissions.json`
+- Sensitive tools (bash, file writes/edits, background_run) require approval
+- Workspace-internal write/edit are auto-allowed by default
+- Bash is gated by program-name allowlist plus per-prefix rules
+- Use `/permissions` in REPL to inspect rules; persisted at `.edgebot/permissions.json`
 
 ## cron
 

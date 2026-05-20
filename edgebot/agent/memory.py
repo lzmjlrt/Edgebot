@@ -12,17 +12,20 @@ Phase 2: AgentRunner with read_file / edit_file tools performs targeted,
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from rich.console import Console
 
-from edgebot.config import MEMORY_DIR, MODEL, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
+from edgebot.config import MEMORY_DIR, MODEL, RUNTIME_DIR, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
 from edgebot.providers.base import LLMProvider
 from edgebot.tools.base import BaseTool
+from edgebot.utils.gitstore import GitStore
 
 _console = Console()
 
@@ -33,6 +36,13 @@ DREAM_CURSOR_FILE = MEMORY_DIR / ".dream_cursor"
 
 _MAX_MESSAGES = 30
 _MAX_ARCHIVED_BATCH = 20
+_MEMORY_FILE_MAX_CHARS = 32_000
+_SOUL_FILE_MAX_CHARS = 16_000
+_USER_FILE_MAX_CHARS = 16_000
+_HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
+_CONVERSATION_MAX_CHARS = 48_000
+_HISTORY_ENTRY_HARD_CAP = 64_000
+_STALE_THRESHOLD_DAYS = 14
 
 PHASE1_PROMPT = """\
 You have TWO equally important tasks:
@@ -87,6 +97,9 @@ Staleness rules:
 - User habits/preferences/personality traits in USER.md are permanent — only \
   update with explicit corrections
 - SOUL.md entries are permanent — only update with explicit corrections
+- MEMORY.md lines may have an age suffix like "← 30d"; age means when the line \
+  was last edited, not automatic deletion. Lines older than {stale_threshold_days} \
+  days deserve closer review.
 - MEMORY.md entries should be pruned if objectively outdated: passed events, \
   resolved issues, superseded approaches
 - When uncertain whether to delete, keep but add "(verify currency)"
@@ -151,10 +164,26 @@ class MemoryStore:
         self.dream_cursor_file = self.memory_dir / ".dream_cursor"
         self.soul_file = SOUL_MD_PATH
         self.user_file = USER_MD_PATH
+        self.git = GitStore(
+            RUNTIME_DIR,
+            tracked_files=[
+                "SOUL.md",
+                "USER.md",
+                "memory/MEMORY.md",
+                "memory/.dream_cursor",
+            ],
+            allow_nested=True,
+        )
         legacy_memory_dir = workspace / "memory"
         if not self.memory_dir.exists() and legacy_memory_dir.exists():
             shutil.copytree(legacy_memory_dir, self.memory_dir)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+    def ensure_git_initialized(self) -> bool:
+        """Initialize the Dream git store after templates have been seeded."""
+        if self.git.is_initialized():
+            return True
+        return self.git.init()
 
     def read_memory(self) -> str:
         return _read_file(self.memory_file)
@@ -178,7 +207,7 @@ class MemoryStore:
         last = self._read_last_entry()
         if last and isinstance(last.get("cursor"), int):
             return last["cursor"] + 1
-        return 1
+        return max((cursor for _entry, cursor in self._iter_valid_entries()), default=0) + 1
 
     def _read_last_entry(self) -> dict | None:
         try:
@@ -197,20 +226,30 @@ class MemoryStore:
         except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
 
-    def append_history(self, content: str) -> int:
+    @staticmethod
+    def _valid_cursor(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    def append_history(self, content: str, *, max_chars: int | None = None) -> int:
         cursor = self._next_cursor()
+        limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
+        cleaned = content.strip()
+        if len(cleaned) > limit:
+            cleaned = _truncate_text(cleaned, limit)
         record = {
             "cursor": cursor,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "content": content.strip(),
+            "content": cleaned,
         }
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         self.cursor_file.write_text(str(cursor), encoding="utf-8")
         return cursor
 
-    def read_unprocessed_history(self, since_cursor: int) -> list[dict]:
-        entries: list[dict] = []
+    def _iter_valid_entries(self) -> Iterator[tuple[dict[str, Any], int]]:
         try:
             with open(self.history_file, "r", encoding="utf-8") as f:
                 for line in f:
@@ -221,11 +260,15 @@ class MemoryStore:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if entry.get("cursor", 0) > since_cursor:
-                        entries.append(entry)
+                    cursor = self._valid_cursor(entry.get("cursor"))
+                    if cursor is None:
+                        continue
+                    yield entry, cursor
         except FileNotFoundError:
-            pass
-        return entries
+            return
+
+    def read_unprocessed_history(self, since_cursor: int) -> list[dict]:
+        return [entry for entry, cursor in self._iter_valid_entries() if cursor > since_cursor]
 
     def get_last_dream_cursor(self) -> int:
         if self.dream_cursor_file.exists():
@@ -244,24 +287,25 @@ class MemoryStore:
         """Drop oldest entries if history.jsonl exceeds the cap."""
         if self._MAX_HISTORY_ENTRIES <= 0:
             return
-        entries = []
-        try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-        except FileNotFoundError:
+        entries = [entry for entry, _cursor in self._iter_valid_entries()]
+        if not entries:
             return
         if len(entries) <= self._MAX_HISTORY_ENTRIES:
             return
         kept = entries[-self._MAX_HISTORY_ENTRIES:]
-        with open(self.history_file, "w", encoding="utf-8") as f:
+        tmp_path = self.history_file.with_suffix(self.history_file.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             for entry in kept:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.history_file)
+        with suppress(PermissionError, OSError):
+            fd = os.open(str(self.history_file.parent), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 
 _STORE = MemoryStore(WORKDIR)
@@ -278,6 +322,13 @@ def _read_file(path) -> str:
         return "(empty)"
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = "\n... (truncated)"
+    return text[: max(0, max_chars - len(marker))] + marker
+
+
 def _format_messages(messages: list[dict]) -> str:
     lines = []
     for msg in messages:
@@ -288,8 +339,8 @@ def _format_messages(messages: list[dict]) -> str:
         if not content:
             continue
         if isinstance(content, str):
-            lines.append(f"[{role}] {content[:500]}")
-    return "\n".join(lines)
+            lines.append(f"[{role}] {_truncate_text(content, 500)}")
+    return _truncate_text("\n".join(lines), _CONVERSATION_MAX_CHARS)
 
 
 def _filter_dedup(analysis: str, existing_blob: str) -> str:
@@ -427,7 +478,8 @@ class DreamProcessor:
         live_messages: list[dict],
     ) -> str:
         archived_history = "\n".join(
-            f"[{entry['timestamp']}] {entry['content']}"
+            f"[{entry['timestamp']}] "
+            f"{_truncate_text(str(entry.get('content', '')), _HISTORY_ENTRY_PREVIEW_MAX_CHARS)}"
             for entry in archived_batch
         )
         recent_conversation = _format_messages(live_messages)
@@ -436,7 +488,32 @@ class DreamProcessor:
             parts.append(f"## Archived History\n{archived_history}")
         if recent_conversation:
             parts.append(f"## Live Conversation\n{recent_conversation}")
-        return "\n\n".join(parts)
+        return _truncate_text("\n\n".join(parts), _CONVERSATION_MAX_CHARS)
+
+    def _annotate_memory_with_ages(self, content: str) -> str:
+        """Append per-line git age hints for stale-memory review."""
+        try:
+            ages = self.store.git.line_ages("memory/MEMORY.md")
+        except Exception:
+            return content
+        if not ages:
+            return content
+
+        had_trailing = content.endswith("\n")
+        lines = content.splitlines()
+        if len(lines) != len(ages):
+            return content
+
+        annotated: list[str] = []
+        for line, age in zip(lines, ages):
+            if line.strip() and age.age_days > _STALE_THRESHOLD_DAYS:
+                annotated.append(f"{line}  ← {age.age_days}d")
+            else:
+                annotated.append(line)
+        result = "\n".join(annotated)
+        if had_trailing:
+            result += "\n"
+        return result
 
     # ---- Phase 1: analysis (plain LLM call, no tools) ----
 
@@ -452,6 +529,7 @@ class DreamProcessor:
             soul_content=soul_content,
             memory_content=memory_content,
             conversation=conversation,
+            stale_threshold_days=_STALE_THRESHOLD_DAYS,
         )
         try:
             response = await self.provider.chat_with_retry(
@@ -470,6 +548,10 @@ class DreamProcessor:
             return None
 
     # ---- Phase 2: agent-runner with read_file / edit_file ----
+
+    @staticmethod
+    def _strip_age_suffix(content: str) -> str:
+        return re.sub(r"\s+← \d+d(?=\n|$)", "", content)
 
     async def _phase2_execute(
         self,
@@ -494,7 +576,7 @@ class DreamProcessor:
             f"## Current File Contents\n\n"
             f"### USER.md\n{user_content}\n\n"
             f"### SOUL.md\n{soul_content}\n\n"
-            f"### MEMORY.md\n{memory_content}"
+            f"### MEMORY.md\n{self._strip_age_suffix(memory_content)}"
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -514,11 +596,25 @@ class DreamProcessor:
             emit_output=self.emit_output,
             assistant_label="Dream",
         ))
+        if result.stop_reason not in ("completed",):
+            raise RuntimeError(f"Dream phase 2 stopped: {result.stop_reason}")
 
+        call_names: dict[str, str] = {}
         changelog: list[dict[str, str]] = []
-        for ev in result.tool_names_used:
-            if ev.startswith("edit_file") or ev.startswith("write_file"):
-                changelog.append({"name": ev, "status": "ok", "detail": "file updated"})
+        for msg in result.messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    func = tc.get("function") or {}
+                    if tc.get("id") and isinstance(func, dict):
+                        call_names[str(tc["id"])] = str(func.get("name") or "")
+            if msg.get("role") != "tool":
+                continue
+            name = call_names.get(str(msg.get("tool_call_id") or ""))
+            content = str(msg.get("content") or "")
+            if name in {"edit_file", "write_file"} and content.startswith("Successfully"):
+                changelog.append({"name": name, "status": "ok", "detail": content[:200]})
         return changelog
 
     def _build_dream_tools(self) -> tuple[list[dict], dict[str, Any]]:
@@ -565,9 +661,16 @@ class DreamProcessor:
         if not conversation.strip():
             return False
 
-        user_content = self.store.read_user()
-        soul_content = self.store.read_soul()
-        memory_content = self.store.read_memory()
+        self.store.ensure_git_initialized()
+        raw_user_content = self.store.read_user()
+        raw_soul_content = self.store.read_soul()
+        raw_memory_content = self.store.read_memory()
+        user_content = _truncate_text(raw_user_content, _USER_FILE_MAX_CHARS)
+        soul_content = _truncate_text(raw_soul_content, _SOUL_FILE_MAX_CHARS)
+        memory_content = _truncate_text(
+            self._annotate_memory_with_ages(raw_memory_content),
+            _MEMORY_FILE_MAX_CHARS,
+        )
 
         # Phase 1: extract structured facts
         analysis = await self._phase1_analyze(
@@ -580,7 +683,7 @@ class DreamProcessor:
             return False
 
         # Dedup against existing content
-        existing_blob = "\n".join([user_content, soul_content, memory_content])
+        existing_blob = "\n".join([raw_user_content, raw_soul_content, raw_memory_content])
         filtered = _filter_dedup(analysis, existing_blob)
         if not any(
             re.match(r"^\s*\[(USER|SOUL|MEMORY)(?:-REMOVE)?\]", line)
@@ -597,18 +700,20 @@ class DreamProcessor:
         except Exception as exc:
             if self.emit_output:
                 _console.print(f"[dim red]  [memory] phase 2 failed: {exc}[/dim red]")
-            self._advance_cursor(archived_batch)
             return False
 
-        self._advance_cursor(archived_batch)
-
         if changelog:
+            ts = archived_batch[-1]["timestamp"] if archived_batch else datetime.now().strftime("%Y-%m-%d %H:%M")
+            commit_msg = f"dream: {ts}, {len(changelog)} change(s)\n\n{filtered.strip()}"
+            self._advance_cursor(archived_batch)
+            self.store.git.auto_commit(commit_msg)
             if self.emit_output:
                 files = [ev["name"] for ev in changelog]
                 _console.print(
                     f"[dim]  [memory] Dream updated: {', '.join(files)}[/dim]"
                 )
             return True
+        self._advance_cursor(archived_batch)
         return False
 
 

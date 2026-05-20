@@ -81,24 +81,6 @@ def format_tool_hint(name: str, args: dict) -> str:
         return f"search: {_trunc(args.get('query', ''), 50)}"
     if name == "spawn_subagent":
         return f"subagent+ [{args.get('capability','?')}] {_trunc(args.get('prompt',''), 50)}"
-    if name == "spawn_teammate":
-        return f"spawn {args.get('name', '?')} ({args.get('role', '?')})"
-    if name == "list_teammates":
-        return "team (list)"
-    if name == "send_message":
-        return f"msg \u2192 {args.get('to', '?')}"
-    if name == "read_inbox":
-        return "inbox"
-    if name == "broadcast":
-        return "broadcast"
-    if name == "shutdown_request":
-        return f"shutdown \u2192 {args.get('teammate', '?')}"
-    if name == "plan_approval":
-        approve = args.get("approve")
-        verdict = "approve" if approve else "reject"
-        return f"plan {verdict}"
-    if name == "idle":
-        return "idle"
     if name.startswith("mcp_"):
         return _format_mcp_hint(name)
     return name

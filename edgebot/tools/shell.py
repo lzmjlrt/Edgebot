@@ -24,7 +24,8 @@ _DENY_PATTERNS = [
 ]
 _READ_ONLY_COMMANDS = {
     "cat", "type", "more", "head", "tail", "pwd", "cd", "ls", "dir",
-    "find", "grep", "rg", "git", "python", "python3", "py",
+    "find", "findstr", "grep", "rg", "git", "python", "python3", "py",
+    "powershell", "pwsh", "echo",
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {
     "status", "diff", "show", "log", "branch", "rev-parse", "ls-files",
@@ -33,6 +34,7 @@ _READ_ONLY_SIMPLE_FLAGS = {
     "cat": set(),
     "type": set(),
     "more": set(),
+    "echo": set(),
     "head": {"-n"},
     "tail": {"-n"},
     "pwd": set(),
@@ -40,6 +42,7 @@ _READ_ONLY_SIMPLE_FLAGS = {
     "ls": {"-a", "-l", "-la", "-al", "-h", "-r", "-t", "-s"},
     "dir": {"/a", "/b", "/o", "/s"},
     "find": set(),
+    "findstr": {"/i", "/n", "/r", "/c", "/l", "/s", "/m", "/v", "/x"},
     "grep": {"-i", "-n", "-r", "-l", "-c", "-w", "-E", "-e", "--color"},
     "rg": {"-i", "-n", "-l", "-c", "-w", "-g", "-t", "-uu", "--files"},
 }
@@ -55,7 +58,30 @@ _READ_ONLY_GIT_ARG_FLAGS = {
 }
 _WRITE_OPERATORS = (">", ">>", "2>", "2>>", "&>", "1>", "1>>", "<")
 _CONTROL_OPERATORS = {"|", "&&", "||", ";"}
-_READ_ONLY_PIPED_COMMANDS = {"grep", "rg", "find"}
+_READ_ONLY_PIPED_COMMANDS = {
+    "cat", "type", "more", "head", "tail", "ls", "dir",
+    "find", "findstr", "grep", "rg", "git", "echo",
+}
+_WINDOWS_SLASH_FLAG_COMMANDS = {"dir", "findstr"}
+_POWERSHELL_FLAGS_WITH_VALUE = {"-command", "-c", "-encodedcommand", "-ec"}
+_POWERSHELL_READ_ONLY_CMDS = {
+    "get-content", "gc", "cat", "type",
+    "select-object", "select",
+    "select-string", "sls",
+    "where-object", "where", "?",
+    "sort-object", "sort",
+    "format-table", "ft",
+    "format-list", "fl",
+    "write-output", "echo",
+}
+_POWERSHELL_WRITE_MARKERS = re.compile(
+    r"\b("
+    r"set-content|add-content|out-file|tee-object|new-item|remove-item|"
+    r"move-item|copy-item|rename-item|clear-content|start-process|stop-process|"
+    r"invoke-webrequest|invoke-restmethod|curl|wget|rm|del|erase|rmdir"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_absolute_paths(command: str) -> list[str]:
@@ -135,12 +161,15 @@ def is_read_only_command(command: str) -> bool:
     stripped = command.strip()
     if not stripped:
         return False
+    stripped = _strip_safe_null_redirections(stripped)
+    if _looks_like_powershell(stripped):
+        return _is_read_only_powershell_command(stripped)
     if any(op in stripped for op in _WRITE_OPERATORS):
         return False
     if any(token in stripped for token in ("$(", "`")):
         return False
-    if "|" in stripped:
-        parts = [part.strip() for part in stripped.split("|")]
+    if _has_pipeline(stripped):
+        parts = [part.strip() for part in re.split(r"(?<!\|)\|(?!\|)", stripped)]
         if not parts or any(not part for part in parts):
             return False
         return all(_is_read_only_segment(part, allow_piped=True) for part in parts)
@@ -169,10 +198,34 @@ def _split_segments(command: str) -> list[str]:
     return segments
 
 
+def _has_pipeline(command: str) -> bool:
+    return re.search(r"(?<!\|)\|(?!\|)", command) is not None
+
+
 def _normalize_flag(token: str) -> str:
     if "=" in token:
         return token.split("=", 1)[0]
     return token
+
+
+def _strip_safe_null_redirections(command: str) -> str:
+    """Remove stderr-to-null redirections that do not write workspace files."""
+    patterns = (
+        r"(?i)\s+2>\s*nul\b",
+        r"(?i)\s+2>>\s*nul\b",
+        r"(?i)\s+2>\s*/dev/null\b",
+        r"(?i)\s+2>>\s*/dev/null\b",
+        r"(?i)\s+2>\s*\$null\b",
+        r"(?i)\s+2>>\s*\$null\b",
+    )
+    for pattern in patterns:
+        command = re.sub(pattern, "", command)
+    return command
+
+
+def _looks_like_powershell(command: str) -> bool:
+    first = command.split(maxsplit=1)[0].lower() if command.split() else ""
+    return first in {"powershell", "pwsh"}
 
 
 def _is_read_only_segment(segment: str, *, allow_piped: bool) -> bool:
@@ -192,6 +245,8 @@ def _is_read_only_segment(segment: str, *, allow_piped: bool) -> bool:
         return _is_read_only_git(args)
     if cmd in {"python", "python3", "py"}:
         return _is_read_only_python(args)
+    if cmd in {"powershell", "pwsh"}:
+        return _is_read_only_powershell(args)
     if allow_piped and cmd not in _READ_ONLY_PIPED_COMMANDS:
         return False
     return _validate_simple_read_only_args(cmd, args)
@@ -204,8 +259,10 @@ def _validate_simple_read_only_args(cmd: str, args: list[str]) -> bool:
         if expects_value_for_previous:
             expects_value_for_previous = False
             continue
-        if arg.startswith("-") or (cmd == "dir" and arg.startswith("/")):
+        if arg.startswith("-") or (cmd in _WINDOWS_SLASH_FLAG_COMMANDS and arg.startswith("/")):
             flag = _normalize_flag(arg)
+            if cmd in _WINDOWS_SLASH_FLAG_COMMANDS:
+                flag = flag.lower()
             if flag not in allowed_flags:
                 return False
             if flag in {"-n", "-e", "-g", "-t"}:
@@ -253,3 +310,57 @@ def _is_read_only_python(args: list[str]) -> bool:
     if not args:
         return False
     return all(arg in {"--version", "-V", "-h", "--help"} for arg in args)
+
+
+def _is_read_only_powershell(args: list[str]) -> bool:
+    if not args:
+        return False
+
+    script: str | None = None
+    idx = 0
+    while idx < len(args):
+        token = args[idx].lower()
+        if token in {"-noprofile", "-noninteractive", "-executionpolicy"}:
+            idx += 2 if token == "-executionpolicy" else 1
+            continue
+        if token in _POWERSHELL_FLAGS_WITH_VALUE:
+            if idx + 1 >= len(args) or token in {"-encodedcommand", "-ec"}:
+                return False
+            script = args[idx + 1].strip().strip('"').strip("'")
+            break
+        return False
+    if script is None:
+        return False
+    return _is_read_only_powershell_script(script)
+
+
+def _is_read_only_powershell_command(command: str) -> bool:
+    try:
+        import shlex
+
+        args = shlex.split(command, posix=False)
+    except ValueError:
+        args = command.split()
+    if not args:
+        return False
+    return _is_read_only_powershell(args[1:])
+
+
+def _is_read_only_powershell_script(script: str) -> bool:
+    if not script:
+        return False
+    if _POWERSHELL_WRITE_MARKERS.search(script):
+        return False
+    if re.search(r"(?<![<>=])>(?![=>])|>>|<", script):
+        return False
+    if any(token in script for token in ("$(", "`")):
+        return False
+
+    segments = [seg.strip() for seg in script.split("|")]
+    if not segments or any(not seg for seg in segments):
+        return False
+    for segment in segments:
+        head = segment.split(maxsplit=1)[0].strip().lower()
+        if head not in _POWERSHELL_READ_ONLY_CMDS:
+            return False
+    return True

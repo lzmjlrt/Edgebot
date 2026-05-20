@@ -13,23 +13,25 @@
   </p>
 </div>
 
-🤖 **Edgebot** is an **ultra-lightweight** workspace agent referenced and inspired by [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code). 
+🤖 **Edgebot** is an **ultra-lightweight** workspace agent referenced and inspired by [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) and [Nanobot](https://github.com/obot-platform/nanobot).
 
-⚡️ Delivers multi-agent collaboration, subagent delegation, native MCP support, and robust tool-calling—all right from your terminal without heavy boilerplate frameworks.
+⚡️ Delivers isolated subagent delegation, native MCP support, layered permission control, and robust tool-calling—all right from your terminal without heavy boilerplate frameworks.
 
 > 🐈 Edgebot supports **any LLM provider** out of the box through [LiteLLM](https://github.com/BerriAI/litellm) (OpenAI, Anthropic, DeepSeek, Ollama, etc.). Simply swap an environment variable and you're good to go!
 
-  
+
 ## ✨ Key Features
 
-🧰 **22 Built-in Tools**: Execute shells, manipulate file systems (read/write/edit), manage persistent task boards, and run silent background jobs. <br>
-🤝 **Multi-Agent Team**: Spawn persistent autonomous teammates that communicate and collaborate seamlessly via a file-based message bus. <br>
-⚡ **Subagent Spawning**: Delegate isolated code exploration or complex research to one-shot background subagents. <br>
-🗜️ **Context Compression**: Uses advanced microcompacting + idle-time intelligent conversation summarization to always stay within token limits cleanly. <br>
+🧰 **20+ Built-in Tools**: Execute shells, manipulate file systems (read/write/edit), manage persistent task boards, and run silent background jobs. <br>
+🧠 **Unified Agent Loop**: Both the main agent and isolated subagents share one `AgentRunner` execution path; subagent results are injected back into the parent turn via a notification queue. <br>
+⚡ **Subagent Spawning**: Delegate isolated code exploration, building, or review to capability-scoped one-shot background subagents. <br>
+🛡️ **Layered Permission Control**: Workspace-boundary auto-allow + bash program allowlist + regex deny patterns; chain-aware (`cd X && cmd` is inspected per-segment). Hard-blocks `rm -rf /`, fork bombs, and similar before the shell ever sees them. <br>
+🗜️ **Context Compression**: Microcompacting + LLM summary compression + idle-session archival to always stay within token limits. <br>
+🌙 **Dream Memory Consolidation**: Two-phase analyze-then-edit pass that extracts durable facts across conversations into persistent memory. <br>
 🧩 **Skill System**: Extend Edgebot with `SKILL.md` files dynamically, teaching it unique domain knowledge without ever touching Python code. <br>
 🔌 **Native MCP Support**: Direct integration with the Model Context Protocol (MCP) servers via `mcp_servers.json`. <br>
 🚀 **Background Execution**: Spawn heavy terminal commands in non-blocking background threads and get notified upon completion. <br>
-🎯 **Modular Tool Architecture**: Add new capabilities in minutes by simply inheriting from `BaseTool`. 
+🎯 **Modular Tool Architecture**: Add new capabilities in minutes by simply inheriting from `BaseTool`.
 
 ## 🏗️ Architecture
 
@@ -37,29 +39,33 @@
 edgebot/
 ├── config.py                # Environment, paths, global constants
 ├── agent/
-│   ├── loop.py              # Main agent loop & runtime routing
-│   ├── subagent.py          # One-shot subagent execution engine
+│   ├── loop.py              # Main turn orchestration & notification draining
+│   ├── runner.py            # Shared LLM-call / tool-execution loop (AgentRunner)
 │   ├── context.py           # Auto-seeds templates & bootstrap config
-│   └── compression.py       # Intelligent token estimation & idle compaction
+│   ├── compression.py       # Token estimation, microcompact, LLM summary
+│   └── memory.py            # Dream-style memory consolidation
+├── subagent/
+│   ├── runner.py            # Isolated subagent task manager (delegates to AgentRunner)
+│   └── capabilities.py      # explore / builder / reviewer tool whitelists
+├── permissions/
+│   ├── manager.py           # Authorize gate, chain-aware bash parsing, rules I/O
+│   └── defaults.py          # Seed allowlist + deny patterns
 ├── tools/
-│   ├── base.py              # BaseTool API & execution sandbox structure
-│   ├── builtin/             # Modularized core tools (BashTool, FileTool, etc.)
-│   └── registry.py          # Dynamic tool schema builder & handler registration
+│   ├── base.py              # BaseTool API
+│   ├── orchestration.py     # Batched parallel/serial dispatch + permission hook
+│   ├── builtin/             # Modularized core tools (bash, filesystem, etc.)
+│   └── registry.py          # Global tool registry & singleton wiring
 ├── mcp/
-│   └── client.py            # External MCP server communication protocols
+│   └── client.py            # External MCP server communication
 ├── tasks/
-│   ├── todo.py              # Fast in-memory checklist tracker (TodoWrite)
-│   └── manager.py           # On-disk persistent task board manager
-├── team/
-│   ├── bus.py               # File-based IPC (Inter-Process) message bus
-│   ├── teammate.py          # Autonomous teammate lifecycle manager
-│   └── protocols.py         # Handshakes, shutdown, and plan approval routines
+│   ├── todo.py              # In-memory checklist tracker (TodoWrite)
+│   └── manager.py           # On-disk persistent task board
 ├── background/
 │   └── manager.py           # Thread-safe background task runner
 ├── skills/
 │   └── loader.py            # Automatic SKILL.md discovery & extraction
 └── cli/
-    └── repl.py              # Interactive REPL, prompt UI, queue injection
+    └── repl.py              # Interactive REPL, prompt UI, approval handler
 ```
 
 ## 📦 Install & Quick Start
@@ -124,16 +130,19 @@ Edgebot offers several powerful control commands right from the prompt:
 | `/resume <#\|key>` | Swiftly resume a previous disconnected session |
 | `/compact` | Manually compress context & update memory |
 | `/memory` | Run persistent memory consolidation now |
-| `/tasks` | Show the active multi-agent task board | 
-| `/team` | List currently spawned teammate agents |
-| `/inbox` | Read the lead agent's inter-process inbox |
+| `/tasks` | Show the active task board |
+| `/bg` / `/bg <id>` / `/bg output <id>` | Inspect background tasks |
+| `/subagents` / `/subagents <id>` | List or inspect isolated subagents |
+| `/subagents output\|transcript\|fg\|bg\|stop <id>` | Control a subagent |
+| `/permissions` | Show persisted + session permission rules |
+| `/cron`, `/heartbeat`, `/mcp` | Inspect scheduler, heartbeat, and MCP state |
 | `/status` | Show current session, model, and token info |
 | `/help` | Print out the CLI manual overlay |
-| `exit` | Gracefully quit the REPL |
+| `/exit` | Gracefully quit the REPL |
 
 ## 🛠️ Tooling & Extensibility
 
-Edgebot ships with **22 powerful tools** categorized logically:
+Edgebot ships with **20+ tools** categorized logically:
 
 <table align="center">
   <tr align="center">
@@ -142,25 +151,45 @@ Edgebot ships with **22 powerful tools** categorized logically:
   </tr>
   <tr>
     <td><b>🐚 Shell</b></td>
-    <td><code>bash</code>, <code>background_run</code>, <code>check_background</code></td>
+    <td><code>bash</code>, <code>background_run</code>, <code>check_background</code>, <code>task_output</code></td>
   </tr>
   <tr>
     <td><b>📂 Filesystem</b></td>
-    <td><code>read_file</code>, <code>write_file</code>, <code>edit_file</code></td>
+    <td><code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>list_dir</code></td>
   </tr>
   <tr>
     <td><b>📋 Tasks</b></td>
     <td><code>task_create</code>, <code>task_get</code>, <code>task_update</code>, <code>task_list</code>, <code>claim_task</code>, <code>TodoWrite</code></td>
   </tr>
   <tr>
-    <td><b>🤖 Agent Core</b></td>
-    <td><code>task</code> (launch subagent), <code>load_skill</code>, <code>compress</code></td>
+    <td><b>🤖 Subagents</b></td>
+    <td><code>task</code> (spawn), <code>check_subagent</code>, <code>list_subagents</code>, <code>control_subagent</code>, <code>wait_subagent</code></td>
   </tr>
   <tr>
-    <td><b>👥 Teamwork</b></td>
-    <td><code>spawn_teammate</code>, <code>list_teammates</code>, <code>send_message</code>, <code>read_inbox</code>, <code>broadcast</code>, <code>shutdown_request</code>, <code>plan_approval</code>, <code>idle</code></td>
+    <td><b>🧩 Other</b></td>
+    <td><code>load_skill</code>, <code>compress</code>, <code>cron</code>, <code>ask_user</code></td>
   </tr>
 </table>
+
+### 🛡️ Permission Model
+
+Sensitive tools (`bash`, `write_file`, `edit_file`, `background_run`) go through `PermissionManager` before execution. The default policy ships with `.edgebot/permissions.json` auto-seeded on first run:
+
+- **`bash_programs`**: program-name allowlist (`git`, `python`, `rg`, `find`, …). Granting `git` covers `git status`, `git log`, `git diff`, etc.—no need to re-approve every subcommand.
+- **`bash_deny_patterns`**: regex blacklist (`rm -rf /`, fork bombs, `dd if=`, …). Matches are hard-denied with a no-retry hint sent back to the model.
+- **`workspace_write_auto_allow`**: writes/edits whose path resolves under the current workspace are auto-allowed; writes outside still prompt.
+- **Chain-aware bash parsing**: `cd X && cmd` / `cmd1 | cmd2` / Windows `for %f in (...) do cmd` are split into segments; every segment's program must be allowed (so `cd X && rm -rf .` is still blocked even though `cd` is transparent).
+
+When a prompt is needed, the REPL offers four choices:
+
+| Key | Effect |
+|-----|--------|
+| `y` | Allow this one call |
+| `s` | Allow for this session (adds to in-memory rules) |
+| `a` | Allow and persist to `.edgebot/permissions.json` |
+| `n` | Deny |
+
+Inspect the current ruleset anytime with `/permissions`.
 
 ### 🔌 Model Context Protocol (MCP) Support
 

@@ -38,7 +38,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         temperature: float = 0.7,
     ) -> LLMResponse:
         safe_messages = self.enforce_role_alternation(messages)
@@ -58,7 +58,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         temperature: float = 0.7,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:

@@ -1,21 +1,32 @@
 """
 edgebot/permissions/manager.py - Lightweight permission approval layer.
 
-This is structurally inspired by claude-code's permission pipeline:
+Structurally inspired by claude-code's permission pipeline:
  - central decision point before tool execution
  - persisted/session allow rules
  - interactive approval when a sensitive action needs confirmation
+
+v2 schema adds:
+ - bash_programs: program-name allowlist (first shlex token, basename-stripped)
+ - bash_deny_patterns: regex blacklist; matches return a hard policy error
+ - workspace_write_auto_allow: auto-allow write/edit inside WORKDIR
 """
 
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from edgebot.permissions.defaults import DEFAULT_BASH_DENY_PATTERNS, DEFAULT_BASH_PROGRAMS
+
 
 PromptHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
+
+_RULES_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -33,8 +44,6 @@ class PermissionManager:
         "write_file",
         "edit_file",
         "background_run",
-        "spawn_teammate",
-        "shutdown_request",
     }
 
     def __init__(self, rules_path: Path):
@@ -44,67 +53,221 @@ class PermissionManager:
         self._session_rules: dict[str, Any] = {
             "allow_tools": [],
             "bash_prefixes": [],
+            "bash_programs": [],
         }
-        self._rules = self._load_rules()
+        self._rules = self._load_or_seed_rules()
+        self._deny_regexes = self._compile_deny_patterns()
+
+    # ----- handler wiring -----
 
     def set_prompt_handler(self, handler: PromptHandler | None) -> None:
         self._prompt_handler = handler
 
-    def _load_rules(self) -> dict[str, Any]:
-        default = {
-            "version": 1,
+    # ----- rules I/O -----
+
+    def _default_rules(self) -> dict[str, Any]:
+        return {
+            "version": _RULES_VERSION,
             "allow_tools": [],
+            "bash_programs": list(DEFAULT_BASH_PROGRAMS),
             "bash_prefixes": [],
+            "bash_deny_patterns": list(DEFAULT_BASH_DENY_PATTERNS),
+            "workspace_write_auto_allow": True,
         }
+
+    def _load_or_seed_rules(self) -> dict[str, Any]:
         if not self.rules_path.exists():
-            return default
+            rules = self._default_rules()
+            self._write_rules(rules)
+            return rules
+
         try:
             data = json.loads(self.rules_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return default
-        if not isinstance(data, dict):
-            return default
-        for key in ("allow_tools", "bash_prefixes"):
-            value = data.get(key, [])
-            data[key] = [item for item in value if isinstance(item, str)]
-        data["version"] = 1
-        return {**default, **data}
+            return self._default_rules()
 
-    def _save_rules(self) -> None:
+        if not isinstance(data, dict):
+            return self._default_rules()
+
+        rules = self._default_rules()
+        for key in ("allow_tools", "bash_programs", "bash_prefixes", "bash_deny_patterns"):
+            value = data.get(key)
+            if isinstance(value, list):
+                rules[key] = [item for item in value if isinstance(item, str)]
+        if isinstance(data.get("workspace_write_auto_allow"), bool):
+            rules["workspace_write_auto_allow"] = data["workspace_write_auto_allow"]
+
+        if data.get("version") != _RULES_VERSION:
+            self._write_rules(rules)
+        return rules
+
+    def _write_rules(self, rules: dict[str, Any]) -> None:
         self.rules_path.write_text(
-            json.dumps(self._rules, indent=2, ensure_ascii=False) + "\n",
+            json.dumps(rules, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
 
+    def _save_rules(self) -> None:
+        self._write_rules(self._rules)
+
+    def _compile_deny_patterns(self) -> list[re.Pattern[str]]:
+        compiled: list[re.Pattern[str]] = []
+        for pat in self._rules.get("bash_deny_patterns", []):
+            try:
+                compiled.append(re.compile(pat))
+            except re.error:
+                continue
+        return compiled
+
+    # ----- decision helpers -----
+
     def _tool_is_sensitive(self, tool_name: str, params: dict[str, Any], tool: Any) -> bool:
-        # Read-only tools never need approval
         if getattr(tool, "is_read_only", lambda _: False)(params):
             return False
-        # bash commands classified as read-only are safe
-        if tool_name == "bash":
-            command = str(params.get("command", "")).strip()
-            if not command:
-                return False
-        return tool_name in self._TOOL_ALWAYS_ASK or not getattr(tool, "is_read_only", lambda _: False)(params)
+        return tool_name in self._TOOL_ALWAYS_ASK
+
+    @staticmethod
+    def _normalize_program(token: str) -> str:
+        if not token:
+            return ""
+        if "/" in token or "\\" in token:
+            token = Path(token).name
+        if token.lower().endswith(".exe"):
+            token = token[:-4]
+        return token.lower()
+
+    @classmethod
+    def _bash_program(cls, command: str) -> str:
+        """First program name in the command (legacy single-token view)."""
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            tokens = command.strip().split()
+        if not tokens:
+            return ""
+        return cls._normalize_program(tokens[0])
+
+    # Shell operators that chain or pipe distinct commands; each side must
+    # independently pass the program allowlist.
+    _CHAIN_OPERATORS = ("&&", "||", ";", "|")
+    # `cd` is intentionally not in the default allowlist (a bare allowance
+    # would let `cd X && <anything>` slip through). Instead we transparently
+    # skip leading `cd ...` segments and validate the *following* command(s).
+    _TRANSPARENT_LEADERS = {"cd", "pushd", "popd"}
+
+    @classmethod
+    def _bash_programs_in_chain(cls, command: str) -> list[str]:
+        """Split on shell chain operators and return each segment's program.
+
+        - `cd X && rg foo`         -> ["rg"]            (cd is transparent)
+        - `cd X && rm -rf .`       -> ["rm"]            (still gated)
+        - `git status | grep foo`  -> ["git", "grep"]
+        - `for %f in (*.py) do find ...` (cmd.exe) -> ["for", "find"]
+        Returns [] if the command cannot be parsed safely.
+        """
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            return []
+        if not tokens:
+            return []
+
+        segments: list[list[str]] = [[]]
+        for tok in tokens:
+            if tok in cls._CHAIN_OPERATORS:
+                segments.append([])
+            else:
+                segments[-1].append(tok)
+
+        programs: list[str] = []
+        for seg in segments:
+            if not seg:
+                continue
+            head = cls._normalize_program(seg[0])
+            if head.startswith("@"):
+                head = head[1:]
+            # `cd` / `pushd` / `popd` as a whole segment are transparent —
+            # the safety check is whatever segment runs *next* in the chain.
+            if head in cls._TRANSPARENT_LEADERS:
+                continue
+            # Windows cmd `for %f in (...) do <cmd> ...` — also include `do <cmd>`.
+            if head == "for" and "do" in seg:
+                try:
+                    do_idx = seg.index("do")
+                    if do_idx + 1 < len(seg):
+                        inner = cls._normalize_program(seg[do_idx + 1])
+                        if inner.startswith("@"):
+                            inner = inner[1:]
+                        if inner:
+                            programs.append(inner)
+                except ValueError:
+                    pass
+                programs.append("for")
+                continue
+            if head:
+                programs.append(head)
+        return programs
+
+    def _bash_denied(self, command: str) -> bool:
+        return any(rx.search(command) for rx in self._deny_regexes)
 
     def _matches_allow_rule(self, tool_name: str, params: dict[str, Any]) -> bool:
         allow_tools = set(self._rules.get("allow_tools", [])) | set(self._session_rules.get("allow_tools", []))
         if tool_name in allow_tools:
             return True
+
         if tool_name == "bash":
             command = str(params.get("command", "")).strip()
+            if not command:
+                return False
+            if self._bash_denied(command):
+                return False
+            programs_allowed = {
+                p.lower() for p in (
+                    list(self._rules.get("bash_programs", []))
+                    + list(self._session_rules.get("bash_programs", []))
+                )
+            }
+            chain = self._bash_programs_in_chain(command)
+            if chain and all(p in programs_allowed for p in chain):
+                return True
+            # Legacy fall-through: exact-prefix rules people granted before v2.
             prefixes = list(self._rules.get("bash_prefixes", [])) + list(self._session_rules.get("bash_prefixes", []))
             return any(command.startswith(prefix) for prefix in prefixes if prefix)
+
+        if tool_name in {"write_file", "edit_file"} and self._rules.get("workspace_write_auto_allow", True):
+            if self._path_inside_workdir(params.get("path", "")):
+                return True
+
         return False
+
+    @staticmethod
+    def _path_inside_workdir(raw_path: Any) -> bool:
+        from edgebot.config import WORKDIR
+
+        try:
+            path_str = str(raw_path or "").strip()
+            if not path_str:
+                return False
+            p = Path(path_str)
+            if not p.is_absolute():
+                p = (Path(WORKDIR) / p)
+            resolved = p.resolve()
+            workdir = Path(WORKDIR).resolve()
+            return resolved == workdir or workdir in resolved.parents
+        except (OSError, ValueError):
+            return False
 
     def _build_request(self, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         if tool_name == "bash":
             command = str(params.get("command", "")).strip()
+            program = self._bash_program(command)
             return {
                 "tool": tool_name,
                 "message": f"Edgebot requests permission to run shell command:\n{command}",
-                "scope_hint": "allow_prefix",
-                "scope_value": command,
+                "scope_hint": "allow_program" if program else "allow_prefix",
+                "scope_value": program or command,
+                "raw_command": command,
             }
         if tool_name in {"write_file", "edit_file"}:
             path = str(params.get("path", "")).strip()
@@ -129,24 +292,47 @@ class PermissionManager:
             "scope_value": tool_name,
         }
 
-    def _apply_allow(self, request: dict[str, Any], persist: bool, scope: str | None) -> None:
+    def _apply_allow(self, request: dict[str, Any], persist: bool, scope: str) -> None:
         target = self._rules if persist else self._session_rules
-        if request["tool"] == "bash" and scope == "allow_prefix":
-            value = str(request.get("scope_value", "")).strip()
-            if value and value not in target["bash_prefixes"]:
-                target["bash_prefixes"].append(value)
+        if request["tool"] == "bash" and scope == "allow_program":
+            value = str(request.get("scope_value", "")).strip().lower()
+            if value:
+                target.setdefault("bash_programs", [])
+                if value not in target["bash_programs"]:
+                    target["bash_programs"].append(value)
+        elif request["tool"] == "bash" and scope == "allow_prefix":
+            value = str(request.get("raw_command") or request.get("scope_value", "")).strip()
+            if value:
+                target.setdefault("bash_prefixes", [])
+                if value not in target["bash_prefixes"]:
+                    target["bash_prefixes"].append(value)
         elif scope == "allow_tool":
             value = str(request.get("scope_value", "")).strip()
-            if value and value not in target["allow_tools"]:
-                target["allow_tools"].append(value)
+            if value:
+                target.setdefault("allow_tools", [])
+                if value not in target["allow_tools"]:
+                    target["allow_tools"].append(value)
         if persist:
             self._save_rules()
+
+    # ----- public API -----
 
     async def authorize(self, tool_name: str, params: dict[str, Any], tool: Any) -> PermissionDecision:
         if getattr(tool, "is_read_only", lambda _: False)(params):
             return PermissionDecision("allow", updated_params=params)
+
+        if tool_name == "bash":
+            command = str(params.get("command", "")).strip()
+            if command and self._bash_denied(command):
+                return PermissionDecision(
+                    "deny",
+                    "Policy denied: command matches deny pattern. "
+                    "Do NOT retry with shell tricks; ask the user instead.",
+                )
+
         if self._matches_allow_rule(tool_name, params):
             return PermissionDecision("allow", updated_params=params)
+
         if not self._tool_is_sensitive(tool_name, params, tool):
             return PermissionDecision("allow", updated_params=params)
 
@@ -186,4 +372,5 @@ class PermissionManager:
         self._session_rules = {
             "allow_tools": [],
             "bash_prefixes": [],
+            "bash_programs": [],
         }

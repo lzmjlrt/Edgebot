@@ -13,15 +13,11 @@ from edgebot.skills.loader import SkillLoader
 from edgebot.subagent.runner import SubagentRunner
 from edgebot.tasks.manager import TaskManager
 from edgebot.tasks.todo import TodoManager
-from edgebot.team.bus import MessageBus
-from edgebot.team.teammate import TeammateManager
 
 TODO = TodoManager()
 SKILLS = SkillLoader(SKILLS_DIR, extra_workspace_dirs=[LEGACY_SKILLS_DIR] if LEGACY_SKILLS_DIR.exists() else None)
 TASK_MGR = TaskManager()
 BG = BackgroundManager()
-BUS = MessageBus()
-TEAM = TeammateManager(BUS, TASK_MGR)
 SUBAGENT = SubagentRunner()
 CRON = CronService(CRON_STORE_PATH)
 PERMISSIONS = PermissionManager(PERMISSIONS_FILE)
@@ -116,16 +112,6 @@ def init_builtin_tools() -> None:
         TaskTool,
         WaitSubagentTool,
     )
-    from edgebot.tools.builtin.team import (
-        BroadcastTool,
-        IdleTool,
-        ListTeammatesTool,
-        PlanApprovalTool,
-        ReadInboxTool,
-        SendMessageTool,
-        ShutdownRequestTool,
-        SpawnTeammateTool,
-    )
     from edgebot.tools.builtin.todo import CompressTool, TodoWriteTool
 
     for tool in [
@@ -139,17 +125,9 @@ def init_builtin_tools() -> None:
         TaskUpdateTool(),
         TaskListTool(),
         ClaimTaskTool(),
-        BroadcastTool(),
-        SendMessageTool(),
-        ReadInboxTool(),
-        SpawnTeammateTool(),
-        ListTeammatesTool(),
         TaskTool(),
         TodoWriteTool(),
         LoadSkillTool(),
-        IdleTool(),
-        ShutdownRequestTool(),
-        PlanApprovalTool(),
         BackgroundRunTool(),
         CheckBackgroundTool(),
         CheckSubagentTool(),

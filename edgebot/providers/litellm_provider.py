@@ -11,7 +11,9 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import json_repair
 import litellm
+from litellm import exceptions as _litellm_exc
 
 litellm.suppress_debug_info = True
 
@@ -42,15 +44,18 @@ class LiteLLMProvider(LLMProvider):
         temperature: float = 0.7,
     ) -> LLMResponse:
         safe_messages = self.enforce_role_alternation(messages)
-        resp = await litellm.acompletion(
-            model=model or self._model,
-            messages=safe_messages,
-            tools=tools,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            api_key=self.api_key,
-            api_base=self.api_base,
-        )
+        try:
+            resp = await litellm.acompletion(
+                model=model or self._model,
+                messages=safe_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                api_key=self.api_key,
+                api_base=self.api_base,
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
         return self._parse_sync_response(resp)
 
     async def chat_stream(
@@ -63,50 +68,71 @@ class LiteLLMProvider(LLMProvider):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         safe_messages = self.enforce_role_alternation(messages)
-        stream = await litellm.acompletion(
-            model=model or self._model,
-            messages=safe_messages,
-            tools=tools,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            api_key=self.api_key,
-            api_base=self.api_base,
-            stream=True,
-        )
+        try:
+            stream = await litellm.acompletion(
+                model=model or self._model,
+                messages=safe_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                api_key=self.api_key,
+                api_base=self.api_base,
+                stream=True,
+            )
+        except Exception as exc:
+            return self._handle_error(exc)
 
         content_parts: list[str] = []
         tool_calls_buf: dict[int, dict] = {}
-        finish_reason = "stop"
+        # None until provider tells us; we infer at end if still missing.
+        finish_reason: str | None = None
 
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
-            delta = choice.delta
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                delta = choice.delta
 
-            text = getattr(delta, "content", None)
-            if text:
-                content_parts.append(text)
-                if on_content_delta:
-                    await on_content_delta(text)
+                text = getattr(delta, "content", None)
+                if text:
+                    content_parts.append(text)
+                    if on_content_delta:
+                        await on_content_delta(text)
 
-            tc_delta = getattr(delta, "tool_calls", None) or []
-            for tc in tc_delta:
-                idx = getattr(tc, "index", 0) or 0
-                buf = tool_calls_buf.setdefault(
-                    idx, {"id": "", "name": "", "arguments": ""}
-                )
-                if getattr(tc, "id", None):
-                    buf["id"] = tc.id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        buf["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        buf["arguments"] += fn.arguments
+                tc_delta = getattr(delta, "tool_calls", None) or []
+                for tc in tc_delta:
+                    idx = getattr(tc, "index", 0) or 0
+                    buf = tool_calls_buf.setdefault(
+                        idx, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if getattr(tc, "id", None):
+                        buf["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            buf["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            buf["arguments"] += fn.arguments
+        except Exception as exc:
+            # Stream-side error mid-flight: surface it as a structured error
+            # so retry policy can classify it (502/503/timeout/etc.).
+            return self._handle_error(exc)
 
+        # Infer finish_reason if the provider never sent one.
+        if finish_reason is None:
+            if tool_calls_buf and not _all_tool_args_complete(tool_calls_buf):
+                # Incomplete JSON in tool_call.arguments → almost certainly truncated.
+                finish_reason = "length"
+            elif tool_calls_buf:
+                finish_reason = "tool_calls"
+            else:
+                finish_reason = "stop"
+
+        # If finish_reason is "length" but we have tool_call buffers, the args
+        # JSON is likely truncated — json_repair handles partial JSON gracefully.
         tool_calls = [
             ToolCallRequest(
                 id=b["id"],
@@ -154,9 +180,155 @@ class LiteLLMProvider(LLMProvider):
             usage=usage,
         )
 
+    # ------------------------------------------------------------------
+    # Error handling
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _handle_error(cls, exc: Exception) -> LLMResponse:
+        """Convert a litellm/httpx exception into a structured error LLMResponse."""
+        meta = cls._extract_error_metadata(exc)
+        body = (
+            getattr(exc, "body", None)
+            or getattr(exc, "doc", None)
+            or getattr(getattr(exc, "response", None), "text", None)
+        )
+        body_text = body if isinstance(body, str) else (str(body) if body is not None else "")
+        if body_text.strip():
+            content = f"Error: {body_text.strip()[:500]}"
+        else:
+            content = f"Error calling LLM: {exc}"
+
+        retry_after = meta.get("error_retry_after_s")
+        if retry_after is None:
+            retry_after = cls._extract_retry_after(content)
+
+        return LLMResponse(
+            content=content,
+            finish_reason="error",
+            retry_after=retry_after,
+            **meta,
+        )
+
+    @classmethod
+    def _extract_error_metadata(cls, exc: Exception) -> dict[str, Any]:
+        """Pull status_code / kind / type / code / retry-after / should-retry from an exception."""
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+
+        # Body for type/code extraction (OpenAI-style error JSON).
+        payload: Any = (
+            getattr(exc, "body", None)
+            or getattr(exc, "doc", None)
+            or getattr(response, "text", None)
+        )
+        if payload is None and response is not None:
+            response_json = getattr(response, "json", None)
+            if callable(response_json):
+                try:
+                    payload = response_json()
+                except Exception:
+                    payload = None
+        error_type, error_code = LLMProvider._extract_error_type_code(payload)
+
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+
+        # Honor x-should-retry hint if the provider sent one.
+        should_retry: bool | None = None
+        if headers is not None:
+            try:
+                raw = headers.get("x-should-retry")
+            except Exception:
+                raw = None
+            if isinstance(raw, str):
+                lowered = raw.strip().lower()
+                if lowered == "true":
+                    should_retry = True
+                elif lowered == "false":
+                    should_retry = False
+
+        # Map litellm exception class → kind (so retry policy can short-circuit).
+        kind = cls._classify_litellm_kind(exc)
+
+        return {
+            "error_status_code": int(status_code) if status_code is not None else None,
+            "error_kind": kind,
+            "error_type": error_type,
+            "error_code": error_code,
+            "error_retry_after_s": cls._extract_retry_after_from_headers(headers),
+            "error_should_retry": should_retry,
+        }
+
+    @staticmethod
+    def _classify_litellm_kind(exc: Exception) -> str | None:
+        """Map a litellm exception class to one of our `error_kind` tokens."""
+        if isinstance(exc, _litellm_exc.ContextWindowExceededError):
+            return "context_length"
+        if isinstance(exc, _litellm_exc.Timeout):
+            return "timeout"
+        if isinstance(exc, _litellm_exc.APIConnectionError):
+            return "connection"
+        if isinstance(exc, _litellm_exc.RateLimitError):
+            return "rate_limit"
+        if isinstance(
+            exc,
+            (
+                _litellm_exc.ServiceUnavailableError,
+                _litellm_exc.InternalServerError,
+                _litellm_exc.BadGatewayError,
+            ),
+        ):
+            return "server_error"
+        if isinstance(exc, _litellm_exc.AuthenticationError):
+            return "auth"
+        if isinstance(exc, _litellm_exc.PermissionDeniedError):
+            return "permission"
+        if isinstance(exc, _litellm_exc.ContentPolicyViolationError):
+            return "content_filter"
+        if isinstance(
+            exc,
+            (
+                _litellm_exc.BadRequestError,
+                _litellm_exc.InvalidRequestError,
+                _litellm_exc.UnprocessableEntityError,
+                _litellm_exc.UnsupportedParamsError,
+            ),
+        ):
+            return "invalid_request"
+        # Fallback: sniff the class name (covers httpx.TimeoutException etc.).
+        name = exc.__class__.__name__.lower()
+        if "timeout" in name:
+            return "timeout"
+        if "connection" in name:
+            return "connection"
+        return None
+
+
+def _all_tool_args_complete(buf: dict[int, dict]) -> bool:
+    """True iff every accumulated tool_call's argument string is valid JSON."""
+    for b in buf.values():
+        raw = b.get("arguments") or ""
+        if not raw:
+            # No args yet — treat as complete (empty dict).
+            continue
+        try:
+            json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return False
+    return True
+
 
 def _parse_json(raw: str) -> dict[str, Any]:
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    """Parse tool-call arguments JSON, repairing truncated/malformed payloads."""
+    if not raw:
         return {}
+    try:
+        result = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        try:
+            result = json_repair.loads(raw)
+        except Exception:
+            return {}
+    return result if isinstance(result, dict) else {}

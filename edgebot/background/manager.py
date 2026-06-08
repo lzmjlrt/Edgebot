@@ -17,6 +17,8 @@ from edgebot.config import BACKGROUND_DIR, WORKDIR
 
 _OUTPUT_PREVIEW_CHARS = 4000
 _NOTIFICATION_PREVIEW_CHARS = 500
+_ADOPT_DRAIN_INTERVAL = 0.2
+_ADOPT_DEFAULT_TIMEOUT = 600
 
 
 class BackgroundManager:
@@ -53,6 +55,127 @@ class BackgroundManager:
             daemon=True,
         ).start()
         return self._public_task(task, include_output=False)
+
+    def adopt(
+        self,
+        process: subprocess.Popen,
+        command: str,
+        captured: str,
+        *,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Take ownership of an already-running Popen and surface it as a bg task.
+
+        Used when the foreground bash tool hits a hard timeout but the process
+        still has work to do. The captured-so-far text is kept on the task
+        record as the initial preview; the watcher thread waits for the process
+        to exit and then writes the full output to the log file via a single
+        final communicate() call.
+        """
+        tid = str(uuid.uuid4())[:8]
+        output_path = self.output_dir / f"{tid}.log"
+        task = {
+            "task_id": tid,
+            "type": "adopted_bash",
+            "status": "running",
+            "command": command,
+            "description": command[:120],
+            "started_at": time.time(),
+            "finished_at": None,
+            "timeout_seconds": timeout if timeout is not None else _ADOPT_DEFAULT_TIMEOUT,
+            "exit_code": None,
+            "error": None,
+            "output_file": str(output_path),
+            "output_preview": (captured or "")[:_OUTPUT_PREVIEW_CHARS],
+            "event": threading.Event(),
+        }
+        with self._lock:
+            self.tasks[tid] = task
+        threading.Thread(
+            target=self._watch_adopted,
+            args=(tid, process, output_path, task["timeout_seconds"]),
+            daemon=True,
+        ).start()
+        return self._public_task(task, include_output=False)
+
+    def _watch_adopted(
+        self,
+        tid: str,
+        process: subprocess.Popen,
+        output_path: Path,
+        timeout: int,
+    ) -> None:
+        """Wait for an adopted process to exit, then write its full output.
+
+        The foreground caller already consumed partial output via
+        `communicate(timeout=)`. We avoid touching stdout/stderr until the
+        process has actually exited — at that point a final communicate() will
+        join the still-running reader threads and return the complete buffered
+        output (which includes the bytes already shown to the agent). We write
+        that complete output to the log so `task_output` returns the full,
+        canonical result.
+        """
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        status = "completed"
+        error: str | None = None
+        final_out = ""
+        final_err = ""
+        try:
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    process.kill()
+                    status = "timeout"
+                    error = f"Adopted task exceeded {timeout}s; killed."
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(_ADOPT_DRAIN_INTERVAL)
+            try:
+                final_out, final_err = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                final_out, final_err = process.communicate()
+            if isinstance(final_out, bytes):
+                final_out = final_out.decode("utf-8", errors="replace")
+            if isinstance(final_err, bytes):
+                final_err = final_err.decode("utf-8", errors="replace")
+        except Exception as exc:
+            status = "error"
+            error = str(exc)
+
+        parts: list[str] = []
+        if final_out:
+            parts.append(final_out)
+        if final_err and final_err.strip():
+            parts.append(f"STDERR:\n{final_err}")
+        if process.returncode is not None:
+            parts.append(f"\nExit code: {process.returncode}")
+        payload = "\n".join(parts) if parts else "(no output)"
+
+        try:
+            output_path.write_text(payload, encoding="utf-8")
+        except OSError:
+            pass
+        preview = payload[:_OUTPUT_PREVIEW_CHARS]
+        with self._lock:
+            task = self.tasks.get(tid)
+            if task is None:
+                return
+            task.update({
+                "status": status,
+                "finished_at": time.time(),
+                "exit_code": process.returncode,
+                "error": error,
+                "output_preview": preview,
+            })
+            task["event"].set()
+
+        self.notifications.put({
+            "task_id": tid,
+            "status": status,
+            "output_file": str(output_path),
+            "result": preview[:_NOTIFICATION_PREVIEW_CHARS],
+        })
 
     def _exec(self, tid: str, command: str, timeout: int, output_path: Path) -> None:
         status = "completed"

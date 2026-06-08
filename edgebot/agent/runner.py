@@ -21,6 +21,8 @@ _console = Console()
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _MAX_EMPTY_RETRIES = 2
+_MAX_LENGTH_RECOVERIES = 3
+_MAX_CONTEXT_EMERGENCY_COMPACTS = 1
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
 _COMPACTABLE_TOOLS = frozenset({
@@ -28,6 +30,10 @@ _COMPACTABLE_TOOLS = frozenset({
     "web_search", "web_fetch", "list_dir",
 })
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
+_LENGTH_RECOVERY_PROMPT = (
+    "Output limit reached. Continue exactly where you left off "
+    "— no recap, no apology. Break remaining work into smaller steps if needed."
+)
 
 
 @dataclass(slots=True)
@@ -78,6 +84,8 @@ class AgentRunner:
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         stop_reason = "completed"
         empty_content_retries = 0
+        length_recoveries = 0
+        context_emergency_compacts = 0
 
         for iteration in range(spec.max_iterations):
             # Context governance: clean up any inconsistencies from
@@ -159,6 +167,63 @@ class AgentRunner:
                     usage[key] = usage.get(key, 0) + int(value or 0)
                 except (TypeError, ValueError):
                     pass
+
+            # ---- Context-length emergency: compact then retry ----
+            if (
+                response.finish_reason == "error"
+                and getattr(response, "error_kind", None) == "context_length"
+                and context_emergency_compacts < _MAX_CONTEXT_EMERGENCY_COMPACTS
+            ):
+                context_emergency_compacts += 1
+                if spec.emit_output:
+                    _console.print(
+                        "[dim yellow]  Context length exceeded — "
+                        "compacting and retrying...[/dim yellow]"
+                    )
+                try:
+                    from edgebot.agent.compression import auto_compact
+                    messages = await auto_compact(messages, is_idle=False)
+                except Exception as exc:
+                    if spec.emit_output:
+                        _console.print(
+                            f"[red]  Emergency compact failed: {exc}[/red]"
+                        )
+                    return AgentRunResult(
+                        final_content=str(exc),
+                        messages=messages,
+                        tool_names_used=tools_used,
+                        usage=usage,
+                        stop_reason="error",
+                    )
+                empty_content_retries = 0
+                continue
+
+            # ---- Length recovery: output hit max_tokens, ask to continue ----
+            if (
+                response.finish_reason == "length"
+                and length_recoveries < _MAX_LENGTH_RECOVERIES
+            ):
+                # Tool_calls under finish_reason="length" are likely truncated
+                # (incomplete arguments JSON) — never execute them. Preserve
+                # any partial assistant text so the model can continue from it.
+                length_recoveries += 1
+                if spec.emit_output:
+                    _console.print(
+                        f"[dim yellow]  Output truncated (length), "
+                        f"continuing... ({length_recoveries}/"
+                        f"{_MAX_LENGTH_RECOVERIES})[/dim yellow]"
+                    )
+                if response.content and response.content.strip():
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content,
+                    })
+                messages.append({
+                    "role": "user",
+                    "content": _LENGTH_RECOVERY_PROMPT,
+                })
+                empty_content_retries = 0
+                continue
 
             # ---- Handle tool calls ----
             if response.should_execute_tools:

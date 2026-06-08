@@ -8,20 +8,13 @@ import subprocess
 from pathlib import Path
 
 from edgebot.config import WORKDIR
+from edgebot.permissions.defaults import DEFAULT_BASH_DENY_PATTERNS
 
 _MAX_OUTPUT = 10_000
 _TIMEOUT = 120
-_DENY_PATTERNS = [
-    r"\brm\s+-[rf]{1,2}\b",
-    r"\bdel\s+/[fq]\b",
-    r"\brmdir\s+/s\b",
-    r"(?:^|[;&|]\s*)format\b",
-    r"\b(mkfs|diskpart)\b",
-    r"\bdd\s+if=",
-    r">\s*/dev/sd",
-    r"\b(shutdown|reboot|poweroff)\b",
-    r":\(\)\s*\{.*\};\s*:",
-]
+_REPEAT_COLLAPSE_THRESHOLD = 5
+# Single source of truth — same regex set the PermissionManager uses.
+_DENY_PATTERNS = list(DEFAULT_BASH_DENY_PATTERNS)
 _READ_ONLY_COMMANDS = {
     "cat", "type", "more", "head", "tail", "pwd", "cd", "ls", "dir",
     "find", "findstr", "grep", "rg", "git", "python", "python3", "py",
@@ -92,9 +85,9 @@ def _extract_absolute_paths(command: str) -> list[str]:
 
 
 def _guard_command(command: str, cwd: str) -> str | None:
-    lower = command.strip().lower()
+    stripped = command.strip()
     for pattern in _DENY_PATTERNS:
-        if re.search(pattern, lower):
+        if re.search(pattern, stripped, re.IGNORECASE):
             return "Error: Command blocked by safety guard (dangerous pattern detected)"
 
     from edgebot.security.network import contains_internal_url
@@ -115,31 +108,48 @@ def _guard_command(command: str, cwd: str) -> str | None:
     return None
 
 
-def run_bash(command: str) -> str:
-    guard_error = _guard_command(command, str(WORKDIR))
-    if guard_error:
-        return guard_error
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {_TIMEOUT} seconds"
-    except Exception as e:
-        return f"Error executing command: {e}"
+def _collapse_repeats(text: str, threshold: int = _REPEAT_COLLAPSE_THRESHOLD) -> str:
+    """Compress runs of identical lines into one line plus a counter."""
+    if not text:
+        return text
+    lines = text.splitlines(keepends=True)
+    if len(lines) < threshold:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        j = i + 1
+        while j < len(lines) and lines[j] == lines[i]:
+            j += 1
+        run = j - i
+        if run >= threshold:
+            out.append(lines[i])
+            sep = "" if lines[i].endswith("\n") else "\n"
+            out.append(f"{sep}... [previous line repeated {run - 1} more times]\n")
+        else:
+            out.extend(lines[i:j])
+        i = j
+    return "".join(out)
 
-    output_parts = []
-    if result.stdout:
-        output_parts.append(result.stdout)
-    if result.stderr and result.stderr.strip():
-        output_parts.append(f"STDERR:\n{result.stderr}")
-    output_parts.append(f"\nExit code: {result.returncode}")
-    output = "\n".join(output_parts) if output_parts else "(no output)"
+
+def _format_output(
+    stdout: str,
+    stderr: str,
+    exit_code: int | None,
+    *,
+    partial: bool = False,
+) -> str:
+    parts: list[str] = []
+    if stdout:
+        parts.append(stdout)
+    if stderr and stderr.strip():
+        parts.append(f"STDERR:\n{stderr}")
+    if exit_code is not None:
+        parts.append(f"\nExit code: {exit_code}")
+    elif partial:
+        parts.append("\n(process still running — exit code not yet available)")
+    output = "\n".join(parts) if parts else "(no output)"
+    output = _collapse_repeats(output)
     if len(output) > _MAX_OUTPUT:
         half = _MAX_OUTPUT // 2
         output = (
@@ -148,6 +158,69 @@ def run_bash(command: str) -> str:
             + output[-half:]
         )
     return output
+
+
+def run_bash(command: str) -> str:
+    guard_error = _guard_command(command, str(WORKDIR))
+    if guard_error:
+        return guard_error
+
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=WORKDIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+        )
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+    try:
+        stdout, stderr = process.communicate(timeout=_TIMEOUT)
+        return _format_output(stdout or "", stderr or "", process.returncode)
+    except subprocess.TimeoutExpired as exc:
+        captured_stdout = exc.stdout or ""
+        captured_stderr = exc.stderr or ""
+        if isinstance(captured_stdout, bytes):
+            captured_stdout = captured_stdout.decode("utf-8", errors="replace")
+        if isinstance(captured_stderr, bytes):
+            captured_stderr = captured_stderr.decode("utf-8", errors="replace")
+        captured = _format_output(
+            captured_stdout, captured_stderr, exit_code=None, partial=True
+        )
+        try:
+            from edgebot.tools.registry import BG
+
+            bg_task = BG.adopt(process, command, captured)
+            tid = bg_task.get("task_id", "?")
+            return (
+                f"Command exceeded {_TIMEOUT}s and was moved to background "
+                f"(task_id={tid}). Use task_output with that id to retrieve the "
+                f"final result.\n\n"
+                f"--- Partial output (captured before timeout) ---\n{captured}"
+            )
+        except Exception as adopt_err:
+            # Adoption failed for some reason — kill to avoid orphan and
+            # surface what we already captured.
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return (
+                f"Error: Command timed out after {_TIMEOUT} seconds (background "
+                f"adoption failed: {adopt_err})\n\n"
+                f"--- Partial output ---\n{captured}"
+            )
+    except Exception as e:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        return f"Error executing command: {e}"
 
 
 def is_read_only_command(command: str) -> bool:

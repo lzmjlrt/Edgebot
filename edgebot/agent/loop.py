@@ -46,8 +46,22 @@ def get_autocompact(session_store) -> object | None:
         provider=create_provider(),
         model=MODEL,
         ttl_minutes=IDLE_COMPACT_MINUTES,
+        memory_dir=_MEMORY.memory_dir,
     )
     return _AUTOCOMPACT
+
+
+def _enforce_session_file_cap(session_store, session_key: str, *, emit_output: bool = True) -> None:
+    if session_store is None:
+        return
+    try:
+        Consolidator(
+            session_store=session_store,
+            memory_dir=_MEMORY.memory_dir,
+        ).enforce_session_file_cap(session_key)
+    except Exception as exc:
+        if emit_output:
+            _console.print(f"[dim red]  [context] file cap error: {exc}[/dim red]")
 
 
 def _flush_stdin() -> None:
@@ -276,6 +290,11 @@ async def agent_loop(
             session_key, "runtime_checkpoint",
         )
         session_store.batch_append(session_key, new_msgs)
+        _enforce_session_file_cap(
+            session_store,
+            session_key,
+            emit_output=emit_output,
+        )
 
     # ---- Post-processing (once) ----
 
@@ -291,6 +310,11 @@ async def agent_loop(
             session_store.update_metadata(
                 session_key,
                 session_summary=extract_session_summary(messages) or "",
+            )
+            _enforce_session_file_cap(
+                session_store,
+                session_key,
+                emit_output=emit_output,
             )
 
     # Archive turn summary to history.jsonl for Dream

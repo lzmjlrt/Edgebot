@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 _LAST_CONSOLIDATED_KEY = "last_consolidated"
+FILE_MAX_MESSAGES = 2000
 
 
 def find_legal_start(messages: list[dict]) -> int:
@@ -87,6 +88,71 @@ def _dedup_messages(messages: list[dict]) -> list[dict]:
                 continue
         deduped.append(msg)
     return deduped
+
+
+def _retain_recent_legal_suffix(
+    state: dict[str, Any],
+    max_messages: int,
+) -> tuple[list[dict], int]:
+    """Trim state messages to a legal recent suffix.
+
+    Returns (dropped_messages, already_consolidated_dropped_count).
+    """
+    messages = list(state.get("messages", []))
+    metadata = state.setdefault("metadata", {})
+    last_consolidated = metadata.get(_LAST_CONSOLIDATED_KEY, 0)
+    if isinstance(last_consolidated, bool) or not isinstance(last_consolidated, int):
+        last_consolidated = 0
+    last_consolidated = max(0, min(last_consolidated, len(messages)))
+
+    if max_messages <= 0:
+        dropped = messages
+        metadata[_LAST_CONSOLIDATED_KEY] = 0
+        state["messages"] = []
+        return dropped, min(last_consolidated, len(dropped))
+    if len(messages) <= max_messages:
+        return [], 0
+
+    original = messages
+    retained = list(messages[-max_messages:])
+
+    first_user = next((i for i, msg in enumerate(retained) if msg.get("role") == "user"), None)
+    if first_user is not None:
+        retained = retained[first_user:]
+    else:
+        latest_user = next(
+            (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
+            None,
+        )
+        if latest_user is not None:
+            retained = list(messages[latest_user: latest_user + max_messages])
+
+    start = find_legal_start(retained)
+    if start:
+        retained = retained[start:]
+
+    if len(retained) > max_messages:
+        retained = retained[-max_messages:]
+        start = find_legal_start(retained)
+        if start:
+            retained = retained[start:]
+
+    retained_ids = {id(message) for message in retained}
+    dropped = [message for message in original if id(message) not in retained_ids]
+    already_consolidated = sum(
+        1
+        for index, message in enumerate(original)
+        if index < last_consolidated and id(message) not in retained_ids
+    )
+    new_last_consolidated = sum(
+        1
+        for index, message in enumerate(original)
+        if index < last_consolidated and id(message) in retained_ids
+    )
+
+    state["messages"] = retained
+    metadata[_LAST_CONSOLIDATED_KEY] = new_last_consolidated
+    return dropped, already_consolidated
 
 
 class SessionStore:
@@ -433,6 +499,36 @@ class SessionStore:
         state["messages"] = list(messages)
         state["updated_at"] = datetime.now(timezone.utc)
         self.save_state(session_key, state)
+
+    def enforce_file_cap(
+        self,
+        session_key: str,
+        *,
+        limit: int = FILE_MAX_MESSAGES,
+        on_archive=None,
+    ) -> bool:
+        """Bound a session file by trimming a legal suffix.
+
+        If provided, on_archive receives dropped messages that were not already
+        covered by last_consolidated.
+        """
+        if limit <= 0:
+            return False
+        state = self.load_state(session_key)
+        if len(state.get("messages", [])) <= limit:
+            return False
+
+        dropped, already_consolidated = _retain_recent_legal_suffix(state, limit)
+        if not dropped:
+            return False
+
+        archive_chunk = dropped[already_consolidated:]
+        if archive_chunk and on_archive is not None:
+            on_archive(archive_chunk)
+
+        state["updated_at"] = datetime.now(timezone.utc)
+        self.save_state(session_key, state)
+        return True
 
     def update_metadata(self, session_key: str, **updates: Any) -> None:
         """Merge keys into session metadata."""

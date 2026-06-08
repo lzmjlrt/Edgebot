@@ -10,7 +10,7 @@ to send to the model.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ from edgebot.agent.compression import (
     merge_session_summaries,
     summarize_messages,
 )
-from edgebot.session.store import SessionStore
+from edgebot.session.store import FILE_MAX_MESSAGES, SessionStore
 
 _HISTORY_ENTRY_HARD_CAP = 64_000
 _FALLBACK_JSON_CAP = 60_000
@@ -93,6 +93,116 @@ class Consolidator:
                 session_summary=merge_session_summaries(previous, summary),
             )
         return True
+
+    async def compact_idle_session(
+        self,
+        session_key: str,
+        max_suffix: int = 8,
+    ) -> str | None:
+        """Archive an idle session's unconsolidated prefix and keep a legal tail."""
+        from edgebot.session.store import _retain_recent_legal_suffix
+
+        state = self.sessions.load_state(session_key)
+        messages = list(state.get("messages", []))
+        start = self.sessions.get_last_consolidated(session_key)
+        tail = messages[start:]
+        if not tail:
+            state["updated_at"] = datetime.now(timezone.utc)
+            self.sessions.save_state(session_key, state)
+            return ""
+
+        probe = {
+            "messages": tail,
+            "metadata": {"last_consolidated": 0},
+        }
+        dropped, already_consolidated = _retain_recent_legal_suffix(
+            probe,
+            max_suffix,
+        )
+        kept = list(probe.get("messages", []))
+        archive_messages = dropped[already_consolidated:]
+        if not archive_messages and not kept:
+            state["messages"] = []
+            state.setdefault("metadata", {})["last_consolidated"] = 0
+            state["updated_at"] = datetime.now(timezone.utc)
+            self.sessions.save_state(session_key, state)
+            return ""
+
+        last_active = state.get("updated_at", datetime.now(timezone.utc))
+        summary: str | None = ""
+        if archive_messages:
+            content, summary = await self._build_archive_content(
+                session_key,
+                archive_messages,
+            )
+            self._append_history_record(
+                session_key=session_key,
+                start_index=start,
+                end_index=start + len(archive_messages),
+                content=content,
+                archived_message_count=len(archive_messages),
+            )
+
+        metadata = state.setdefault("metadata", {})
+        if summary and summary != "(nothing)":
+            metadata["session_summary"] = merge_session_summaries(
+                metadata.get("session_summary"),
+                summary,
+            )
+            metadata["_last_summary"] = {
+                "text": summary,
+                "last_active": (
+                    last_active.isoformat()
+                    if isinstance(last_active, datetime)
+                    else str(last_active)
+                ),
+            }
+
+        state["messages"] = kept
+        metadata["last_consolidated"] = 0
+        state["updated_at"] = datetime.now(timezone.utc)
+        self.sessions.save_state(session_key, state)
+        return summary
+
+    def enforce_session_file_cap(
+        self,
+        session_key: str,
+        *,
+        max_messages: int = FILE_MAX_MESSAGES,
+    ) -> bool:
+        """Trim an oversized session file and raw-archive newly dropped history."""
+        return self.sessions.enforce_file_cap(
+            session_key,
+            limit=max_messages,
+            on_archive=lambda chunk: self.raw_archive_messages(
+                session_key,
+                chunk,
+                reason="session file cap",
+            ),
+        )
+
+    def raw_archive_messages(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        *,
+        reason: str = "raw archive",
+    ) -> None:
+        """Append raw messages to history.jsonl when no LLM summary is needed."""
+        if not messages:
+            return
+        raw = json.dumps(messages, ensure_ascii=False, default=str)
+        content = _truncate_text(
+            f"Context archive fallback for session {session_key}; {reason}.\n{raw}",
+            _FALLBACK_JSON_CAP,
+        )
+        self._append_history_record(
+            session_key=session_key,
+            start_index=-1,
+            end_index=-1,
+            content=content,
+            archived_message_count=len(messages),
+        )
 
     def _find_archive_boundary(
         self,

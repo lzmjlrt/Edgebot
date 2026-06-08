@@ -69,6 +69,7 @@ def test_consolidator_archives_incremental_prefix_at_user_boundary(tmp_path: Pat
     loaded = store.load_state("s1")
     assert loaded["messages"] == messages
     assert loaded["metadata"]["last_consolidated"] == 5
+    assert loaded["metadata"]["session_summary"] == "- old work summarized"
 
     records = [
         json.loads(line)

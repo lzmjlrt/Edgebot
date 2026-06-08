@@ -38,7 +38,7 @@ def _is_blocked_device(path: str | Path) -> bool:
     )
 
 
-def run_read(path: str, limit: int | None = None, offset: int = 1) -> str:
+def run_read(path: str, limit: int | None = None, offset: int = 1, force: bool = False) -> str:
     try:
         fp = safe_path(path)
         if _is_blocked_device(fp):
@@ -53,7 +53,7 @@ def run_read(path: str, limit: int | None = None, offset: int = 1) -> str:
             current_mtime = os.path.getmtime(fp)
         except OSError:
             current_mtime = 0.0
-        if entry and entry.can_dedup and entry.offset == offset and entry.limit == limit:
+        if not force and entry and entry.can_dedup and entry.offset == offset and entry.limit == limit:
             current_hash = file_state._hash_file(fp)
             if current_mtime == entry.mtime and current_hash == entry.content_hash:
                 return f"[File unchanged since last read: {path}]"

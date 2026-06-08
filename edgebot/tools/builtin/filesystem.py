@@ -9,11 +9,11 @@ class ReadFileTool(BaseTool):
     @property
     def name(self) -> str: return "read_file"
     @property
-    def description(self) -> str: return "Read file contents."
+    def description(self) -> str: return "Read file contents. Use force=true to bypass deduplication after context compaction or failed edits."
     @property
-    def parameters(self) -> dict: return {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 1}}, "required": ["path"]}
+    def parameters(self) -> dict: return {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 1}, "force": {"type": "boolean"}}, "required": ["path"]}
     def is_read_only(self, params: dict[str, Any] | None = None) -> bool: return True
-    def execute(self, **kwargs: Any) -> Any: return run_read(kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1))
+    def execute(self, **kwargs: Any) -> Any: return run_read(kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1), kwargs.get("force", False))
 
 class WriteFileTool(BaseTool):
     @property

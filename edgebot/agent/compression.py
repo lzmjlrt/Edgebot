@@ -5,7 +5,6 @@ edgebot/agent/compression.py - Context compression utilities.
 import json
 import time
 
-from edgebot.config import MODEL, TRANSCRIPT_DIR, create_provider
 from edgebot.session.store import find_legal_start
 
 _COMPACT_PREFIX = "[System: Context auto-compressed"
@@ -72,6 +71,35 @@ def extract_session_summary(messages: list[dict]) -> str | None:
     return summary or None
 
 
+async def summarize_messages(
+    messages: list[dict],
+    *,
+    provider=None,
+    model: str | None = None,
+    max_tokens: int = 2000,
+    max_input_chars: int = 80000,
+) -> str | None:
+    """Summarize a message slice using the standard context-compaction prompt."""
+    if not messages:
+        return None
+    if provider is None or model is None:
+        from edgebot.config import MODEL, create_provider
+        provider = provider or create_provider()
+        model = model or MODEL
+
+    conv_text = json.dumps(messages, ensure_ascii=False, default=str)[:max_input_chars]
+    prompt = f"{_COMPACT_PROMPT}\n\n## Conversation\n{conv_text}"
+    resp = await provider.chat_with_retry(
+        messages=[{"role": "user", "content": prompt}],
+        model=model,
+        max_tokens=max_tokens,
+        temperature=0.3,
+    )
+    if getattr(resp, "finish_reason", None) == "error":
+        return None
+    return resp.content
+
+
 async def auto_compact(
     messages: list,
     is_idle: bool = False,
@@ -97,23 +125,15 @@ async def auto_compact(
     if not prefix:
         return messages
 
+    from edgebot.config import TRANSCRIPT_DIR
+
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(path, "w", encoding="utf-8") as f:
         for msg in prefix:
             f.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
             
-    conv_text = json.dumps(prefix, ensure_ascii=False, default=str)[:80000]
-    prompt = f"{_COMPACT_PROMPT}\n\n## Conversation\n{conv_text}"
-
-    provider = create_provider()
-    resp = await provider.chat_with_retry(
-        messages=[{"role": "user", "content": prompt}],
-        model=MODEL,
-        max_tokens=2000,
-        temperature=0.3,
-    )
-    summary = resp.content
+    summary = await summarize_messages(prefix)
 
     if memory_store and summary:
         archived_label = (

@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_LAST_CONSOLIDATED_KEY = "last_consolidated"
+
 
 def find_legal_start(messages: list[dict]) -> int:
     """
@@ -111,6 +113,18 @@ class SessionStore:
         metadata["workspace"] = workspace_value
         return True
 
+    def _normalize_last_consolidated(self, state: dict[str, Any]) -> bool:
+        metadata = state.setdefault("metadata", {})
+        messages = state.get("messages", [])
+        value = metadata.get(_LAST_CONSOLIDATED_KEY, 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            value = 0
+        value = max(0, min(value, len(messages)))
+        if metadata.get(_LAST_CONSOLIDATED_KEY) == value:
+            return False
+        metadata[_LAST_CONSOLIDATED_KEY] = value
+        return True
+
     def _read_metadata_line(self, path: Path) -> dict[str, Any] | None:
         try:
             with open(path, encoding="utf-8") as f:
@@ -172,7 +186,7 @@ class SessionStore:
             "key": session_key,
             "created_at": now,
             "updated_at": now,
-            "metadata": {},
+            "metadata": {_LAST_CONSOLIDATED_KEY: 0},
             "messages": [],
         }
         self._apply_workspace_metadata(state)
@@ -310,6 +324,8 @@ class SessionStore:
         state["messages"] = messages
 
         touched = self._restore_state(state)
+        if self._normalize_last_consolidated(state):
+            touched = True
         if self._apply_workspace_metadata(state):
             touched = True
         if touched:
@@ -330,8 +346,23 @@ class SessionStore:
             "metadata": dict(state.get("metadata", {})),
             "messages": list(state.get("messages", [])),
         }
+        self._normalize_last_consolidated(state)
         self._apply_workspace_metadata(state)
         self._write_state(path, state)
+
+    def get_last_consolidated(self, session_key: str) -> int:
+        """Return the message index boundary already archived for this session."""
+        state = self.load_state(session_key)
+        self._normalize_last_consolidated(state)
+        return int(state["metadata"][_LAST_CONSOLIDATED_KEY])
+
+    def set_last_consolidated(self, session_key: str, cursor: int) -> None:
+        """Persist the message index boundary already archived for this session."""
+        state = self.load_state(session_key)
+        state["metadata"][_LAST_CONSOLIDATED_KEY] = cursor
+        self._normalize_last_consolidated(state)
+        state["updated_at"] = datetime.now(timezone.utc)
+        self.save_state(session_key, state)
 
     def append(self, session_key: str, message: dict) -> None:
         """Append a single message dict to the session file."""

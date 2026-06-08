@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from rich.console import Console
@@ -28,6 +29,8 @@ _MAX_LENGTH_RECOVERIES = 3
 _MAX_CONTEXT_EMERGENCY_COMPACTS = 1
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
+_TOOL_RESULT_PREVIEW_CHARS = 1200
+_DEFAULT_MAX_TOOL_RESULT_TOKENS = 24_000
 _COMPACTABLE_TOOLS = frozenset({
     "read_file", "bash", "grep", "glob",
     "web_search", "web_fetch", "list_dir",
@@ -54,6 +57,9 @@ class AgentRunSpec:
     temperature: float = 0.7
     retry_mode: str = "standard"
     max_tool_result_chars: int = 16_000
+    max_tool_result_tokens: int | None = _DEFAULT_MAX_TOOL_RESULT_TOKENS
+    session_key: str = "default"
+    tool_result_root: Path | None = None
     emit_output: bool = True
     assistant_label: str = "Edgebot"
     on_progress: Callable[..., Awaitable[None]] | None = None
@@ -97,7 +103,8 @@ class AgentRunner:
             messages = _drop_orphan_tool_results(messages)
             messages = _backfill_missing_tool_results(messages)
             messages = _microcompact(messages)
-            call_messages = _apply_input_token_budget(messages, spec)
+            governed_messages = _apply_tool_result_budget(messages, spec)
+            call_messages = _apply_input_token_budget(governed_messages, spec)
 
             # Streaming LLM call via provider
             first_delta = True
@@ -263,13 +270,18 @@ class AgentRunner:
                 completed_results: list[dict[str, Any]] = []
                 for executed in executed_calls:
                     tc = executed["tool_call"]
+                    tool_name = executed.get("name") or tc.get("function", {}).get("name") or "tool"
                     output = str(executed["output"])
-                    if len(output) > spec.max_tool_result_chars:
-                        output = output[:spec.max_tool_result_chars] + "\n...[truncated]"
+                    output = _prepare_tool_result_content(
+                        output,
+                        tool_name=tool_name,
+                        tool_call_id=str(tc.get("id") or "tool_call"),
+                        spec=spec,
+                    )
                     tool_msg = {
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "name": executed.get("name") or tc.get("function", {}).get("name") or "tool",
+                        "name": tool_name,
                         "content": output,
                     }
                     messages.append(tool_msg)
@@ -464,6 +476,140 @@ def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return updated if updated is not None else messages
 
 
+def _safe_session_dir_name(session_key: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in session_key)
+    return safe.strip("._") or "default"
+
+
+def _safe_tool_result_name(tool_call_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in tool_call_id)
+    return (safe.strip("._") or "tool_call") + ".txt"
+
+
+def _tool_result_root(spec: AgentRunSpec) -> Path:
+    if spec.tool_result_root is not None:
+        return Path(spec.tool_result_root)
+    from edgebot.config import RUNTIME_DIR
+    return RUNTIME_DIR / "tool-results"
+
+
+def _prepare_tool_result_content(
+    output: str,
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    spec: AgentRunSpec,
+) -> str:
+    """Offload large non-read_file tool outputs and return context content."""
+    if tool_name != "read_file" and len(output) > spec.max_tool_result_chars:
+        root = _tool_result_root(spec)
+        path = (
+            root
+            / _safe_session_dir_name(spec.session_key)
+            / _safe_tool_result_name(tool_call_id)
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output, encoding="utf-8")
+        preview = output[:_TOOL_RESULT_PREVIEW_CHARS]
+        return (
+            "[Tool result offloaded]\n"
+            f"Path: {path}\n"
+            f"Original size: {len(output)} chars\n"
+            f"Preview:\n{preview}"
+        )
+
+    if len(output) > spec.max_tool_result_chars:
+        return output[:spec.max_tool_result_chars] + "\n...[truncated]"
+    return output
+
+
+def _apply_tool_result_budget(
+    messages: list[dict[str, Any]],
+    spec: AgentRunSpec,
+) -> list[dict[str, Any]]:
+    """Replace old tool results when aggregate tool output exceeds budget."""
+    max_tool_result_tokens = spec.max_tool_result_tokens
+    if max_tool_result_tokens is None:
+        return messages
+    max_tool_result_tokens = max(0, int(max_tool_result_tokens))
+    tool_indices = [
+        idx for idx, msg in enumerate(messages)
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), str)
+    ]
+    if not tool_indices:
+        return messages
+
+    tool_messages = [messages[idx] for idx in tool_indices]
+    if estimate_tokens(tool_messages) <= max_tool_result_tokens:
+        return messages
+
+    keep: set[int] = set()
+    kept_messages: list[dict[str, Any]] = []
+    for idx in reversed(tool_indices):
+        msg = messages[idx]
+        candidate = [msg] + kept_messages
+        if kept_messages and estimate_tokens(candidate) > max_tool_result_tokens:
+            continue
+        keep.add(idx)
+        kept_messages = candidate
+        if estimate_tokens(kept_messages) > max_tool_result_tokens:
+            break
+
+    updated = [dict(message) for message in messages]
+    for idx in tool_indices:
+        if idx in keep:
+            continue
+        name = updated[idx].get("name") or "tool"
+        updated[idx]["content"] = (
+            f"[{name} result omitted from context due to tool-result budget]"
+        )
+    return updated
+
+
+def _drop_incomplete_tool_call_groups(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove orphan tools and assistant tool_call groups without full results."""
+    updated: list[dict[str, Any]] = []
+    idx = 0
+    changed = False
+    while idx < len(messages):
+        msg = messages[idx]
+        role = msg.get("role")
+        if role == "tool":
+            changed = True
+            idx += 1
+            continue
+        if role != "assistant" or not msg.get("tool_calls"):
+            updated.append(dict(msg))
+            idx += 1
+            continue
+
+        call_ids = {
+            str(tc.get("id"))
+            for tc in msg.get("tool_calls") or []
+            if isinstance(tc, dict) and tc.get("id")
+        }
+        group = [dict(msg)]
+        found: set[str] = set()
+        cursor = idx + 1
+        while cursor < len(messages) and messages[cursor].get("role") == "tool":
+            tool_msg = messages[cursor]
+            group.append(dict(tool_msg))
+            tool_call_id = tool_msg.get("tool_call_id")
+            if tool_call_id:
+                found.add(str(tool_call_id))
+            cursor += 1
+
+        if call_ids and call_ids.issubset(found):
+            updated.extend(group)
+        else:
+            changed = True
+        idx = cursor
+
+    return updated if changed else messages
+
+
 def _apply_input_token_budget(
     messages: list[dict[str, Any]],
     spec: AgentRunSpec,
@@ -477,7 +623,7 @@ def _apply_input_token_budget(
         )
     max_input_tokens = max(0, int(max_input_tokens))
     if estimate_tokens(messages) <= max_input_tokens:
-        return messages
+        return _drop_incomplete_tool_call_groups(messages)
 
     system_prefix: list[dict[str, Any]] = []
     body_start = 0
@@ -508,4 +654,5 @@ def _apply_input_token_budget(
             selected = selected[idx:]
             break
 
-    return system_prefix + [dict(message) for message in selected]
+    repaired = _drop_incomplete_tool_call_groups(selected)
+    return system_prefix + [dict(message) for message in repaired]

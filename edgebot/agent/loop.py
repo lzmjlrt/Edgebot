@@ -20,7 +20,7 @@ from edgebot.agent.context import (
 from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.agent.runner import AgentRunSpec, AgentRunner
 from edgebot.agent.token_budget import consolidation_token_target, input_token_budget
-from edgebot.config import IDLE_COMPACT_MINUTES, MODEL, WORKDIR, create_provider
+from edgebot.config import IDLE_COMPACT_MINUTES, MODEL, RUNTIME_DIR, WORKDIR, create_provider
 from edgebot.tools.registry import SUBAGENT, set_tool_runtime_context
 
 _console = Console()
@@ -238,6 +238,8 @@ async def agent_loop(
         max_iterations=200,
         max_tokens=_RUN_MAX_COMPLETION_TOKENS,
         max_input_tokens=max_input_tokens,
+        session_key=session_key,
+        tool_result_root=RUNTIME_DIR / "tool-results",
         retry_mode="standard",
         emit_output=emit_output,
         assistant_label=assistant_label,

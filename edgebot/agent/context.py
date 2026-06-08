@@ -36,6 +36,7 @@ _SEEDED_ONLY_PATHS = {
 }
 _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
 _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+_SESSION_SUMMARY_HEADING = "## Session Summary"
 
 # Location of shipped templates inside the edgebot package
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
@@ -80,7 +81,10 @@ def seed_workspace_templates() -> None:
             print("[setup] Created .edgebot/mcp_servers.json")
 
 
-def build_system_prompt(skills_descriptions: str | None = None) -> str:
+def build_system_prompt(
+    skills_descriptions: str | None = None,
+    session_summary: str | None = None,
+) -> str:
     """
     Assemble a rich system prompt from identity, workspace files, and skills.
 
@@ -151,7 +155,22 @@ def build_system_prompt(skills_descriptions: str | None = None) -> str:
         if recent_lines:
             parts.append("## Recent History\n\n" + "\n".join(recent_lines))
 
-    return "\n\n---\n\n".join(parts)
+    system = "\n\n---\n\n".join(parts)
+    return inject_session_summary_into_system_prompt(system, session_summary)
+
+
+def inject_session_summary_into_system_prompt(
+    system: str,
+    session_summary: str | None,
+) -> str:
+    """Append persisted session continuity as trusted system context."""
+    summary = session_summary.strip() if isinstance(session_summary, str) else ""
+    if not summary:
+        return system
+    section = f"{_SESSION_SUMMARY_HEADING}\n\n{summary}"
+    if section in system:
+        return system
+    return f"{system.rstrip()}\n\n{section}"
 
 
 def build_runtime_context(
@@ -169,8 +188,6 @@ def build_runtime_context(
     ]
     if session_key:
         lines.append(f"Session Key: {session_key}")
-    if session_summary:
-        lines += ["", "[Resumed Session]", session_summary]
     return _RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + _RUNTIME_CONTEXT_END
 
 

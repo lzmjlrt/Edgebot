@@ -13,7 +13,10 @@ from rich.console import Console
 
 from edgebot.agent.compression import auto_compact, estimate_tokens, extract_session_summary, microcompact
 from edgebot.agent.consolidator import Consolidator
-from edgebot.agent.context import merge_runtime_context_into_messages
+from edgebot.agent.context import (
+    inject_session_summary_into_system_prompt,
+    merge_runtime_context_into_messages,
+)
 from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.agent.runner import AgentRunSpec, AgentRunner
 from edgebot.agent.token_budget import consolidation_token_target, input_token_budget
@@ -197,12 +200,12 @@ async def agent_loop(
             call_history = list(call_history) + pre_notifs
 
     # ---- Build the full prompt for the runner ----
+    system = inject_session_summary_into_system_prompt(system, session_summary)
     call_messages = [{"role": "system", "content": system}] + merge_runtime_context_into_messages(
         call_history,
         channel=channel,
         chat_id=chat_id,
         session_key=session_key,
-        session_summary=session_summary,
     )
 
     # ---- Session checkpoint callback ----

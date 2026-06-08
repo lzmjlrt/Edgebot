@@ -9,6 +9,7 @@ from edgebot.session.store import find_legal_start
 
 _COMPACT_PREFIX = "[System: Context auto-compressed"
 _IDLE_PREFIX = "[System: User was idle"
+_SESSION_SUMMARY_MAX_CHARS = 24_000
 
 _COMPACT_PROMPT = """\
 Summarize the conversation below for continuity, following these rules:
@@ -69,6 +70,24 @@ def extract_session_summary(messages: list[dict]) -> str | None:
         return None
     summary = tail.strip()
     return summary or None
+
+
+def merge_session_summaries(existing: str | None, new_summary: str | None) -> str:
+    """Append a new archive summary to existing session metadata."""
+    existing = existing.strip() if isinstance(existing, str) else ""
+    new_summary = new_summary.strip() if isinstance(new_summary, str) else ""
+    if not new_summary:
+        return existing
+    if not existing:
+        merged = new_summary
+    elif new_summary in existing:
+        merged = existing
+    else:
+        merged = f"{existing}\n\n{new_summary}"
+    if len(merged) <= _SESSION_SUMMARY_MAX_CHARS:
+        return merged
+    marker = "... (older session summary truncated)\n\n"
+    return marker + merged[-(_SESSION_SUMMARY_MAX_CHARS - len(marker)):]
 
 
 async def summarize_messages(

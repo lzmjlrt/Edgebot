@@ -14,7 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from edgebot.agent.compression import estimate_tokens, summarize_messages
+from edgebot.agent.compression import (
+    estimate_tokens,
+    merge_session_summaries,
+    summarize_messages,
+)
 from edgebot.session.store import SessionStore
 
 _HISTORY_ENTRY_HARD_CAP = 64_000
@@ -69,7 +73,10 @@ class Consolidator:
         if not archive_messages:
             return False
 
-        content = await self._build_archive_content(session_key, archive_messages)
+        content, summary = await self._build_archive_content(
+            session_key,
+            archive_messages,
+        )
         self._append_history_record(
             session_key=session_key,
             start_index=start,
@@ -78,6 +85,13 @@ class Consolidator:
             archived_message_count=len(archive_messages),
         )
         self.sessions.set_last_consolidated(session_key, boundary)
+        if summary:
+            state = self.sessions.load_state(session_key)
+            previous = state.get("metadata", {}).get("session_summary")
+            self.sessions.update_metadata(
+                session_key,
+                session_summary=merge_session_summaries(previous, summary),
+            )
         return True
 
     def _find_archive_boundary(
@@ -121,7 +135,7 @@ class Consolidator:
         self,
         session_key: str,
         messages: list[dict[str, Any]],
-    ) -> str:
+    ) -> tuple[str, str | None]:
         try:
             summary = await summarize_messages(
                 messages,
@@ -131,16 +145,23 @@ class Consolidator:
         except Exception:
             summary = None
         if summary and summary.strip():
-            return _truncate_text(
-                f"Context archive for session {session_key}:\n{summary.strip()}",
-                _HISTORY_ENTRY_HARD_CAP,
+            summary = summary.strip()
+            return (
+                _truncate_text(
+                    f"Context archive for session {session_key}:\n{summary}",
+                    _HISTORY_ENTRY_HARD_CAP,
+                ),
+                summary,
             )
 
         raw = json.dumps(messages, ensure_ascii=False, default=str)
-        return _truncate_text(
-            "Context archive fallback for session "
-            f"{session_key}; summarization failed.\n{raw}",
-            _FALLBACK_JSON_CAP,
+        return (
+            _truncate_text(
+                "Context archive fallback for session "
+                f"{session_key}; summarization failed.\n{raw}",
+                _FALLBACK_JSON_CAP,
+            ),
+            None,
         )
 
     def _append_history_record(

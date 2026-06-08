@@ -21,7 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from edgebot.permissions.defaults import DEFAULT_BASH_DENY_PATTERNS, DEFAULT_BASH_PROGRAMS
+from edgebot.permissions.defaults import (
+    DEFAULT_BASH_DENY_PATTERNS,
+    DEFAULT_BASH_PROGRAMS,
+    INTERPRETER_PROGRAMS,
+)
 
 
 PromptHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
@@ -211,6 +215,18 @@ class PermissionManager:
     def _bash_denied(self, command: str) -> bool:
         return any(rx.search(command) for rx in self._deny_regexes)
 
+    @staticmethod
+    def _chain_contains_interpreter(programs: list[str]) -> bool:
+        """True if any segment of the command chain runs an interpreter / pkg manager / build driver.
+
+        Bare program-name allow-rules ("allow program: python") are unsafe for these
+        commands because their argument surface is Turing-complete (`python -c "..."`,
+        `npm run any-script`, `make any-target`). When this returns True, the command
+        cannot be auto-approved by a program-name rule and must either match an exact
+        prefix rule or be approved interactively.
+        """
+        return any(p in INTERPRETER_PROGRAMS for p in programs)
+
     def _matches_allow_rule(self, tool_name: str, params: dict[str, Any]) -> bool:
         allow_tools = set(self._rules.get("allow_tools", [])) | set(self._session_rules.get("allow_tools", []))
         if tool_name in allow_tools:
@@ -222,18 +238,27 @@ class PermissionManager:
                 return False
             if self._bash_denied(command):
                 return False
+            chain = self._bash_programs_in_chain(command)
+            # Legacy / explicit-prefix rules are checked first because users
+            # who intentionally granted `python -V` or `npm test` should keep
+            # working even though `python`/`npm` are interpreters.
+            prefixes = list(self._rules.get("bash_prefixes", [])) + list(self._session_rules.get("bash_prefixes", []))
+            if any(command.startswith(prefix) for prefix in prefixes if prefix):
+                return True
+            # Program-name allowlist only applies when no segment of the chain
+            # is an interpreter / package manager / build driver. This stops
+            # `python` in the seed list from acting as a wildcard.
+            if chain and self._chain_contains_interpreter(chain):
+                return False
             programs_allowed = {
                 p.lower() for p in (
                     list(self._rules.get("bash_programs", []))
                     + list(self._session_rules.get("bash_programs", []))
                 )
             }
-            chain = self._bash_programs_in_chain(command)
             if chain and all(p in programs_allowed for p in chain):
                 return True
-            # Legacy fall-through: exact-prefix rules people granted before v2.
-            prefixes = list(self._rules.get("bash_prefixes", [])) + list(self._session_rules.get("bash_prefixes", []))
-            return any(command.startswith(prefix) for prefix in prefixes if prefix)
+            return False
 
         if tool_name in {"write_file", "edit_file"} and self._rules.get("workspace_write_auto_allow", True):
             if self._path_inside_workdir(params.get("path", "")):
@@ -262,12 +287,20 @@ class PermissionManager:
         if tool_name == "bash":
             command = str(params.get("command", "")).strip()
             program = self._bash_program(command)
+            chain = self._bash_programs_in_chain(command)
+            # Interpreters / build drivers / package managers must be granted
+            # by exact command (`allow_prefix`), never by program name —
+            # otherwise one approval lets the model run any script.
+            uses_interpreter = bool(chain) and self._chain_contains_interpreter(chain)
+            scope_hint = "allow_prefix" if (uses_interpreter or not program) else "allow_program"
+            scope_value = command if uses_interpreter else (program or command)
             return {
                 "tool": tool_name,
                 "message": f"Edgebot requests permission to run shell command:\n{command}",
-                "scope_hint": "allow_program" if program else "allow_prefix",
-                "scope_value": program or command,
+                "scope_hint": scope_hint,
+                "scope_value": scope_value,
                 "raw_command": command,
+                "uses_interpreter": uses_interpreter,
             }
         if tool_name in {"write_file", "edit_file"}:
             path = str(params.get("path", "")).strip()

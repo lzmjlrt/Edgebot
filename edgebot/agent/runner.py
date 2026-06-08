@@ -14,7 +14,10 @@ from typing import Any, Awaitable, Callable
 
 from rich.console import Console
 
+from edgebot.agent.compression import estimate_tokens
+from edgebot.agent.token_budget import input_token_budget
 from edgebot.providers.base import LLMProvider, ToolCallRequest
+from edgebot.session.store import find_legal_start
 from edgebot.tools.orchestration import execute_tool_batches
 
 _console = Console()
@@ -47,6 +50,7 @@ class AgentRunSpec:
     model: str
     max_iterations: int = 200
     max_tokens: int = 8192
+    max_input_tokens: int | None = None
     temperature: float = 0.7
     retry_mode: str = "standard"
     max_tool_result_chars: int = 16_000
@@ -93,6 +97,7 @@ class AgentRunner:
             messages = _drop_orphan_tool_results(messages)
             messages = _backfill_missing_tool_results(messages)
             messages = _microcompact(messages)
+            call_messages = _apply_input_token_budget(messages, spec)
 
             # Streaming LLM call via provider
             first_delta = True
@@ -118,7 +123,7 @@ class AgentRunner:
                         await spec.on_stream(delta)
 
                     response = await spec.provider.chat_stream_with_retry(
-                        messages=messages,
+                        messages=call_messages,
                         tools=spec.tools,
                         model=spec.model,
                         max_tokens=spec.max_tokens,
@@ -129,7 +134,7 @@ class AgentRunner:
                     )
                 else:
                     response = await spec.provider.chat_with_retry(
-                        messages=messages,
+                        messages=call_messages,
                         tools=spec.tools,
                         model=spec.model,
                         max_tokens=spec.max_tokens,
@@ -457,3 +462,50 @@ def _microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         updated[idx]["content"] = summary
 
     return updated if updated is not None else messages
+
+
+def _apply_input_token_budget(
+    messages: list[dict[str, Any]],
+    spec: AgentRunSpec,
+) -> list[dict[str, Any]]:
+    """Return a legal suffix that fits the model-aware input budget."""
+    max_input_tokens = spec.max_input_tokens
+    if max_input_tokens is None:
+        max_input_tokens = input_token_budget(
+            spec.model,
+            max_completion_tokens=spec.max_tokens,
+        )
+    max_input_tokens = max(0, int(max_input_tokens))
+    if estimate_tokens(messages) <= max_input_tokens:
+        return messages
+
+    system_prefix: list[dict[str, Any]] = []
+    body_start = 0
+    for idx, message in enumerate(messages):
+        if message.get("role") != "system":
+            body_start = idx
+            break
+        system_prefix.append(dict(message))
+    else:
+        return [dict(message) for message in messages]
+
+    selected: list[dict[str, Any]] = []
+    body = messages[body_start:]
+    for message in reversed(body):
+        candidate = [message] + selected
+        if selected and estimate_tokens(system_prefix + candidate) > max_input_tokens:
+            break
+        selected = candidate
+        if estimate_tokens(system_prefix + selected) > max_input_tokens:
+            break
+
+    start = find_legal_start(selected)
+    selected = selected[start:]
+    for idx, message in enumerate(selected):
+        if message.get("role") == "user" or (
+            message.get("role") == "assistant" and message.get("tool_calls")
+        ):
+            selected = selected[idx:]
+            break
+
+    return system_prefix + [dict(message) for message in selected]

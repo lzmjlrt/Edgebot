@@ -12,15 +12,19 @@ import sys
 from rich.console import Console
 
 from edgebot.agent.compression import auto_compact, estimate_tokens, extract_session_summary, microcompact
+from edgebot.agent.consolidator import Consolidator
 from edgebot.agent.context import merge_runtime_context_into_messages
 from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.agent.runner import AgentRunSpec, AgentRunner
-from edgebot.config import IDLE_COMPACT_MINUTES, MODEL, TOKEN_THRESHOLD, WORKDIR, create_provider
+from edgebot.agent.token_budget import consolidation_token_target, input_token_budget
+from edgebot.config import IDLE_COMPACT_MINUTES, MODEL, WORKDIR, create_provider
 from edgebot.tools.registry import SUBAGENT, set_tool_runtime_context
 
 _console = Console()
 _CONSOLIDATION_INTERVAL = 15
 _MIN_HISTORY_FOR_MEMORY = 10
+_RUN_MAX_COMPLETION_TOKENS = 8000
+_MAX_REPLAY_MESSAGES = 2000
 _turn_counter = 0
 _MEMORY = MemoryStore(WORKDIR)
 _AUTOCOMPACT = None
@@ -107,7 +111,38 @@ async def agent_loop(
     )
 
     microcompact(messages)
-    if estimate_tokens(messages) > TOKEN_THRESHOLD:
+    max_input_tokens = input_token_budget(
+        MODEL,
+        max_completion_tokens=_RUN_MAX_COMPLETION_TOKENS,
+    )
+    archive_target_tokens = consolidation_token_target(
+        MODEL,
+        max_completion_tokens=_RUN_MAX_COMPLETION_TOKENS,
+    )
+
+    call_history = messages
+    if session_store:
+        try:
+            await Consolidator(
+                session_store=session_store,
+                provider=provider,
+                model=MODEL,
+                memory_dir=_MEMORY.memory_dir,
+            ).maybe_consolidate_by_tokens(
+                session_key,
+                max_unconsolidated_tokens=archive_target_tokens,
+            )
+        except Exception as exc:
+            if emit_output:
+                _console.print(f"[dim red]  [context] consolidation error: {exc}[/dim red]")
+        call_history = session_store.get_history(
+            session_key,
+            max_messages=_MAX_REPLAY_MESSAGES,
+            max_tokens=max_input_tokens,
+        )
+        if not call_history and messages:
+            call_history = messages[-1:]
+    elif estimate_tokens(messages) > max_input_tokens:
         if emit_output:
             _console.print("[dim]  Auto-compressing context...[/dim]")
         messages[:] = await auto_compact(
@@ -158,10 +193,12 @@ async def agent_loop(
     pre_notifs = await _injection_callback()
     if pre_notifs:
         messages.extend(pre_notifs)
+        if call_history is not messages:
+            call_history = list(call_history) + pre_notifs
 
     # ---- Build the full prompt for the runner ----
     call_messages = [{"role": "system", "content": system}] + merge_runtime_context_into_messages(
-        messages,
+        call_history,
         channel=channel,
         chat_id=chat_id,
         session_key=session_key,
@@ -196,7 +233,8 @@ async def agent_loop(
         tool_handlers=tool_handlers,
         model=MODEL,
         max_iterations=200,
-        max_tokens=8000,
+        max_tokens=_RUN_MAX_COMPLETION_TOKENS,
+        max_input_tokens=max_input_tokens,
         retry_mode="standard",
         emit_output=emit_output,
         assistant_label=assistant_label,

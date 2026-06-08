@@ -44,6 +44,18 @@ def find_legal_start(messages: list[dict]) -> int:
     return start
 
 
+def _find_history_replay_start(messages: list[dict]) -> int:
+    """Find a valid, user-preferred start index for a replay slice."""
+    start = find_legal_start(messages)
+    for idx in range(start, len(messages)):
+        role = messages[idx].get("role")
+        if role == "user":
+            return idx
+        if role == "assistant" and messages[idx].get("tool_calls"):
+            return idx
+    return start
+
+
 def _dedup_messages(messages: list[dict]) -> list[dict]:
     """Remove duplicate messages loaded from a session file.
 
@@ -335,6 +347,43 @@ class SessionStore:
     def load(self, session_key: str) -> list[dict]:
         """Load messages for *session_key*, trimming orphan tool results."""
         return self.load_state(session_key)["messages"]
+
+    def get_history(
+        self,
+        session_key: str,
+        *,
+        max_messages: int | None = None,
+        max_tokens: int | None = None,
+    ) -> list[dict]:
+        """Return the unconsolidated session tail bounded by messages and tokens."""
+        from edgebot.agent.compression import estimate_tokens
+
+        state = self.load_state(session_key)
+        messages = list(state["messages"])
+        start = state["metadata"].get(_LAST_CONSOLIDATED_KEY, 0)
+        if isinstance(start, bool) or not isinstance(start, int):
+            start = 0
+        start = max(0, min(start, len(messages)))
+
+        history = messages[start:]
+        if max_messages is not None:
+            max_messages = max(0, int(max_messages))
+            history = history[-max_messages:] if max_messages else []
+
+        if max_tokens is not None:
+            max_tokens = max(0, int(max_tokens))
+            selected: list[dict] = []
+            for message in reversed(history):
+                candidate = [message] + selected
+                if selected and estimate_tokens(candidate) > max_tokens:
+                    break
+                selected = candidate
+                if estimate_tokens(selected) > max_tokens:
+                    break
+            history = selected
+
+        replay_start = _find_history_replay_start(history)
+        return [dict(message) for message in history[replay_start:]]
 
     def save_state(self, session_key: str, state: dict[str, Any]) -> None:
         """Overwrite the session file with the provided full state."""

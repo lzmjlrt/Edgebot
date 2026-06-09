@@ -15,10 +15,11 @@ import json
 import os
 import re
 import shutil
+import threading
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, ClassVar, Iterator
 
 from rich.console import Console
 
@@ -155,17 +156,24 @@ Files are located at:
 class MemoryStore:
     """Pure file I/O for Edgebot memory files."""
 
-    def __init__(self, workspace: Path):
+    _append_locks: ClassVar[dict[Path, threading.Lock]] = {}
+    _append_locks_guard: ClassVar[threading.Lock] = threading.Lock()
+
+    def __init__(self, workspace: Path, *, memory_dir: Path | None = None):
         self.workspace = workspace
-        self.memory_dir = MEMORY_DIR
+        self.memory_dir = Path(memory_dir) if memory_dir is not None else MEMORY_DIR
+        runtime_dir = self.memory_dir.parent
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.cursor_file = self.memory_dir / ".cursor"
         self.dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self.soul_file = SOUL_MD_PATH
-        self.user_file = USER_MD_PATH
+        self.soul_file = runtime_dir / "SOUL.md" if memory_dir is not None else SOUL_MD_PATH
+        self.user_file = runtime_dir / "USER.md" if memory_dir is not None else USER_MD_PATH
+        lock_key = self.memory_dir.resolve()
+        with self._append_locks_guard:
+            self._append_lock = self._append_locks.setdefault(lock_key, threading.Lock())
         self.git = GitStore(
-            RUNTIME_DIR,
+            runtime_dir if memory_dir is not None else RUNTIME_DIR,
             tracked_files=[
                 "SOUL.md",
                 "USER.md",
@@ -238,24 +246,28 @@ class MemoryStore:
         *,
         max_chars: int | None = None,
         session_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> int:
-        cursor = self._next_cursor()
-        limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
-        cleaned = content.strip()
-        if len(cleaned) > limit:
-            cleaned = _truncate_text(cleaned, limit)
-        record = {
-            "cursor": cursor,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "content": cleaned,
-        }
-        if session_key:
-            record["session_key"] = session_key
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self.cursor_file.write_text(str(cursor), encoding="utf-8")
-        return cursor
+        with self._append_lock:
+            cursor = self._next_cursor()
+            limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
+            cleaned = content.strip()
+            if len(cleaned) > limit:
+                cleaned = _truncate_text(cleaned, limit)
+            record = {
+                "cursor": cursor,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "content": cleaned,
+            }
+            if session_key:
+                record["session_key"] = session_key
+            if metadata:
+                record.update(metadata)
+            self.memory_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.history_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            self.cursor_file.write_text(str(cursor), encoding="utf-8")
+            return cursor
 
     def _iter_valid_entries(self) -> Iterator[tuple[dict[str, Any], int]]:
         try:

@@ -46,7 +46,7 @@ def get_autocompact(session_store) -> object | None:
         provider=create_provider(),
         model=MODEL,
         ttl_minutes=IDLE_COMPACT_MINUTES,
-        memory_dir=_MEMORY.memory_dir,
+        memory_store=_MEMORY,
     )
     return _AUTOCOMPACT
 
@@ -57,7 +57,7 @@ def _enforce_session_file_cap(session_store, session_key: str, *, emit_output: b
     try:
         Consolidator(
             session_store=session_store,
-            memory_dir=_MEMORY.memory_dir,
+            memory_store=_MEMORY,
         ).enforce_session_file_cap(session_key)
     except Exception as exc:
         if emit_output:
@@ -152,7 +152,7 @@ async def agent_loop(
                 session_store=session_store,
                 provider=provider,
                 model=MODEL,
-                memory_dir=_MEMORY.memory_dir,
+                memory_store=_MEMORY,
             ).maybe_consolidate_by_tokens(
                 session_key,
                 max_unconsolidated_tokens=archive_target_tokens,

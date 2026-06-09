@@ -19,6 +19,7 @@ from edgebot.agent.compression import (
     merge_session_summaries,
     summarize_messages,
 )
+from edgebot.agent.memory import MemoryStore
 from edgebot.session.store import FILE_MAX_MESSAGES, SessionStore
 
 _HISTORY_ENTRY_HARD_CAP = 64_000
@@ -35,17 +36,20 @@ class Consolidator:
         *,
         model: str | None = None,
         memory_dir: Path | None = None,
+        memory_store: MemoryStore | None = None,
         keep_recent_messages: int = 8,
     ) -> None:
-        if memory_dir is None:
+        if memory_store is None and memory_dir is None:
             from edgebot.config import MEMORY_DIR
             memory_dir = MEMORY_DIR
         self.sessions = session_store
         self.provider = provider
         self.model = model
-        self.memory_dir = Path(memory_dir)
-        self.history_file = self.memory_dir / "history.jsonl"
-        self.cursor_file = self.memory_dir / ".cursor"
+        self.memory_store = memory_store or MemoryStore(
+            Path(memory_dir).parent,
+            memory_dir=Path(memory_dir),
+        )
+        self.memory_dir = self.memory_store.memory_dir
         self.keep_recent_messages = max(1, keep_recent_messages)
 
     async def maybe_consolidate_by_tokens(
@@ -283,46 +287,16 @@ class Consolidator:
         content: str,
         archived_message_count: int,
     ) -> None:
-        cursor = self._next_history_cursor()
-        record = {
-            "cursor": cursor,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "content": content,
-            "session_key": session_key,
-            "start_index": start_index,
-            "end_index": end_index,
-            "archived_message_count": archived_message_count,
-        }
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        self.cursor_file.write_text(str(cursor), encoding="utf-8")
-
-    def _next_history_cursor(self) -> int:
-        last = self._last_history_cursor()
-        if last is not None:
-            return last + 1
-        if self.cursor_file.exists():
-            try:
-                return int(self.cursor_file.read_text(encoding="utf-8").strip()) + 1
-            except (OSError, ValueError):
-                pass
-        return 1
-
-    def _last_history_cursor(self) -> int | None:
-        try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                for line in reversed(f.read().splitlines()):
-                    if not line.strip():
-                        continue
-                    record = json.loads(line)
-                    cursor = record.get("cursor")
-                    if isinstance(cursor, int) and not isinstance(cursor, bool):
-                        return cursor
-                    return None
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return None
-        return None
+        self.memory_store.append_history(
+            content,
+            session_key=session_key,
+            max_chars=_HISTORY_ENTRY_HARD_CAP,
+            metadata={
+                "start_index": start_index,
+                "end_index": end_index,
+                "archived_message_count": archived_message_count,
+            },
+        )
 
 
 def _truncate_text(text: str, max_chars: int) -> str:

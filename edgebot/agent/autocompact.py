@@ -15,6 +15,7 @@ from pathlib import Path
 from rich.console import Console
 
 from edgebot.agent.consolidator import Consolidator
+from edgebot.agent.memory import MemoryStore
 from edgebot.providers.base import LLMProvider
 from edgebot.session.store import SessionStore
 
@@ -34,6 +35,7 @@ class AutoCompact:
         *,
         ttl_minutes: int = 0,
         memory_dir: Path | None = None,
+        memory_store: MemoryStore | None = None,
     ):
         self.sessions = session_store
         self.provider = provider
@@ -46,6 +48,7 @@ class AutoCompact:
             provider=provider,
             model=model,
             memory_dir=memory_dir,
+            memory_store=memory_store,
             keep_recent_messages=_RECENT_SUFFIX_MESSAGES,
         )
 

@@ -22,7 +22,7 @@
 | P1 | Dream Phase 1 对 `[SKIP]` 的判断会误丢有效发现 | `edgebot/agent/memory.py` | `agent/memory.py`, `templates/agent/dream.md` | 已解决 |
 | P1 | Edgebot Dream 缺少 nanobot 的 `SKILL.md` 路由 | `edgebot/agent/memory.py`, `edgebot/templates/skills/memory/SKILL.md` | `templates/agent/dream.md`, `agent/memory.py` | 已解决 |
 | P1 | 每轮摘要和上下文归档都写入同一 history，Dream 输入容易重复/噪声化 | `edgebot/agent/loop.py`, `edgebot/agent/consolidator.py`, `edgebot/agent/memory.py` | `templates/agent/dream.md`, `agent/memory.py` | 已解决 |
-| P2 | Dream read_file 复用全局文件去重状态，可能读不到当前内容 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py`, `agent/tools/filesystem.py` | 未修 |
+| P2 | Dream read_file 复用全局文件去重状态，可能读不到当前内容 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py`, `agent/tools/filesystem.py` | 已解决 |
 | P2 | 缺少专门的 Dream/Memory 测试覆盖 | `tests/` | nanobot 测试/实现路径 | 未补 |
 | P2 | `MemoryStore(workspace)` 仍使用全局 `.edgebot` 路径，隔离性差 | `edgebot/agent/memory.py`, `edgebot/config.py` | `agent/memory.py` | 未修 |
 
@@ -297,6 +297,14 @@ Dream 的 Phase 1 虽然有 dedup prompt 和 `_filter_dedup()`，但这些都是
 - 新增测试：`read_unprocessed_history()` 能保留并返回结构化字段，Dream prompt 能看到 source/tag 信息。
 
 ## P2: Dream read_file 复用全局文件去重状态，可能读不到当前内容
+
+状态：已解决（2026-06-09）
+
+修复摘要：
+
+- `_DreamReadTool.parameters` 已补充 `limit`、`offset`、`force` 参数，Dream agent 可以显式请求强制读取。
+- `_DreamReadTool.execute()` 默认以 `force=True` 调用 `run_read()`，即使主 agent 或之前流程已读过同一文件，也会返回当前文件内容而不是 `[File unchanged since last read: ...]`。
+- 新增 `tests/test_dream_tool_scope.py` 覆盖主 agent 先读过 `MEMORY.md` 后 Dream read 仍返回完整内容，以及 Dream read schema 暴露 `force` 参数。
 
 ### 问题文件
 

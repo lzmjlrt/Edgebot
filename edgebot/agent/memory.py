@@ -944,6 +944,12 @@ class _DreamReadTool(BaseTool):
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to file to read."},
+                "limit": {"type": "integer", "description": "Maximum lines to read."},
+                "offset": {"type": "integer", "description": "1-based line offset.", "minimum": 1},
+                "force": {
+                    "type": "boolean",
+                    "description": "Force full read even if the global file cache thinks it is unchanged.",
+                },
             },
             "required": ["path"],
         }
@@ -956,7 +962,12 @@ class _DreamReadTool(BaseTool):
 
     def execute(self, **kwargs: Any) -> Any:
         from edgebot.tools.filesystem import run_read
-        return run_read(kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1))
+        return run_read(
+            kwargs["path"],
+            kwargs.get("limit"),
+            kwargs.get("offset", 1),
+            kwargs.get("force", True),
+        )
 
 
 class _DreamEditTool(BaseTool):

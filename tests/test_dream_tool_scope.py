@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from edgebot.agent.memory import _DreamEditTool
+from edgebot.agent.memory import _DreamEditTool, _DreamReadTool
 
 
 def _write(path: Path, content: str) -> None:
@@ -54,3 +54,29 @@ def test_dream_edit_allows_memory_files(monkeypatch, tmp_path: Path) -> None:
     assert user_file.read_text(encoding="utf-8") == "- Name: new"
     assert soul_file.read_text(encoding="utf-8") == "- Tone: new"
     assert memory_file.read_text(encoding="utf-8") == "- Fact: new"
+
+
+def test_dream_read_returns_content_after_global_read_dedup(monkeypatch, tmp_path: Path) -> None:
+    import edgebot.tools.base as tool_base
+    from edgebot.tools import file_state
+    from edgebot.tools.filesystem import run_read
+
+    monkeypatch.setattr(tool_base, "WORKDIR", tmp_path)
+    file_state._state.clear()
+    memory_file = tmp_path / ".edgebot" / "memory" / "MEMORY.md"
+    _write(memory_file, "- Durable fact: current")
+
+    assert "- Durable fact: current" in run_read(".edgebot/memory/MEMORY.md")
+    assert run_read(".edgebot/memory/MEMORY.md").startswith("[File unchanged")
+
+    result = _DreamReadTool(tmp_path).execute(path=".edgebot/memory/MEMORY.md")
+
+    assert "- Durable fact: current" in str(result)
+    assert not str(result).startswith("[File unchanged")
+
+
+def test_dream_read_schema_exposes_force_parameter() -> None:
+    schema = _DreamReadTool(Path.cwd()).parameters
+
+    assert "force" in schema["properties"]
+    assert schema["properties"]["force"]["type"] == "boolean"

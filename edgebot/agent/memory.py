@@ -413,6 +413,23 @@ def _filter_dedup(analysis: str, existing_blob: str) -> str:
     return "\n".join(kept)
 
 
+def _extract_actionable_findings(analysis: str) -> str:
+    """Return normalized Phase 1 findings that Phase 2 can execute."""
+    findings: list[str] = []
+    for raw in analysis.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^\[(USER|SOUL|MEMORY)(-REMOVE)?\]\s*(.*)$", line, re.I)
+        if not m:
+            continue
+        tag = m.group(1).upper() + (m.group(2).upper() if m.group(2) else "")
+        content = m.group(3).strip()
+        if content:
+            findings.append(f"[{tag}] {content}")
+    return "\n".join(findings)
+
+
 def _normalize_line(line: str) -> str:
     s = line.strip().lstrip("-*").strip()
     s = re.sub(r"\*\*|__|\*|_", "", s)
@@ -719,24 +736,22 @@ class DreamProcessor:
         )
         if analysis is None:
             return False
-        if "[SKIP]" in analysis or not analysis.strip():
+        if not analysis.strip():
             self._advance_cursor(archived_batch)
             return False
 
         # Dedup against existing content
         existing_blob = "\n".join([raw_user_content, raw_soul_content, raw_memory_content])
         filtered = _filter_dedup(analysis, existing_blob)
-        if not any(
-            re.match(r"^\s*\[(USER|SOUL|MEMORY)(?:-REMOVE)?\]", line)
-            for line in filtered.splitlines()
-        ):
+        actionable = _extract_actionable_findings(filtered)
+        if not actionable:
             self._advance_cursor(archived_batch)
             return False
 
         # Phase 2: agent edits files via tools
         try:
             changelog = await self._phase2_execute(
-                filtered, user_content, soul_content, memory_content,
+                actionable, user_content, soul_content, memory_content,
             )
         except Exception as exc:
             if self.emit_output:
@@ -745,7 +760,7 @@ class DreamProcessor:
 
         if changelog:
             ts = archived_batch[-1]["timestamp"] if archived_batch else datetime.now().strftime("%Y-%m-%d %H:%M")
-            commit_msg = f"dream: {ts}, {len(changelog)} change(s)\n\n{filtered.strip()}"
+            commit_msg = f"dream: {ts}, {len(changelog)} change(s)\n\n{actionable.strip()}"
             self._advance_cursor(archived_batch)
             self.store.git.auto_commit(commit_msg)
             if self.emit_output:

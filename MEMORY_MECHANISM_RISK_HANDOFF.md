@@ -20,7 +20,7 @@
 | P0 | `history.jsonl` 多写入方绕过统一 cursor/锁 | `edgebot/agent/memory.py`, `edgebot/agent/consolidator.py` | `agent/memory.py` | 已解决 |
 | P0 | Dream 编辑工具没有真正限制到记忆文件 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py` | 已解决 |
 | P1 | Dream Phase 1 对 `[SKIP]` 的判断会误丢有效发现 | `edgebot/agent/memory.py` | `agent/memory.py`, `templates/agent/dream.md` | 已解决 |
-| P1 | Edgebot Dream 缺少 nanobot 的 `SKILL.md` 路由 | `edgebot/agent/memory.py`, `edgebot/templates/skills/memory/SKILL.md` | `templates/agent/dream.md`, `agent/memory.py` | 未对齐 |
+| P1 | Edgebot Dream 缺少 nanobot 的 `SKILL.md` 路由 | `edgebot/agent/memory.py`, `edgebot/templates/skills/memory/SKILL.md` | `templates/agent/dream.md`, `agent/memory.py` | 已解决 |
 | P1 | 每轮摘要和上下文归档都写入同一 history，Dream 输入容易重复/噪声化 | `edgebot/agent/loop.py`, `edgebot/agent/consolidator.py`, `edgebot/agent/memory.py` | `templates/agent/dream.md`, `agent/memory.py` | 未修 |
 | P2 | Dream read_file 复用全局文件去重状态，可能读不到当前内容 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py`, `agent/tools/filesystem.py` | 未修 |
 | P2 | 缺少专门的 Dream/Memory 测试覆盖 | `tests/` | nanobot 测试/实现路径 | 未补 |
@@ -185,6 +185,18 @@ LLM 很可能输出混合结果，例如：
 - 新增测试：Phase 1 输出小写 `[skip]` 和大小写混合标签时行为一致。
 
 ## P1: Edgebot Dream 缺少 nanobot 的 `SKILL.md` 路由
+
+状态：已解决（2026-06-09）
+
+修复摘要：
+
+- `PHASE1_PROMPT` 已支持 `[SKILL]` 与 `[SKILL-REMOVE]`，并明确把可复用流程、命令、API 参数和操作步骤路由到 `SKILL.md`。
+- `_extract_actionable_findings()` 与 `_filter_dedup()` 已保留并规范化 `SKILL` 标签，Dream 不再在 Phase 1 后丢弃技能发现。
+- `MemoryStore` 已增加 `.edgebot/skills` 目录认知，Phase 1/Phase 2 prompt 会带入现有 skill 摘要，用于更新已有 skill 而不是创建重复技能。
+- Dream 工具集已新增受限 `_DreamWriteTool`，只允许写 `.edgebot/skills/<name>/SKILL.md`；`_DreamEditTool` 也只额外允许编辑该形式的 skill 文件，不放开整个工作区。
+- Dream 内部 `GitStore` 已跟踪 `skills/` 目录，让生成或更新的 skill 纳入 Dream 版本历史。
+- `edgebot/templates/skills/memory/SKILL.md` 已说明 `.edgebot/skills/<name>/SKILL.md` 的职责，避免把可复用流程继续塞进 `MEMORY.md`。
+- 新增 `tests/test_dream_skill_routing.py`，覆盖 `SKILL` 标签保留、工具集暴露 `write_file`、技能文件创建限制、拒绝覆盖已有 skill、已有技能编辑限制。
 
 ### 问题文件
 

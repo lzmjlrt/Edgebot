@@ -43,10 +43,12 @@ class GitStore:
         workspace: Path,
         tracked_files: list[str],
         *,
+        tracked_dirs: list[str] | None = None,
         allow_nested: bool = False,
     ):
         self._workspace = workspace
         self._tracked_files = tracked_files
+        self._tracked_dirs = tracked_dirs or []
         self._allow_nested = allow_nested
 
     def is_initialized(self) -> bool:
@@ -73,8 +75,10 @@ class GitStore:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 if not p.exists():
                     p.write_text("", encoding="utf-8")
+            for rel in self._tracked_dirs:
+                (self._workspace / rel).mkdir(parents=True, exist_ok=True)
 
-            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_files)
+            porcelain.add(str(self._workspace), paths=[".gitignore"] + self._tracked_paths())
             porcelain.commit(
                 str(self._workspace),
                 message=b"init: edgebot memory store",
@@ -98,7 +102,7 @@ class GitStore:
                 return None
 
             msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
-            porcelain.add(str(self._workspace), paths=self._tracked_files)
+            porcelain.add(str(self._workspace), paths=self._tracked_paths())
             sha_bytes = porcelain.commit(
                 str(self._workspace),
                 message=msg_bytes,
@@ -263,6 +267,9 @@ class GitStore:
             current = current.parent
         return False
 
+    def _tracked_paths(self) -> list[str]:
+        return [*self._tracked_files, *self._tracked_dirs]
+
     def _run_git(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["git", "-C", str(self._workspace), *args],
@@ -287,8 +294,10 @@ class GitStore:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 if not p.exists():
                     p.write_text("", encoding="utf-8")
+            for rel in self._tracked_dirs:
+                (self._workspace / rel).mkdir(parents=True, exist_ok=True)
 
-            self._run_git(["add", ".gitignore", *self._tracked_files])
+            self._run_git(["add", ".gitignore", *self._tracked_paths()])
             self._run_git([
                 "-c", "user.name=edgebot",
                 "-c", "user.email=edgebot@dream",
@@ -301,12 +310,12 @@ class GitStore:
     def _auto_commit_cli(self, message: str) -> str | None:
         try:
             status = self._run_git(
-                ["status", "--porcelain", "--", *self._tracked_files],
+                ["status", "--porcelain", "--", *self._tracked_paths()],
                 check=False,
             )
             if not status.stdout.strip():
                 return None
-            self._run_git(["add", *self._tracked_files])
+            self._run_git(["add", *self._tracked_paths()])
             commit = self._run_git([
                 "-c", "user.name=edgebot",
                 "-c", "user.email=edgebot@dream",
@@ -323,7 +332,7 @@ class GitStore:
         try:
             proc = self._run_git([
                 "log", f"-n{max_entries}", "--format=%H%x09%ct%x09%s",
-                "--", *self._tracked_files,
+                "--", *self._tracked_paths(),
             ], check=False)
             if proc.returncode != 0:
                 return []
@@ -366,7 +375,7 @@ class GitStore:
     def _diff_commits_cli(self, sha1: str, sha2: str) -> str:
         try:
             proc = self._run_git([
-                "diff", sha1, sha2, "--", *self._tracked_files,
+                "diff", sha1, sha2, "--", *self._tracked_paths(),
             ], check=False)
             if proc.returncode not in (0, 1):
                 return ""
@@ -383,7 +392,7 @@ class GitStore:
                 return None
             parent_sha = parent.stdout.strip()
             checkout = self._run_git([
-                "checkout", parent_sha, "--", *self._tracked_files,
+                "checkout", parent_sha, "--", *self._tracked_paths(),
             ], check=False)
             if checkout.returncode != 0:
                 return None
@@ -400,6 +409,10 @@ class GitStore:
         lines = ["/*"]
         for d in sorted(dirs):
             lines.append(f"!{d}/")
+        for d in sorted(self._tracked_dirs):
+            normalized = d.replace("\\", "/").rstrip("/")
+            lines.append(f"!{normalized}/")
+            lines.append(f"!{normalized}/**")
         for f in self._tracked_files:
             lines.append("!" + f.replace("\\", "/"))
         lines.append("!.gitignore")

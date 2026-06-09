@@ -11,6 +11,7 @@ always: true
 - `.edgebot/SOUL.md` - bot personality and communication style. Managed by Dream.
 - `.edgebot/USER.md` - user profile and durable preferences. Managed by Dream.
 - `.edgebot/memory/MEMORY.md` - long-term facts and project context. Managed by Dream.
+- `.edgebot/skills/<name>/SKILL.md` - reusable workflows, commands, API parameters, and operational procedures. Managed by Dream.
 - `.edgebot/memory/history.jsonl` - append-only JSONL archive. It is not fully loaded into context.
 
 ## Search Past Events
@@ -33,5 +34,6 @@ grep(pattern="oauth|token", path=".edgebot/memory", glob="*.jsonl", output_mode=
 ## Important
 
 - Do not edit `.edgebot/SOUL.md`, `.edgebot/USER.md`, or `.edgebot/memory/MEMORY.md` directly unless the user explicitly asks. Dream maintains them.
+- Do not manually move reusable workflow details into `.edgebot/memory/MEMORY.md`; Dream routes those to `.edgebot/skills/<name>/SKILL.md`.
 - Use `/memory` to manually run Dream consolidation.
 - Use `/dream-log` to inspect Dream changes and `/dream-restore` to roll one back.

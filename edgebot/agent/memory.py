@@ -2,10 +2,10 @@
 edgebot/agent/memory.py - Memory store and two-phase Dream consolidation.
 
 Phase 1: LLM analyzes conversation history + archived entries, extracts
-         structured facts tagged [USER|SOUL|MEMORY].
+         structured facts tagged [USER|SOUL|MEMORY|SKILL].
 
-Phase 2: AgentRunner with read_file / edit_file tools performs targeted,
-         incremental edits to USER.md, SOUL.md, MEMORY.md — instead of
+Phase 2: AgentRunner with read_file / edit_file / write_file tools performs
+         targeted, incremental edits to memory files and skills instead of
          fragile text-parsing.
 """
 
@@ -40,6 +40,8 @@ _MAX_ARCHIVED_BATCH = 20
 _MEMORY_FILE_MAX_CHARS = 32_000
 _SOUL_FILE_MAX_CHARS = 16_000
 _USER_FILE_MAX_CHARS = 16_000
+_SKILLS_CONTEXT_MAX_CHARS = 16_000
+_SKILL_FILE_MAX_CHARS = 8_000
 _HISTORY_ENTRY_PREVIEW_MAX_CHARS = 4_000
 _CONVERSATION_MAX_CHARS = 48_000
 _HISTORY_ENTRY_HARD_CAP = 64_000
@@ -52,11 +54,12 @@ You have TWO equally important tasks:
 or stale content even if NOT mentioned in history
 
 Output one line per finding:
-[FILE] atomic fact              (FILE = USER, SOUL, or MEMORY)
+[FILE] atomic fact              (FILE = USER, SOUL, MEMORY, or SKILL)
 [FILE-REMOVE] content to remove, reason why
 
 Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY \
-(knowledge, project context)
+(knowledge, project context), SKILL (reusable workflows, commands, API \
+parameters, or operational procedures)
 
 ## Task 1 — New fact extraction
 STRICT INCLUSION CRITERIA — a fact must meet ALL of:
@@ -80,6 +83,9 @@ Category rules:
 [SOUL]   Only when user EXPLICITLY corrects the assistant's tone/style
 [MEMORY] Only new architectural decisions, confirmed solutions, or long-lived \
          project facts
+[SKILL]  Only reusable workflows, repeated procedures, exact commands, API \
+         parameters, tool usage patterns, or step-by-step operations. Prefer \
+         updating an existing skill that covers the same workflow.
 
 ## Task 2 — Deduplication and staleness
 Scan ALL memory files for these redundancy patterns:
@@ -87,12 +93,14 @@ Scan ALL memory files for these redundancy patterns:
   USER.md and MEMORY.md)
 - Overlapping or nested sections covering the same topic
 - Information in MEMORY.md that is already captured in USER.md or SOUL.md
+- Reusable workflow details in MEMORY.md that should live in SKILL.md
 - Verbose entries that can be condensed without losing information
 - Corrections: "location is Tokyo, not Osaka" → update USER.md
 
 For each issue found, output [FILE-REMOVE] with the exact content to remove \
 and why. Prefer keeping facts in their canonical location (USER.md for \
-identity/preferences, SOUL.md for behavior, MEMORY.md for project knowledge).
+identity/preferences, SOUL.md for behavior, MEMORY.md for project knowledge, \
+SKILL.md for reusable workflow instructions).
 
 Staleness rules:
 - User habits/preferences/personality traits in USER.md are permanent — only \
@@ -116,6 +124,9 @@ If nothing qualifies: [SKIP] no high-value information
 ## Current MEMORY.md
 {memory_content}
 
+## Current Skills
+{skills_content}
+
 ## Recent Conversation
 {conversation}
 """
@@ -124,17 +135,25 @@ PHASE2_SYSTEM_PROMPT = """\
 You are a memory maintenance agent. Your job is to update long-term memory
 files based on the analysis provided.
 
-You have access to read_file and edit_file tools. Follow this workflow:
+You have access to read_file, edit_file, and write_file tools. Follow this workflow:
 
-1. Read the current contents of USER.md, SOUL.md, and MEMORY.md
+1. Read the current contents of USER.md, SOUL.md, MEMORY.md, and relevant \
+skills/<name>/SKILL.md files
 2. For each entry in the analysis:
    - [FILE] entries: check if already present (exact or paraphrased). \
 If new, append to the correct file.
    - [FILE-REMOVE] entries: find the matching content and delete it using \
 edit_file (replace with empty string).
+   - [SKILL] entries: create or update .edgebot/skills/<name>/SKILL.md. If an \
+existing skill covers the workflow, update that file instead of creating a \
+duplicate. Do not put reusable workflow steps into MEMORY.md.
+   - [SKILL-REMOVE] entries: remove obsolete or duplicated workflow text from \
+the matching skill or from MEMORY.md if it is being migrated into a skill.
 3. Rules:
    - For USER.md: treat "- Key: value" lines as upserts (update if key exists)
    - For SOUL.md and MEMORY.md: append new content, delete flagged content
+   - For new skills: write a complete SKILL.md with YAML frontmatter containing \
+name and description, followed by concise workflow instructions
    - When deleting: include surrounding context (blank lines, section header) \
 in old_text to ensure unique match
    - Keep entries as concise bullet points
@@ -146,6 +165,7 @@ Files are located at:
 - USER.md:   {user_path}
 - SOUL.md:   {soul_path}
 - MEMORY.md: {memory_path}
+- Skills:    {skills_path}/<name>/SKILL.md
 """
 
 
@@ -169,6 +189,7 @@ class MemoryStore:
         self.dream_cursor_file = self.memory_dir / ".dream_cursor"
         self.soul_file = runtime_dir / "SOUL.md" if memory_dir is not None else SOUL_MD_PATH
         self.user_file = runtime_dir / "USER.md" if memory_dir is not None else USER_MD_PATH
+        self.skills_dir = runtime_dir / "skills"
         lock_key = self.memory_dir.resolve()
         with self._append_locks_guard:
             self._append_lock = self._append_locks.setdefault(lock_key, threading.Lock())
@@ -180,6 +201,7 @@ class MemoryStore:
                 "memory/MEMORY.md",
                 "memory/.dream_cursor",
             ],
+            tracked_dirs=["skills"],
             allow_nested=True,
         )
         legacy_memory_dir = workspace / "memory"
@@ -201,6 +223,30 @@ class MemoryStore:
 
     def read_soul(self) -> str:
         return _read_file(self.soul_file)
+
+    def iter_skill_files(self) -> Iterator[Path]:
+        if not self.skills_dir.exists():
+            return iter(())
+        skill_files: list[Path] = []
+        for skill_dir in sorted(self.skills_dir.iterdir()):
+            skill_file = skill_dir / "SKILL.md"
+            if skill_dir.is_dir() and skill_file.is_file():
+                skill_files.append(skill_file)
+        return iter(skill_files)
+
+    def read_skills_context(self) -> str:
+        sections: list[str] = []
+        runtime_dir = self.memory_dir.parent
+        for skill_file in self.iter_skill_files():
+            try:
+                rel = skill_file.relative_to(runtime_dir).as_posix()
+            except ValueError:
+                rel = str(skill_file)
+            content = _truncate_text(_read_file(skill_file), _SKILL_FILE_MAX_CHARS)
+            sections.append(f"### {rel}\n{content}")
+        if not sections:
+            return "(no skills)"
+        return _truncate_text("\n\n".join(sections), _SKILLS_CONTEXT_MAX_CHARS)
 
     def get_memory_context(self) -> str:
         content = self.read_memory().strip()
@@ -391,7 +437,7 @@ def _filter_dedup(analysis: str, existing_blob: str) -> str:
             kept.append(raw)
             continue
         m = re.match(
-            r"^\[(USER|SOUL|MEMORY|SKIP|(?:USER|SOUL|MEMORY)-REMOVE)\]\s*(.*)$",
+            r"^\[(USER|SOUL|MEMORY|SKILL|SKIP|(?:USER|SOUL|MEMORY|SKILL)-REMOVE)\]\s*(.*)$",
             line, re.I,
         )
         if not m:
@@ -420,7 +466,7 @@ def _extract_actionable_findings(analysis: str) -> str:
         line = raw.strip()
         if not line:
             continue
-        m = re.match(r"^\[(USER|SOUL|MEMORY)(-REMOVE)?\]\s*(.*)$", line, re.I)
+        m = re.match(r"^\[(USER|SOUL|MEMORY|SKILL)(-REMOVE)?\]\s*(.*)$", line, re.I)
         if not m:
             continue
         tag = m.group(1).upper() + (m.group(2).upper() if m.group(2) else "")
@@ -576,11 +622,13 @@ class DreamProcessor:
         user_content: str,
         soul_content: str,
         memory_content: str,
+        skills_content: str,
     ) -> str | None:
         prompt = PHASE1_PROMPT.format(
             user_content=user_content,
             soul_content=soul_content,
             memory_content=memory_content,
+            skills_content=skills_content,
             conversation=conversation,
             stale_threshold_days=_STALE_THRESHOLD_DAYS,
         )
@@ -623,13 +671,16 @@ class DreamProcessor:
             user_path=str(self.store.user_file),
             soul_path=str(self.store.soul_file),
             memory_path=str(self.store.memory_file),
+            skills_path=str(self.store.skills_dir),
         )
+        skills_content = self.store.read_skills_context()
         user_prompt = (
             f"## Analysis Result\n{analysis}\n\n"
             f"## Current File Contents\n\n"
             f"### USER.md\n{user_content}\n\n"
             f"### SOUL.md\n{soul_content}\n\n"
-            f"### MEMORY.md\n{self._strip_age_suffix(memory_content)}"
+            f"### MEMORY.md\n{self._strip_age_suffix(memory_content)}\n\n"
+            f"### Skills\n{skills_content}"
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -684,12 +735,19 @@ class DreamProcessor:
                 self.store.soul_file,
                 self.store.memory_file,
             ),
+            allowed_skill_dir=self.store.skills_dir,
+        )
+        write_tool = _DreamWriteTool(
+            self.store.workspace,
+            skills_dir=self.store.skills_dir,
         )
 
         tools.append(read_tool.to_openai())
         handlers[read_tool.name] = read_tool.execute
         tools.append(edit_tool.to_openai())
         handlers[edit_tool.name] = edit_tool.execute
+        tools.append(write_tool.to_openai())
+        handlers[write_tool.name] = write_tool.execute
 
         return tools, handlers
 
@@ -723,16 +781,18 @@ class DreamProcessor:
         raw_user_content = self.store.read_user()
         raw_soul_content = self.store.read_soul()
         raw_memory_content = self.store.read_memory()
+        raw_skills_content = self.store.read_skills_context()
         user_content = _truncate_text(raw_user_content, _USER_FILE_MAX_CHARS)
         soul_content = _truncate_text(raw_soul_content, _SOUL_FILE_MAX_CHARS)
         memory_content = _truncate_text(
             self._annotate_memory_with_ages(raw_memory_content),
             _MEMORY_FILE_MAX_CHARS,
         )
+        skills_content = _truncate_text(raw_skills_content, _SKILLS_CONTEXT_MAX_CHARS)
 
         # Phase 1: extract structured facts
         analysis = await self._phase1_analyze(
-            conversation, user_content, soul_content, memory_content,
+            conversation, user_content, soul_content, memory_content, skills_content,
         )
         if analysis is None:
             return False
@@ -741,7 +801,12 @@ class DreamProcessor:
             return False
 
         # Dedup against existing content
-        existing_blob = "\n".join([raw_user_content, raw_soul_content, raw_memory_content])
+        existing_blob = "\n".join([
+            raw_user_content,
+            raw_soul_content,
+            raw_memory_content,
+            raw_skills_content,
+        ])
         filtered = _filter_dedup(analysis, existing_blob)
         actionable = _extract_actionable_findings(filtered)
         if not actionable:
@@ -782,6 +847,14 @@ def _normalized_path_key(path: Path) -> str:
     if os.name == "nt":
         key = os.path.normcase(key)
     return key
+
+
+def _is_allowed_skill_file(path: Path, skills_dir: Path) -> bool:
+    try:
+        rel = path.resolve().relative_to(skills_dir.resolve())
+    except ValueError:
+        return False
+    return len(rel.parts) == 2 and rel.parts[0] not in {"", ".", ".."} and rel.parts[1] == "SKILL.md"
 
 
 class _DreamReadTool(BaseTool):
@@ -847,15 +920,17 @@ class _DreamEditTool(BaseTool):
         workspace: Path,
         *,
         allowed_files: tuple[Path, ...] | None = None,
+        allowed_skill_dir: Path | None = None,
     ):
         self._workspace = workspace
         runtime_dir = workspace / ".edgebot"
-        files = allowed_files or (
+        files = allowed_files if allowed_files is not None else (
             runtime_dir / "USER.md",
             runtime_dir / "SOUL.md",
             runtime_dir / "memory" / "MEMORY.md",
         )
         self._allowed_files = {_normalized_path_key(path) for path in files}
+        self._allowed_skill_dir = allowed_skill_dir
 
     def execute(self, **kwargs: Any) -> Any:
         from edgebot.tools.base import safe_path
@@ -865,15 +940,64 @@ class _DreamEditTool(BaseTool):
             target = safe_path(kwargs["path"])
         except Exception as exc:
             return f"Error: {exc}"
-        if _normalized_path_key(target) not in self._allowed_files:
+        allowed = _normalized_path_key(target) in self._allowed_files
+        if not allowed and self._allowed_skill_dir is not None:
+            allowed = _is_allowed_skill_file(target, self._allowed_skill_dir)
+        if not allowed:
             return (
                 "Error: Dream edit_file may only update USER.md, SOUL.md, "
-                "or memory/MEMORY.md."
+                "memory/MEMORY.md, or skills/<name>/SKILL.md."
             )
         return run_edit(
             kwargs["path"], kwargs["old_text"], kwargs["new_text"],
             kwargs.get("replace_all", False),
         )
+
+
+class _DreamWriteTool(BaseTool):
+    """write_file scoped to new Dream skill files."""
+
+    @property
+    def name(self) -> str:
+        return "write_file"
+
+    @property
+    def description(self) -> str:
+        return "Create .edgebot/skills/<name>/SKILL.md for reusable workflows."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Skill file to write."},
+                "content": {"type": "string", "description": "Complete SKILL.md content."},
+            },
+            "required": ["path", "content"],
+        }
+
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        skills_dir: Path | None = None,
+    ):
+        self._workspace = workspace
+        self._skills_dir = skills_dir or (workspace / ".edgebot" / "skills")
+
+    def execute(self, **kwargs: Any) -> Any:
+        from edgebot.tools.base import safe_path
+        from edgebot.tools.filesystem import run_write
+
+        try:
+            target = safe_path(kwargs["path"])
+        except Exception as exc:
+            return f"Error: {exc}"
+        if not _is_allowed_skill_file(target, self._skills_dir):
+            return "Error: Dream write_file may only write skills/<name>/SKILL.md."
+        if target.exists() and target.read_text(encoding="utf-8").strip():
+            return "Error: Skill already exists. Use edit_file to update existing skills."
+        return run_write(kwargs["path"], kwargs["content"])
 
 
 # ---------------------------------------------------------------------------

@@ -655,14 +655,19 @@ class DreamProcessor:
 
     def _build_dream_tools(self) -> tuple[list[dict], dict[str, Any]]:
         """Build read_file + edit_file tools scoped to the memory workspace."""
-        from edgebot.tools.base import safe_path
-        from edgebot.config import WORKDIR
 
         tools: list[dict] = []
         handlers: dict[str, Any] = {}
 
         read_tool = _DreamReadTool(self.store.workspace)
-        edit_tool = _DreamEditTool(self.store.workspace)
+        edit_tool = _DreamEditTool(
+            self.store.workspace,
+            allowed_files=(
+                self.store.user_file,
+                self.store.soul_file,
+                self.store.memory_file,
+            ),
+        )
 
         tools.append(read_tool.to_openai())
         handlers[read_tool.name] = read_tool.execute
@@ -757,6 +762,13 @@ class DreamProcessor:
 # Dream-scoped tools (read/edit restricted to workspace memory files)
 # ---------------------------------------------------------------------------
 
+def _normalized_path_key(path: Path) -> str:
+    key = os.path.abspath(path)
+    if os.name == "nt":
+        key = os.path.normcase(key)
+    return key
+
+
 class _DreamReadTool(BaseTool):
     """read_file scoped to the workspace for Dream agent."""
 
@@ -815,11 +827,34 @@ class _DreamEditTool(BaseTool):
             "required": ["path", "old_text", "new_text"],
         }
 
-    def __init__(self, workspace: Path):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        allowed_files: tuple[Path, ...] | None = None,
+    ):
         self._workspace = workspace
+        runtime_dir = workspace / ".edgebot"
+        files = allowed_files or (
+            runtime_dir / "USER.md",
+            runtime_dir / "SOUL.md",
+            runtime_dir / "memory" / "MEMORY.md",
+        )
+        self._allowed_files = {_normalized_path_key(path) for path in files}
 
     def execute(self, **kwargs: Any) -> Any:
+        from edgebot.tools.base import safe_path
         from edgebot.tools.filesystem import run_edit
+
+        try:
+            target = safe_path(kwargs["path"])
+        except Exception as exc:
+            return f"Error: {exc}"
+        if _normalized_path_key(target) not in self._allowed_files:
+            return (
+                "Error: Dream edit_file may only update USER.md, SOUL.md, "
+                "or memory/MEMORY.md."
+            )
         return run_edit(
             kwargs["path"], kwargs["old_text"], kwargs["new_text"],
             kwargs.get("replace_all", False),

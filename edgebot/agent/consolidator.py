@@ -87,6 +87,8 @@ class Consolidator:
             end_index=boundary,
             content=content,
             archived_message_count=len(archive_messages),
+            source="context_archive" if summary else "raw_archive",
+            tags=["durable"] if summary else ["ephemeral"],
         )
         self.sessions.set_last_consolidated(session_key, boundary)
         if summary:
@@ -145,6 +147,8 @@ class Consolidator:
                 end_index=start + len(archive_messages),
                 content=content,
                 archived_message_count=len(archive_messages),
+                source="context_archive" if summary else "raw_archive",
+                tags=["durable"] if summary else ["ephemeral"],
             )
 
         metadata = state.setdefault("metadata", {})
@@ -206,6 +210,8 @@ class Consolidator:
             end_index=-1,
             content=content,
             archived_message_count=len(messages),
+            source="raw_archive",
+            tags=["ephemeral"],
         )
 
     def _find_archive_boundary(
@@ -286,11 +292,15 @@ class Consolidator:
         end_index: int,
         content: str,
         archived_message_count: int,
+        source: str = "context_archive",
+        tags: list[str] | None = None,
     ) -> None:
         self.memory_store.append_history(
             content,
             session_key=session_key,
             max_chars=_HISTORY_ENTRY_HARD_CAP,
+            source=source,
+            tags=tags or ["durable"],
             metadata={
                 "start_index": start_index,
                 "end_index": end_index,

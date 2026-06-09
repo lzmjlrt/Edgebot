@@ -21,7 +21,7 @@
 | P0 | Dream 编辑工具没有真正限制到记忆文件 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py` | 已解决 |
 | P1 | Dream Phase 1 对 `[SKIP]` 的判断会误丢有效发现 | `edgebot/agent/memory.py` | `agent/memory.py`, `templates/agent/dream.md` | 已解决 |
 | P1 | Edgebot Dream 缺少 nanobot 的 `SKILL.md` 路由 | `edgebot/agent/memory.py`, `edgebot/templates/skills/memory/SKILL.md` | `templates/agent/dream.md`, `agent/memory.py` | 已解决 |
-| P1 | 每轮摘要和上下文归档都写入同一 history，Dream 输入容易重复/噪声化 | `edgebot/agent/loop.py`, `edgebot/agent/consolidator.py`, `edgebot/agent/memory.py` | `templates/agent/dream.md`, `agent/memory.py` | 未修 |
+| P1 | 每轮摘要和上下文归档都写入同一 history，Dream 输入容易重复/噪声化 | `edgebot/agent/loop.py`, `edgebot/agent/consolidator.py`, `edgebot/agent/memory.py` | `templates/agent/dream.md`, `agent/memory.py` | 已解决 |
 | P2 | Dream read_file 复用全局文件去重状态，可能读不到当前内容 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py`, `agent/tools/filesystem.py` | 未修 |
 | P2 | 缺少专门的 Dream/Memory 测试覆盖 | `tests/` | nanobot 测试/实现路径 | 未补 |
 | P2 | `MemoryStore(workspace)` 仍使用全局 `.edgebot` 路径，隔离性差 | `edgebot/agent/memory.py`, `edgebot/config.py` | `agent/memory.py` | 未修 |
@@ -240,6 +240,17 @@ Edgebot 没有 `[SKILL]` 路由时，Dream 只能把这些内容塞进 `MEMORY.m
 - 新增测试：从 `MEMORY.md` 迁移到 skill 后，`MEMORY.md` 中重复操作步骤被删除。
 
 ## P1: 每轮摘要和上下文归档都写入同一 history，Dream 输入容易重复/噪声化
+
+状态：已解决（2026-06-09）
+
+修复摘要：
+
+- `MemoryStore.append_history()` 已支持并默认保留结构化 `source` 与 `tags` 字段，`read_unprocessed_history()` 返回原始记录时会保留这些字段。
+- 每轮摘要写入标记为 `source=turn_summary`、`tags=["summary"]`；上下文摘要写入标记为 `source=context_archive`、`tags=["durable"]`；raw archive 和降级 fallback 写入标记为 `source=raw_archive`、`tags=["ephemeral"]`。
+- Dream 构造 archived history prompt 时会显示 `source/tags/session/cursor` 元数据，使 Phase 1 可以按来源和标签判断证据质量。
+- Dream 会跳过 `raw_archive` 或 `ephemeral` 且没有 durable/permanent/correction 证据的 archived entries，并推进 `.dream_cursor`，避免被低质量 raw fallback 卡住或直接写入长期记忆。
+- `_extract_actionable_findings()` 已增加规范化去重，同一 finding 同时来自 turn summary 和 context archive 时，只会传给 Phase 2 一次。
+- 新增 `tests/test_dream_history_sources.py`，覆盖 history source/tags 写入、Dream prompt 元数据展示、重复 finding 去重、ephemeral raw history 跳过并推进 cursor。
 
 ### 问题文件
 

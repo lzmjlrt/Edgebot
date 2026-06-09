@@ -160,7 +160,11 @@ async def auto_compact(
             if is_idle else
             "Context auto-compressed. "
         )
-        memory_store.append_history(archived_label + summary)
+        memory_store.append_history(
+            archived_label + summary,
+            source="context_archive",
+            tags=["durable"],
+        )
     
     if is_idle:
         system_msg = f"[System: User was idle for {int(idle_minutes)} minutes. Previous context summary (log {path.name}):]\n{summary}"

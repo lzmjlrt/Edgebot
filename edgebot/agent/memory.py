@@ -292,6 +292,8 @@ class MemoryStore:
         *,
         max_chars: int | None = None,
         session_key: str | None = None,
+        source: str | None = None,
+        tags: list[str] | tuple[str, ...] | set[str] | str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> int:
         with self._append_lock:
@@ -300,15 +302,20 @@ class MemoryStore:
             cleaned = content.strip()
             if len(cleaned) > limit:
                 cleaned = _truncate_text(cleaned, limit)
+            extra = dict(metadata or {})
+            record_source = source or extra.pop("source", None) or "unknown"
+            record_tags = tags if tags is not None else extra.pop("tags", [])
             record = {
                 "cursor": cursor,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "source": str(record_source),
+                "tags": _normalize_history_tags(record_tags),
                 "content": cleaned,
             }
             if session_key:
                 record["session_key"] = session_key
-            if metadata:
-                record.update(metadata)
+            if extra:
+                record.update(extra)
             self.memory_dir.mkdir(parents=True, exist_ok=True)
             with open(self.history_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
@@ -411,6 +418,59 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[: max(0, max_chars - len(marker))] + marker
 
 
+def _normalize_history_tags(tags: Any) -> list[str]:
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        raw_tags = [tags]
+    elif isinstance(tags, (list, tuple, set)):
+        raw_tags = list(tags)
+    else:
+        raw_tags = [str(tags)]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for tag in raw_tags:
+        value = str(tag).strip().lower()
+        if not value or value in seen:
+            continue
+        normalized.append(value)
+        seen.add(value)
+    return normalized
+
+
+def _history_tags(entry: dict[str, Any]) -> list[str]:
+    return _normalize_history_tags(entry.get("tags"))
+
+
+def _has_durable_history_signal(entry: dict[str, Any]) -> bool:
+    tags = set(_history_tags(entry))
+    return bool(tags & {"durable", "permanent", "correction"})
+
+
+def _is_dream_visible_history(entry: dict[str, Any]) -> bool:
+    tags = set(_history_tags(entry))
+    source = str(entry.get("source") or "unknown").strip().lower()
+    if "skip" in tags:
+        return False
+    if source == "raw_archive" and not _has_durable_history_signal(entry):
+        return False
+    if "ephemeral" in tags and not _has_durable_history_signal(entry):
+        return False
+    return True
+
+
+def _format_history_entry_for_dream(entry: dict[str, Any]) -> str:
+    source = str(entry.get("source") or "unknown").strip() or "unknown"
+    tags = ",".join(_history_tags(entry)) or "none"
+    session = entry.get("session_key")
+    session_part = f" session={session}" if session else ""
+    return (
+        f"[{entry['timestamp']}] "
+        f"[source={source} tags={tags}{session_part} cursor={entry['cursor']}] "
+        f"{_truncate_text(str(entry.get('content', '')), _HISTORY_ENTRY_PREVIEW_MAX_CHARS)}"
+    )
+
+
 def _format_messages(messages: list[dict]) -> str:
     lines = []
     for msg in messages:
@@ -462,6 +522,7 @@ def _filter_dedup(analysis: str, existing_blob: str) -> str:
 def _extract_actionable_findings(analysis: str) -> str:
     """Return normalized Phase 1 findings that Phase 2 can execute."""
     findings: list[str] = []
+    seen: set[tuple[str, str]] = set()
     for raw in analysis.splitlines():
         line = raw.strip()
         if not line:
@@ -471,8 +532,13 @@ def _extract_actionable_findings(analysis: str) -> str:
             continue
         tag = m.group(1).upper() + (m.group(2).upper() if m.group(2) else "")
         content = m.group(3).strip()
-        if content:
-            findings.append(f"[{tag}] {content}")
+        if not content:
+            continue
+        key = (tag, _normalize_line(content))
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(f"[{tag}] {content}")
     return "\n".join(findings)
 
 
@@ -576,10 +642,13 @@ class DreamProcessor:
         archived_batch: list[dict],
         live_messages: list[dict],
     ) -> str:
+        visible_archived_entries = [
+            entry for entry in archived_batch
+            if _is_dream_visible_history(entry) and entry.get("content")
+        ]
         archived_history = "\n".join(
-            f"[{entry['timestamp']}] "
-            f"{_truncate_text(str(entry.get('content', '')), _HISTORY_ENTRY_PREVIEW_MAX_CHARS)}"
-            for entry in archived_batch
+            _format_history_entry_for_dream(entry)
+            for entry in visible_archived_entries
         )
         recent_conversation = _format_messages(live_messages)
         parts: list[str] = []
@@ -775,6 +844,7 @@ class DreamProcessor:
 
         conversation = self._build_conversation_context(archived_batch, live_messages)
         if not conversation.strip():
+            self._advance_cursor(archived_batch)
             return False
 
         self.store.ensure_git_initialized()

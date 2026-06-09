@@ -101,6 +101,8 @@ def _archive_turn_summary(
     _MEMORY.append_history(
         f"User: {user_preview}\nEdgebot: {reply_preview}",
         session_key=session_key,
+        source="turn_summary",
+        tags=["summary"],
     )
 
 

@@ -24,7 +24,7 @@
 | P1 | 每轮摘要和上下文归档都写入同一 history，Dream 输入容易重复/噪声化 | `edgebot/agent/loop.py`, `edgebot/agent/consolidator.py`, `edgebot/agent/memory.py` | `templates/agent/dream.md`, `agent/memory.py` | 已解决 |
 | P2 | Dream read_file 复用全局文件去重状态，可能读不到当前内容 | `edgebot/agent/memory.py`, `edgebot/tools/filesystem.py` | `agent/memory.py`, `agent/tools/filesystem.py` | 已解决 |
 | P2 | 缺少专门的 Dream/Memory 测试覆盖 | `tests/` | nanobot 测试/实现路径 | 未补 |
-| P2 | `MemoryStore(workspace)` 仍使用全局 `.edgebot` 路径，隔离性差 | `edgebot/agent/memory.py`, `edgebot/config.py` | `agent/memory.py` | 未修 |
+| P2 | `MemoryStore(workspace)` 仍使用全局 `.edgebot` 路径，隔离性差 | `edgebot/agent/memory.py`, `edgebot/config.py` | `agent/memory.py` | 已解决 |
 
 ## P0: `history.jsonl` 多写入方绕过统一 cursor/锁
 
@@ -379,6 +379,15 @@ Dream Phase 2 系统提示要求先读当前 `USER.md`、`SOUL.md`、`MEMORY.md`
 - 测试使用临时 runtime/memory 目录，不能污染仓库 `.edgebot`。
 
 ## P2: `MemoryStore(workspace)` 仍使用全局 `.edgebot` 路径，隔离性差
+
+状态：已解决（2026-06-09）
+
+修复摘要：
+
+- `MemoryStore(workspace)` 默认路径已改为从传入 workspace 派生：`workspace/.edgebot/memory`、`workspace/.edgebot/USER.md`、`workspace/.edgebot/SOUL.md`、`workspace/.edgebot/skills`。
+- 显式传入 `memory_dir=` 的测试/兼容入口仍保留原语义，相关记忆文件从 `memory_dir.parent` 派生。
+- `MemoryStore(WORKDIR)` 仍读取当前 CLI 工作区的 `.edgebot` 记忆文件。
+- 新增 `tests/test_memory_workspace_isolation.py`，覆盖默认路径派生，以及两个不同 workspace 的 history/cursor 写入互不影响。
 
 ### 问题文件
 

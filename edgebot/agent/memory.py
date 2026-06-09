@@ -23,7 +23,7 @@ from typing import Any, ClassVar, Iterator
 
 from rich.console import Console
 
-from edgebot.config import MEMORY_DIR, MODEL, RUNTIME_DIR, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
+from edgebot.config import MEMORY_DIR, MODEL, SOUL_MD_PATH, USER_MD_PATH, WORKDIR
 from edgebot.providers.base import LLMProvider
 from edgebot.tools.base import BaseTool
 from edgebot.utils.gitstore import GitStore
@@ -180,21 +180,22 @@ class MemoryStore:
     _append_locks_guard: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, workspace: Path, *, memory_dir: Path | None = None):
-        self.workspace = workspace
-        self.memory_dir = Path(memory_dir) if memory_dir is not None else MEMORY_DIR
+        self.workspace = Path(workspace)
+        runtime_dir = Path(memory_dir).parent if memory_dir is not None else self.workspace / ".edgebot"
+        self.memory_dir = Path(memory_dir) if memory_dir is not None else runtime_dir / "memory"
         runtime_dir = self.memory_dir.parent
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
         self.cursor_file = self.memory_dir / ".cursor"
         self.dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self.soul_file = runtime_dir / "SOUL.md" if memory_dir is not None else SOUL_MD_PATH
-        self.user_file = runtime_dir / "USER.md" if memory_dir is not None else USER_MD_PATH
+        self.soul_file = runtime_dir / "SOUL.md"
+        self.user_file = runtime_dir / "USER.md"
         self.skills_dir = runtime_dir / "skills"
         lock_key = self.memory_dir.resolve()
         with self._append_locks_guard:
             self._append_lock = self._append_locks.setdefault(lock_key, threading.Lock())
         self.git = GitStore(
-            runtime_dir if memory_dir is not None else RUNTIME_DIR,
+            runtime_dir,
             tracked_files=[
                 "SOUL.md",
                 "USER.md",

@@ -868,7 +868,7 @@ async def main():
         store.append(run_session_key, user_msg)
         return await agent_loop(
             messages=run_history,
-            system=build_system_prompt(),
+            system=build_system_prompt(session_key=run_session_key),
             tools=all_tools,
             tool_handlers=all_handlers,
             todo_mgr=TODO,
@@ -1234,7 +1234,7 @@ async def main():
                 continue
 
             # ---- Normal message ----
-            system = build_system_prompt()
+            system = build_system_prompt(session_key=session_key)
             user_msg = {"role": "user", "content": query}
             store.update_metadata(session_key, pending_user_turn=True)
             history.append(user_msg)

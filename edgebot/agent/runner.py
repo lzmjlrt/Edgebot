@@ -262,9 +262,36 @@ class AgentRunner:
                 for tc in response.tool_calls:
                     _print_tool_hint(tc.name, tc.arguments, spec)
 
+                tool_status = None
+                active_tool_executions = 0
+
+                async def _on_tool_execution_start(name: str, args: dict[str, Any]) -> None:
+                    nonlocal tool_status, active_tool_executions
+                    if not spec.emit_output:
+                        return
+                    active_tool_executions += 1
+                    if tool_status is None:
+                        tool_status = _console.status(
+                            "[dim]Edgebot is thinking...[/dim]", spinner="dots"
+                        )
+                        tool_status.start()
+
+                async def _on_tool_execution_end(name: str, args: dict[str, Any]) -> None:
+                    nonlocal tool_status, active_tool_executions
+                    if not spec.emit_output:
+                        return
+                    active_tool_executions = max(0, active_tool_executions - 1)
+                    if active_tool_executions == 0 and tool_status is not None:
+                        try:
+                            tool_status.stop()
+                        finally:
+                            tool_status = None
+
                 executed_calls = await execute_tool_batches(
                     [tc.to_openai_tool_call() for tc in response.tool_calls],
                     tool_handlers=spec.tool_handlers,
+                    on_execution_start=_on_tool_execution_start,
+                    on_execution_end=_on_tool_execution_end,
                 )
 
                 completed_results: list[dict[str, Any]] = []

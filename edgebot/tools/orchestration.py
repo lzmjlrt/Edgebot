@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from edgebot.tools.registry import PERMISSIONS, execute_registered_tool, get_tool_instance
 
@@ -83,23 +83,51 @@ def partition_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
     return batches
 
 
-async def _run_single_tool(name: str, args: dict[str, Any]) -> Any:
+ToolExecutionCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+async def _run_single_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    on_execution_start: ToolExecutionCallback | None = None,
+    on_execution_end: ToolExecutionCallback | None = None,
+) -> Any:
     tool = get_tool_instance(name)
     if tool is not None:
         decision = await PERMISSIONS.authorize(name, args, tool)
         if decision.behavior != "allow":
             return f"Error: {decision.message}"
-        return await execute_registered_tool(name, decision.updated_params or args)
+        updated_args = decision.updated_params or args
+        started = False
+        if on_execution_start is not None:
+            await on_execution_start(name, updated_args)
+            started = True
+        try:
+            return await execute_registered_tool(name, updated_args)
+        finally:
+            if started and on_execution_end is not None:
+                await on_execution_end(name, updated_args)
     return f"Unknown tool: {name}"
 
 
-async def _run_parallel_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _run_parallel_calls(
+    calls: list[dict[str, Any]],
+    *,
+    on_execution_start: ToolExecutionCallback | None = None,
+    on_execution_end: ToolExecutionCallback | None = None,
+) -> list[dict[str, Any]]:
     semaphore = asyncio.Semaphore(_get_max_tool_concurrency())
 
     async def _guarded(call: dict[str, Any]) -> dict[str, Any]:
         async with semaphore:
             try:
-                output = await _run_single_tool(call["name"], call["args"])
+                output = await _run_single_tool(
+                    call["name"],
+                    call["args"],
+                    on_execution_start=on_execution_start,
+                    on_execution_end=on_execution_end,
+                )
             except Exception as exc:
                 output = f"Error: {exc}"
             return {
@@ -116,6 +144,8 @@ async def execute_tool_batches(
     tool_calls: list[dict[str, Any]],
     *,
     tool_handlers: dict[str, Any] | None = None,
+    on_execution_start: ToolExecutionCallback | None = None,
+    on_execution_end: ToolExecutionCallback | None = None,
 ) -> list[dict[str, Any]]:
     """
     Execute tool calls with conservative orchestration.
@@ -127,14 +157,23 @@ async def execute_tool_batches(
     for batch in partition_tool_calls(tool_calls):
         calls = batch["calls"]
         if batch["parallel"]:
-            results.extend(await _run_parallel_calls(calls))
+            results.extend(await _run_parallel_calls(
+                calls,
+                on_execution_start=on_execution_start,
+                on_execution_end=on_execution_end,
+            ))
             continue
 
         for call in calls:
             try:
                 tool = get_tool_instance(call["name"])
                 if tool is not None:
-                    output = await _run_single_tool(call["name"], call["args"])
+                    output = await _run_single_tool(
+                        call["name"],
+                        call["args"],
+                        on_execution_start=on_execution_start,
+                        on_execution_end=on_execution_end,
+                    )
                 elif tool_handlers and call["name"] in tool_handlers:
                     result = tool_handlers[call["name"]](**call["args"])
                     output = await result if hasattr(result, "__await__") else result

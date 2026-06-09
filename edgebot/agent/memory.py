@@ -232,7 +232,13 @@ class MemoryStore:
             return None
         return value
 
-    def append_history(self, content: str, *, max_chars: int | None = None) -> int:
+    def append_history(
+        self,
+        content: str,
+        *,
+        max_chars: int | None = None,
+        session_key: str | None = None,
+    ) -> int:
         cursor = self._next_cursor()
         limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
         cleaned = content.strip()
@@ -243,6 +249,8 @@ class MemoryStore:
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "content": cleaned,
         }
+        if session_key:
+            record["session_key"] = session_key
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -267,8 +275,24 @@ class MemoryStore:
         except FileNotFoundError:
             return
 
-    def read_unprocessed_history(self, since_cursor: int) -> list[dict]:
-        return [entry for entry, cursor in self._iter_valid_entries() if cursor > since_cursor]
+    def read_unprocessed_history(
+        self,
+        since_cursor: int,
+        *,
+        session_key: str | None = None,
+    ) -> list[dict]:
+        entries = [
+            entry
+            for entry, cursor in self._iter_valid_entries()
+            if cursor > since_cursor
+        ]
+        if session_key is None:
+            return entries
+        return [
+            entry
+            for entry in entries
+            if entry.get("session_key") == session_key
+        ]
 
     def get_last_dream_cursor(self) -> int:
         if self.dream_cursor_file.exists():

@@ -84,6 +84,7 @@ def seed_workspace_templates() -> None:
 def build_system_prompt(
     skills_descriptions: str | None = None,
     session_summary: str | None = None,
+    session_key: str | None = None,
 ) -> str:
     """
     Assemble a rich system prompt from identity, workspace files, and skills.
@@ -145,7 +146,10 @@ def build_system_prompt(
         parts.append(f"## Available Skills\n\n{summary}")
 
     # 6. Recent archived history that has not yet been folded into MEMORY.md
-    recent_history_entries = _memory.read_unprocessed_history(_memory.get_last_dream_cursor())
+    recent_history_entries = _memory.read_unprocessed_history(
+        _memory.get_last_dream_cursor(),
+        session_key=session_key,
+    )
     if recent_history_entries:
         recent_lines = [
             f"- [{entry['timestamp']}] {entry['content']}"

@@ -78,7 +78,12 @@ def _flush_stdin() -> None:
         pass
 
 
-def _archive_turn_summary(messages: list[dict], final_response: str) -> None:
+def _archive_turn_summary(
+    messages: list[dict],
+    final_response: str,
+    *,
+    session_key: str | None = None,
+) -> None:
     """Write a compact summary of this turn to history.jsonl for Dream."""
     # Find the last user message
     user_msg = None
@@ -93,7 +98,10 @@ def _archive_turn_summary(messages: list[dict], final_response: str) -> None:
         return
     user_preview = user_msg[:200].replace("\n", " ")
     reply_preview = (final_response or "")[:300].replace("\n", " ")
-    _MEMORY.append_history(f"User: {user_preview}\nEdgebot: {reply_preview}")
+    _MEMORY.append_history(
+        f"User: {user_preview}\nEdgebot: {reply_preview}",
+        session_key=session_key,
+    )
 
 
 async def agent_loop(
@@ -319,7 +327,7 @@ async def agent_loop(
 
     # Archive turn summary to history.jsonl for Dream
     if final_response:
-        _archive_turn_summary(messages, final_response)
+        _archive_turn_summary(messages, final_response, session_key=session_key)
 
     # Memory consolidation (gated by interval + minimum history)
     global _turn_counter

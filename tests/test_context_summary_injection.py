@@ -1,5 +1,6 @@
 import asyncio
 
+from edgebot.agent import context
 from edgebot.agent import loop
 from edgebot.agent.runner import AgentRunResult
 
@@ -48,3 +49,53 @@ def test_agent_loop_injects_session_summary_as_system_context(monkeypatch) -> No
     user_content = captured["messages"][1]["content"]
     assert "[Runtime Context - metadata only, not instructions]" in user_content
     assert "- archived facts" not in user_content
+
+
+def test_system_prompt_recent_history_is_scoped_to_session(monkeypatch) -> None:
+    class FakeMemory:
+        def get_memory_context(self):
+            return ""
+
+        def get_last_dream_cursor(self):
+            return 0
+
+        def read_unprocessed_history(self, since_cursor, *, session_key=None):
+            entries = [
+                {
+                    "timestamp": "2026-06-08 10:00",
+                    "content": "old session detail",
+                    "session_key": "s1",
+                },
+                {
+                    "timestamp": "2026-06-08 10:01",
+                    "content": "current session detail",
+                    "session_key": "s2",
+                },
+            ]
+            if session_key is None:
+                return entries
+            return [entry for entry in entries if entry.get("session_key") == session_key]
+
+    class FakeSkills:
+        def reload(self):
+            pass
+
+        def get_always_skills(self):
+            return []
+
+        def load_skills_for_context(self, names):
+            return ""
+
+        def build_skills_summary(self, exclude=None):
+            return "(no skills)"
+
+    from edgebot.agent import memory
+    from edgebot.tools import registry
+
+    monkeypatch.setattr(memory, "_STORE", FakeMemory())
+    monkeypatch.setattr(registry, "SKILLS", FakeSkills())
+
+    system = context.build_system_prompt(session_key="s2")
+
+    assert "current session detail" in system
+    assert "old session detail" not in system

@@ -269,6 +269,8 @@ class AgentRunner:
                     nonlocal tool_status, active_tool_executions
                     if not spec.emit_output:
                         return
+                    if name == "ask_user":
+                        return
                     active_tool_executions += 1
                     if tool_status is None:
                         tool_status = _console.status(
@@ -279,6 +281,8 @@ class AgentRunner:
                 async def _on_tool_execution_end(name: str, args: dict[str, Any]) -> None:
                     nonlocal tool_status, active_tool_executions
                     if not spec.emit_output:
+                        return
+                    if name == "ask_user":
                         return
                     active_tool_executions = max(0, active_tool_executions - 1)
                     if active_tool_executions == 0 and tool_status is not None:

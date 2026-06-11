@@ -15,11 +15,13 @@ from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
+from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -44,7 +46,7 @@ from edgebot.cron.types import CronJob, CronPayload
 from edgebot.heartbeat.service import HeartbeatService
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
-from edgebot.tools.builtin.ask import set_ask_handler
+from edgebot.tools.builtin.ask import AskOption, AskQuestion, build_ask_user_result, set_ask_handler
 from edgebot.tools.registry import (
     BG,
     CRON,
@@ -62,13 +64,20 @@ _MEMORY = MemoryStore(Path.cwd())
 
 _HISTORY_PATH = Path.home() / ".edgebot" / "cli_history"
 _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-_prompt_session: PromptSession = PromptSession(history=FileHistory(str(_HISTORY_PATH)))
+_prompt_session: PromptSession | None = None
+
+
+def _prompt() -> PromptSession:
+    global _prompt_session
+    if _prompt_session is None:
+        _prompt_session = PromptSession(history=FileHistory(str(_HISTORY_PATH)))
+    return _prompt_session
 
 
 async def _ask_user() -> str:
     """Prompt the user for a single line; returns stripped text."""
     with patch_stdout():
-        line = await _prompt_session.prompt_async(
+        line = await _prompt().prompt_async(
             HTML("<b><ansiblue>You:</ansiblue></b> ")
         )
     return (line or "").strip()
@@ -124,7 +133,7 @@ async def _permission_prompt(request: dict) -> dict | None:
 
     while True:
         with patch_stdout():
-            line = await _prompt_session.prompt_async(
+            line = await _prompt().prompt_async(
                 HTML("<b><ansiyellow>Approval:</ansiyellow></b> ")
             )
         choice = (line or "").strip().lower()
@@ -140,70 +149,51 @@ async def _permission_prompt(request: dict) -> dict | None:
         await _interactive_notice("Use y / s / a / n.")
 
 
-async def _ask_user_handler(question: str, options: list[str] | None) -> str:
-    """Interactive ask_user prompt with arrow-key option picker."""
+def _display_width(text: str) -> int:
+    return get_cwidth(text)
+
+
+def _pad_display(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+
+
+def _clip_display(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if _display_width(text) <= width:
+        return text
+    if width <= 3:
+        return "." * width
+    clipped = ""
+    used = 0
+    for char in text:
+        char_width = _display_width(char)
+        if used + char_width > max(0, width - 3):
+            break
+        clipped += char
+        used += char_width
+    return clipped + "..."
+
+
+def _preview_box(preview: str | None, width: int = 58, height: int = 8) -> list[str]:
+    inner = max(12, width - 2)
+    lines = (preview or "No preview available").splitlines() or [""]
+    visible = lines[:height]
+    hidden = max(0, len(lines) - len(visible))
+    rendered = ["+" + "-" * inner + "+"]
+    for line in visible:
+        rendered.append("|" + _pad_display(_clip_display(line, inner), inner) + "|")
+    if hidden:
+        marker = f"... {hidden} lines hidden"
+        rendered[-1] = "|" + _pad_display(_clip_display(marker, inner), inner) + "|"
+    while len(rendered) < height + 1:
+        rendered.append("|" + " " * inner + "|")
+    rendered.append("+" + "-" * inner + "+")
+    return rendered
+
+
+async def _ask_free_text(question: str) -> str:
     safe_q = escape(question)
-    if options:
-        selected_index = 0
-
-        def _render_ask():
-            fragments: list[tuple[str, str]] = [
-                ("class:title", f"{question}\n\n"),
-                ("class:hint", "Up/Down select, Enter confirm, Esc/type for free text.\n\n"),
-            ]
-            for idx, opt in enumerate(options):
-                pointer = "> " if idx == selected_index else "  "
-                style = "class:selected" if idx == selected_index else "class:item"
-                fragments.append((style, f"{pointer}{opt}\n"))
-            return fragments
-
-        body = FormattedTextControl(_render_ask, focusable=True, show_cursor=False)
-        kb = KeyBindings()
-
-        @kb.add("up")
-        @kb.add("k")
-        def _move_up(event) -> None:
-            nonlocal selected_index
-            selected_index = (selected_index - 1) % len(options)
-            event.app.invalidate()
-
-        @kb.add("down")
-        @kb.add("j")
-        def _move_down(event) -> None:
-            nonlocal selected_index
-            selected_index = (selected_index + 1) % len(options)
-            event.app.invalidate()
-
-        @kb.add("enter")
-        def _accept(event) -> None:
-            event.app.exit(result=options[selected_index])
-
-        @kb.add("escape")
-        @kb.add("c-c")
-        def _free_text(event) -> None:
-            event.app.exit(result=None)
-
-        app = Application(
-            layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
-            key_bindings=kb,
-            full_screen=False,
-            mouse_support=False,
-            style=Style.from_dict({
-                "title": "bold",
-                "hint": "ansibrightblack",
-                "item": "",
-                "selected": "reverse bold",
-            }),
-        )
-
-        with patch_stdout():
-            result = await app.run_async()
-
-        if result is not None:
-            return result
-
-        # User pressed Esc — fall through to free-text input
-
     await _interactive_print(
         lambda c: (
             c.print(f"[bold]{safe_q}[/bold]"),
@@ -211,10 +201,503 @@ async def _ask_user_handler(question: str, options: list[str] | None) -> str:
         )
     )
     with patch_stdout():
-        line = await _prompt_session.prompt_async(
+        line = await _prompt().prompt_async(
             HTML("<b><ansicyan>You:</ansicyan></b> ")
         )
     return (line or "").strip() or "(no response)"
+
+
+def _answer_has_value(answer: object | None) -> bool:
+    if isinstance(answer, list):
+        return any(str(item).strip() for item in answer)
+    if answer is None:
+        return False
+    return bool(str(answer).strip())
+
+
+def _display_answer(answer: object | None) -> str:
+    if isinstance(answer, list):
+        values = [str(item).strip() for item in answer if str(item).strip()]
+        return ", ".join(values) if values else "(no response)"
+    value = str(answer or "").strip()
+    return value or "(no response)"
+
+
+async def _run_ask_questions(questions: list[AskQuestion]) -> dict[str, object]:
+    """Run one multi-step ask_user picker with a final submit review."""
+    if not questions:
+        return {}
+    if all(not question.options for question in questions):
+        return {
+            question.question: await _ask_free_text(question.question)
+            for question in questions
+        }
+
+    selected_indices = [0 for _ in questions]
+    checked: list[set[int]] = [set() for _ in questions]
+    custom_inputs = ["" for _ in questions]
+    answers: dict[str, object] = {}
+    step_index = 0
+    submit_choice = 0
+
+    def _question_options(question_index: int) -> list[AskOption]:
+        return questions[question_index].options
+
+    def _selected_option(question_index: int) -> AskOption | None:
+        options = _question_options(question_index)
+        if not options:
+            return None
+        index = selected_indices[question_index] % len(options)
+        return options[index]
+
+    def _current_custom_active() -> bool:
+        if step_index >= len(questions):
+            return False
+        selected = _selected_option(step_index)
+        return bool(selected and selected.is_other)
+
+    def _answer_for(question_index: int) -> object:
+        question = questions[question_index]
+        selected = _selected_option(question_index)
+        custom = custom_inputs[question_index].strip()
+        if not question.options:
+            return custom or "(no response)"
+        if question.multi_select:
+            chosen = sorted(checked[question_index]) or [selected_indices[question_index]]
+            values: list[str] = []
+            for idx in chosen:
+                option = question.options[idx]
+                if option.is_other:
+                    if custom:
+                        values.append(custom)
+                else:
+                    values.append(option.label)
+            return values or [custom or "(no response)"]
+        if selected and selected.is_other:
+            return custom or ""
+        return selected.label if selected else custom
+
+    def _store_current_answer() -> None:
+        if step_index >= len(questions):
+            return
+        question = questions[step_index]
+        answers[question.question] = _answer_for(step_index)
+
+    def _current_question_complete() -> bool:
+        if step_index >= len(questions):
+            return True
+        return _answer_has_value(_answer_for(step_index))
+
+    def _go_to_submit() -> None:
+        nonlocal step_index
+        if step_index < len(questions):
+            _store_current_answer()
+        for idx, question in enumerate(questions):
+            answers[question.question] = _answer_for(idx)
+        step_index = len(questions)
+
+    def _go_to_next_question() -> None:
+        nonlocal step_index
+        if step_index >= len(questions):
+            return
+        if not _current_question_complete():
+            return
+        _store_current_answer()
+        if step_index + 1 < len(questions):
+            step_index += 1
+        else:
+            _go_to_submit()
+
+    def _go_to_previous_question() -> None:
+        nonlocal step_index
+        if step_index >= len(questions):
+            step_index = max(0, len(questions) - 1)
+            return
+        if step_index > 0:
+            _store_current_answer()
+            step_index -= 1
+
+    def _render_step_nav() -> list[tuple[str, str]]:
+        fragments: list[tuple[str, str]] = [("class:rule", "-" * 72 + "\n")]
+        for idx, question in enumerate(questions):
+            done = _answer_has_value(answers.get(question.question))
+            marker = "[x]" if done else "[ ]"
+            style = "class:active_tab" if idx == step_index else "class:done_tab" if done else "class:tab"
+            fragments.append((style, f"{marker} {question.header}"))
+            fragments.append(("", "   "))
+        style = "class:active_tab" if step_index == len(questions) else "class:tab"
+        fragments.append((style, "Submit"))
+        fragments.append(("", "  ->\n\n"))
+        return fragments
+
+    def _option_lines(question_index: int) -> list[tuple[str, str]]:
+        question = questions[question_index]
+        lines: list[tuple[str, str]] = []
+        for idx, option in enumerate(question.options):
+            is_selected = idx == selected_indices[question_index]
+            style = "class:selected" if is_selected else "class:item"
+            prefix = "> " if is_selected else "  "
+            if question.multi_select:
+                mark = "[x]" if idx in checked[question_index] else "[ ]"
+                label = f"{prefix}{idx + 1}. {mark} {option.label}"
+            elif option.is_other:
+                label = f"{prefix}{idx + 1}. Type something"
+                value = custom_inputs[question_index]
+                if value:
+                    label += f": {value}"
+                elif is_selected:
+                    label += "."
+            else:
+                label = f"{prefix}{idx + 1}. {option.label}"
+            lines.append((style, label))
+            if option.description and not option.is_other:
+                lines.append(("class:desc", f"     {option.description}"))
+        return lines
+
+    def _render_question() -> list[tuple[str, str]]:
+        question = questions[step_index]
+        selected = _selected_option(step_index)
+        fragments = _render_step_nav()
+        fragments.extend([
+            ("class:title", f"{question.question}\n\n"),
+        ])
+        option_lines = _option_lines(step_index)
+        has_preview = (
+            not question.multi_select
+            and any(option.preview for option in question.options)
+        )
+        if not has_preview:
+            for style, text in option_lines:
+                fragments.append((style, text + "\n"))
+        else:
+            left_width = 42
+            right = _preview_box(
+                selected.preview if selected else None,
+                width=60,
+                height=max(3, len(option_lines) - 1),
+            )
+            rows = max(len(option_lines), len(right))
+            for row in range(rows):
+                if row < len(option_lines):
+                    style, text = option_lines[row]
+                    fragments.append((style, _pad_display(_clip_display(text, left_width), left_width)))
+                else:
+                    fragments.append(("", " " * left_width))
+                fragments.append(("", "  "))
+                if row < len(right):
+                    fragments.append(("class:preview", right[row]))
+                fragments.append(("", "\n"))
+            fragments.append(("", "\n"))
+        if _current_custom_active():
+            fragments.append(("class:input_label", "Custom answer: "))
+            fragments.append(("class:input", custom_inputs[step_index] + "|\n"))
+        fragments.append(("", "\n"))
+        fragments.append((
+            "class:hint",
+            "Up/Down or j/k select, type on 'Type something', Tab next, Shift-Tab back, Enter continue.\n",
+        ))
+        return fragments
+
+    def _render_submit() -> list[tuple[str, str]]:
+        fragments = _render_step_nav()
+        fragments.extend([
+            ("class:title", "Review your answers\n\n"),
+        ])
+        for idx, question in enumerate(questions):
+            answer = answers.get(question.question, _answer_for(idx))
+            fragments.extend([
+                ("class:item", f"- {question.question}\n"),
+                ("class:answer", f"  -> {_display_answer(answer)}\n"),
+            ])
+        fragments.extend([
+            ("", "\n"),
+            ("class:hint", "Ready to submit your answers?\n\n"),
+        ])
+        options = ["Submit answers", "Cancel"]
+        for idx, label in enumerate(options):
+            style = "class:selected" if idx == submit_choice else "class:item"
+            prefix = "> " if idx == submit_choice else "  "
+            fragments.append((style, f"{prefix}{idx + 1}. {label}\n"))
+        fragments.append(("", "\n"))
+        fragments.append(("class:hint", "Enter submit, Shift-Tab back to edit.\n"))
+        return fragments
+
+    def _render_ask():
+        if step_index >= len(questions):
+            return _render_submit()
+        return _render_question()
+
+    body = FormattedTextControl(_render_ask, focusable=True, show_cursor=False)
+    kb = KeyBindings()
+
+    def _invalidate(event) -> None:
+        event.app.invalidate()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _move_up(event) -> None:
+        nonlocal submit_choice
+        if _current_custom_active() and event.data in {"j", "k"}:
+            custom_inputs[step_index] += event.data
+            _invalidate(event)
+            return
+        if step_index >= len(questions):
+            submit_choice = (submit_choice - 1) % 2
+            _invalidate(event)
+            return
+        options = _question_options(step_index)
+        if options:
+            selected_indices[step_index] = (selected_indices[step_index] - 1) % len(options)
+        _invalidate(event)
+
+    @kb.add("down")
+    @kb.add("j")
+    def _move_down(event) -> None:
+        nonlocal submit_choice
+        if _current_custom_active() and event.data in {"j", "k"}:
+            custom_inputs[step_index] += event.data
+            _invalidate(event)
+            return
+        if step_index >= len(questions):
+            submit_choice = (submit_choice + 1) % 2
+            _invalidate(event)
+            return
+        options = _question_options(step_index)
+        if options:
+            selected_indices[step_index] = (selected_indices[step_index] + 1) % len(options)
+        _invalidate(event)
+
+    @kb.add("tab")
+    @kb.add("right")
+    def _next(event) -> None:
+        _go_to_next_question()
+        _invalidate(event)
+
+    @kb.add("s-tab")
+    @kb.add("left")
+    def _previous(event) -> None:
+        _go_to_previous_question()
+        _invalidate(event)
+
+    @kb.add(" ")
+    def _toggle(event) -> None:
+        if step_index >= len(questions):
+            return
+        question = questions[step_index]
+        if not question.multi_select:
+            return
+        selected = selected_indices[step_index]
+        if selected in checked[step_index]:
+            checked[step_index].remove(selected)
+        else:
+            checked[step_index].add(selected)
+        _invalidate(event)
+
+    @kb.add("enter")
+    def _accept(event) -> None:
+        if step_index >= len(questions):
+            if submit_choice == 0:
+                for idx, question in enumerate(questions):
+                    answers[question.question] = _answer_for(idx)
+                event.app.exit(result=answers)
+            else:
+                event.app.exit(result={})
+            return
+        _go_to_next_question()
+        _invalidate(event)
+
+    @kb.add("c-h")
+    @kb.add("backspace")
+    def _backspace(event) -> None:
+        if not _current_custom_active():
+            return
+        custom_inputs[step_index] = custom_inputs[step_index][:-1]
+        _invalidate(event)
+
+    @kb.add(Keys.Any)
+    def _type_custom(event) -> None:
+        if not _current_custom_active():
+            return
+        data = event.data
+        if not data or data in {"\r", "\n", "\t"}:
+            return
+        if data == "\x1b":
+            return
+        custom_inputs[step_index] += data
+        _invalidate(event)
+
+    @kb.add("escape")
+    def _jump_to_other(event) -> None:
+        if step_index >= len(questions):
+            return
+        question = questions[step_index]
+        if question.multi_select:
+            for idx, option in enumerate(question.options):
+                if option.is_other:
+                    checked[step_index].add(idx)
+                    selected_indices[step_index] = idx
+                    break
+            _invalidate(event)
+            return
+        for idx, option in enumerate(question.options):
+            if option.is_other:
+                selected_indices[step_index] = idx
+                break
+        _invalidate(event)
+
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        event.app.exit(result={})
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+        style=Style.from_dict({
+            "rule": "ansibrightblack",
+            "tab": "ansibrightblack",
+            "active_tab": "ansiblack bg:ansibrightblue",
+            "done_tab": "ansiwhite",
+            "title": "bold",
+            "hint": "ansibrightblack",
+            "item": "",
+            "desc": "ansibrightblack",
+            "selected": "ansibrightblue bold",
+            "answer": "ansigreen",
+            "preview": "ansiwhite",
+            "input_label": "ansibrightblue",
+            "input": "ansiwhite",
+        }),
+    )
+
+    with patch_stdout():
+        result = await app.run_async()
+    return result or {}
+
+
+async def _run_ask_question(question: AskQuestion) -> str | list[str] | None:
+    if not question.options:
+        return await _ask_free_text(question.question)
+
+    selected_index = 0
+    checked: set[int] = set()
+    has_preview = (
+        not question.multi_select
+        and any(opt.preview for opt in question.options)
+    )
+
+    def _render_ask():
+        selected = question.options[selected_index]
+        fragments: list[tuple[str, str]] = [
+            ("class:header", f"[{question.header}] "),
+            ("class:title", f"{question.question}\n"),
+            ("class:hint", (
+                "Up/Down or j/k select, Enter confirm, Esc free text"
+                + (", Space toggles" if question.multi_select else "")
+                + ".\n\n"
+            )),
+        ]
+        option_lines: list[tuple[str, str]] = []
+        for idx, opt in enumerate(question.options):
+            is_selected = idx == selected_index
+            style = "class:selected" if is_selected else "class:item"
+            prefix = "> " if is_selected else "  "
+            if question.multi_select:
+                mark = "[x]" if idx in checked else "[ ]"
+                label = f"{prefix}{mark} {idx + 1}. {opt.label}"
+            else:
+                label = f"{prefix}{idx + 1}. {opt.label}"
+            option_lines.append((style, label))
+            if opt.description:
+                option_lines.append(("class:desc", f"     {opt.description}"))
+
+        if not has_preview:
+            for style, text in option_lines:
+                fragments.append((style, text + "\n"))
+            return fragments
+
+        left_width = 42
+        left = option_lines
+        right = _preview_box(selected.preview, width=60, height=max(6, len(left) - 2))
+        rows = max(len(left), len(right))
+        for row in range(rows):
+            if row < len(left):
+                style, text = left[row]
+                fragments.append((style, _pad_display(_clip_display(text, left_width), left_width)))
+            else:
+                fragments.append(("", " " * left_width))
+            fragments.append(("", "  "))
+            if row < len(right):
+                fragments.append(("class:preview", right[row]))
+            fragments.append(("", "\n"))
+        return fragments
+
+    body = FormattedTextControl(_render_ask, focusable=True, show_cursor=False)
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _move_up(event) -> None:
+        nonlocal selected_index
+        selected_index = (selected_index - 1) % len(question.options)
+        event.app.invalidate()
+
+    @kb.add("down")
+    @kb.add("j")
+    def _move_down(event) -> None:
+        nonlocal selected_index
+        selected_index = (selected_index + 1) % len(question.options)
+        event.app.invalidate()
+
+    @kb.add(" ")
+    def _toggle(event) -> None:
+        if not question.multi_select:
+            return
+        if selected_index in checked:
+            checked.remove(selected_index)
+        else:
+            checked.add(selected_index)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _accept(event) -> None:
+        if question.multi_select:
+            selected = sorted(checked) or [selected_index]
+            labels = [question.options[idx].label for idx in selected]
+            event.app.exit(result=labels)
+            return
+        event.app.exit(result=question.options[selected_index].label)
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _free_text(event) -> None:
+        event.app.exit(result=None)
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+        style=Style.from_dict({
+            "header": "ansibrightblue bold",
+            "title": "bold",
+            "hint": "ansibrightblack",
+            "item": "",
+            "desc": "ansibrightblack",
+            "selected": "ansibrightblue bold",
+            "preview": "ansiwhite",
+        }),
+    )
+
+    with patch_stdout():
+        return await app.run_async()
+
+
+async def _ask_user_handler(questions: list[AskQuestion]) -> str:
+    """Interactive ask_user prompt with structured option picker."""
+    answers = await _run_ask_questions(questions)
+    return build_ask_user_result(questions, answers)
 _HELP_TEXT = """[bold]Edgebot commands:[/bold]
   /new                Start a new conversation
   /sessions           List saved sessions

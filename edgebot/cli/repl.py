@@ -6,6 +6,7 @@ REPL commands: /new /sessions /resume /compact /memory /dream-log /dream-restore
 
 import asyncio
 import json
+import re
 import shlex
 import time
 from datetime import datetime
@@ -56,6 +57,7 @@ from edgebot.tools.registry import (
     TODO,
     TOOL_HANDLERS,
     TOOLS,
+    set_batch_permission_prompt_handler,
     set_permission_prompt_handler,
 )
 
@@ -121,32 +123,455 @@ async def _interactive_response(label: str, body: str) -> None:
 
 
 async def _permission_prompt(request: dict) -> dict | None:
+    result = await _run_permission_prompt(request)
+    return result if isinstance(result, dict) else {"action": "deny"}
+
+
+async def _batch_permission_prompt(requests: list[dict]) -> dict | None:
+    result = await _run_batch_permission_prompt(requests)
+    return result if isinstance(result, dict) else {"action": "deny_all"}
+
+
+def _permission_title(request: dict) -> str:
+    tool = str(request.get("tool", "")).strip()
+    if tool == "bash":
+        return "Bash command"
+    if tool == "write_file":
+        return "Write file"
+    if tool == "edit_file":
+        return "Edit file"
+    if tool == "background_run":
+        return "Background task"
+    if tool == "web_fetch":
+        return "Web fetch"
+    if tool == "web_search":
+        return "Web search"
+    if tool == "task":
+        return "Subagent"
+    return f"{tool or 'Tool'} request"
+
+
+def _permission_subject(request: dict) -> str:
+    tool = str(request.get("tool", "")).strip()
+    if tool == "bash":
+        return str(request.get("raw_command") or request.get("scope_value") or "").strip()
     message = str(request.get("message", "")).strip()
-    await _interactive_print(
-        lambda c: (
-            c.print("[yellow]Permission required[/yellow]"),
-            c.print(escape(message), highlight=False, soft_wrap=True),
-            c.print("[dim]Allow once: y | session rule: s | persist rule: a | deny: n[/dim]"),
-            c.print(),
-        )
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        return lines[-1]
+    return str(request.get("scope_value") or tool or "this operation").strip()
+
+
+def _permission_description(request: dict) -> str:
+    description = str(request.get("description") or "").strip()
+    if description:
+        return description
+    tool = str(request.get("tool", "")).strip()
+    if tool == "bash":
+        command = _permission_subject(request)
+        if "git reset --hard" in command.lower():
+            return "Reset git history or working tree state (destructive operation)"
+        if re.search(r">\s*\S+", command):
+            return "Write command output to a file"
+        if request.get("requires_confirmation"):
+            return "Sensitive shell operation"
+        return "Shell command requested by Edgebot"
+    if tool in {"write_file", "edit_file"}:
+        return "Modify file contents"
+    if tool == "background_run":
+        return "Start a background command"
+    if tool in {"web_fetch", "web_search"}:
+        return "Network access requested by Edgebot"
+    if tool == "task":
+        return "Start a delegated agent task"
+    return "Sensitive tool operation"
+
+
+def _permission_scope_label(request: dict) -> str:
+    tool = str(request.get("tool", "")).strip()
+    scope = str(request.get("scope_hint") or "allow_tool")
+    subject = _permission_subject(request)
+    if tool == "bash":
+        if scope == "allow_program":
+            program = str(request.get("scope_value") or "").strip()
+            return program or subject or "this command"
+        pattern = _bash_permission_pattern(subject)
+        return pattern or subject or "this command"
+    if tool in {"write_file", "edit_file"}:
+        try:
+            path = Path(subject)
+            if not path.is_absolute():
+                first = path.parts[0] if path.parts else subject
+                return f"{first}{path.anchor or ''} from this project"
+        except (OSError, ValueError):
+            pass
+    return subject or str(request.get("scope_value") or tool or "this tool")
+
+
+def _bash_permission_pattern(command: str) -> str:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return ""
+    head = tokens[0]
+    if head.lower() == "git" and len(tokens) >= 2:
+        return f"git {tokens[1]} *"
+    return f"{head} *"
+
+
+async def _run_permission_prompt(request: dict) -> dict:
+    selected_index = 0
+    save_index = 0
+    mode = "select"
+    feedback = ""
+    tool = str(request.get("tool", "")).strip()
+    subject = _permission_subject(request)
+    amended_subject = subject
+    title = _permission_title(request)
+    description = _permission_description(request)
+    scope = str(request.get("scope_hint") or "allow_tool")
+    scope_label = _permission_scope_label(request)
+    requires_confirmation = bool(request.get("requires_confirmation"))
+    confirmed = not requires_confirmation
+    confirmation_input = ""
+
+    options = [
+        ("Yes", "allow_once"),
+        (f"Yes, and don't ask again for: {scope_label}", "allow_always"),
+        ("No", "deny"),
+    ]
+    save_options = [
+        ("Save to project settings (.claude/settings.json)", "project"),
+        ("Save to user settings (~/.claude/settings.json)", "user"),
+        ("Cancel - don't save, allow once", "cancel"),
+    ]
+
+    def _render_permission():
+        fragments: list[tuple[str, str]] = []
+        if requires_confirmation and not confirmed:
+            fragments.extend([
+                ("class:rule", "-" * 72 + "\n"),
+                ("class:danger", "HIGH RISK COMMAND\n\n"),
+                ("class:title", f"{title}\n\n"),
+                ("class:item", f"    {subject}\n"),
+                ("class:desc", f"    {description}\n\n"),
+                ("class:item", "This command needs an extra confirmation.\n"),
+                ("class:item", "Type the command exactly to continue:\n"),
+                ("class:input_label", "> "),
+                ("class:input", confirmation_input + "|\n\n"),
+                ("class:hint", "Esc to cancel\n"),
+            ])
+            return fragments
+        fragments.extend([
+            ("class:rule", "-" * 72 + "\n"),
+            ("class:header", f"{title}\n\n"),
+            ("class:item", f"    {subject}\n"),
+            ("class:desc", f"    {description}\n\n"),
+        ])
+        if requires_confirmation:
+            fragments.append(("class:danger", "High risk command confirmed.\n\n"))
+        fragments.extend([
+            ("class:item", "This command requires approval\n\n"),
+        ])
+        if mode == "explain":
+            fragments.extend([
+                ("class:item", "Tell Edgebot what to do differently:\n"),
+                ("class:input_label", "> "),
+                ("class:input", feedback + "|\n\n"),
+                ("class:hint", "Enter to send · Esc to cancel\n"),
+            ])
+            return fragments
+        if mode == "save":
+            rule_preview = str(request.get("rule_preview") or scope_label or subject)
+            fragments.extend([
+                ("class:title", "Rule Preview\n\n"),
+                ("class:item", f"    {rule_preview}\n\n"),
+                ("class:desc", "Choose where to save this allow rule.\n\n"),
+            ])
+            for idx, (label, _target) in enumerate(save_options):
+                style = "class:selected" if idx == save_index else "class:item"
+                prefix = "> " if idx == save_index else "  "
+                fragments.append((style, f"{prefix}{idx + 1}. {label}\n"))
+            fragments.extend([
+                ("", "\n"),
+                ("class:hint", "Esc to cancel save · Enter to confirm\n"),
+            ])
+            return fragments
+        if mode == "amend":
+            fragments.extend([
+                ("class:item", "Amend command before running:\n"),
+                ("class:input_label", "> "),
+                ("class:input", amended_subject + "|\n\n"),
+                ("class:hint", "Enter to allow amended command · Esc to cancel\n"),
+            ])
+            return fragments
+        fragments.append(("class:title", "Do you want to proceed?\n"))
+        for idx, (label, _action) in enumerate(options):
+            style = "class:selected" if idx == selected_index else "class:item"
+            prefix = "> " if idx == selected_index else "  "
+            fragments.append((style, f"{prefix}{idx + 1}. {label}\n"))
+        fragments.extend([
+            ("", "\n"),
+            ("class:hint", "Esc to cancel · Tab to amend · ctrl+e to explain\n"),
+        ])
+        return fragments
+
+    body = FormattedTextControl(_render_permission, focusable=True, show_cursor=False)
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _move_up(event) -> None:
+        nonlocal selected_index
+        nonlocal save_index
+        if not confirmed or mode != "select":
+            if confirmed and mode == "save":
+                save_index = (save_index - 1) % len(save_options)
+                event.app.invalidate()
+            return
+        selected_index = (selected_index - 1) % len(options)
+        event.app.invalidate()
+
+    @kb.add("down")
+    @kb.add("j")
+    def _move_down(event) -> None:
+        nonlocal selected_index
+        nonlocal save_index
+        if not confirmed or mode != "select":
+            if confirmed and mode == "save":
+                save_index = (save_index + 1) % len(save_options)
+                event.app.invalidate()
+            return
+        selected_index = (selected_index + 1) % len(options)
+        event.app.invalidate()
+
+    @kb.add("tab")
+    def _amend(event) -> None:
+        nonlocal mode
+        if confirmed:
+            mode = "amend"
+            event.app.invalidate()
+
+    @kb.add("c-e")
+    def _explain(event) -> None:
+        nonlocal mode
+        if confirmed:
+            mode = "explain"
+            event.app.invalidate()
+
+    @kb.add("enter")
+    def _accept(event) -> None:
+        nonlocal confirmed
+        nonlocal mode
+        if requires_confirmation and not confirmed:
+            if confirmation_input == subject:
+                confirmed = True
+                event.app.invalidate()
+            else:
+                event.app.exit(result={"action": "deny"})
+            return
+        if mode == "explain":
+            event.app.exit(result={
+                "action": "deny",
+                "feedback": feedback.strip(),
+            })
+            return
+        if mode == "save":
+            target = save_options[save_index][1]
+            if target == "cancel":
+                event.app.exit(result={"action": "allow"})
+                return
+            event.app.exit(result={
+                "action": "allow",
+                "scope": scope,
+                "persist": True,
+                "save_target": target,
+            })
+            return
+        if mode == "amend":
+            updated = amended_subject.strip()
+            if not updated:
+                event.app.exit(result={"action": "deny"})
+                return
+            raw_params = request.get("params")
+            updated_params = dict(raw_params) if isinstance(raw_params, dict) else {}
+            result = {"action": "allow"}
+            if tool in {"bash", "background_run"}:
+                updated_params["command"] = updated
+            else:
+                updated_params["path"] = updated
+            result["updated_params"] = updated_params
+            event.app.exit(result=result)
+            return
+        action = options[selected_index][1]
+        if action == "allow_once":
+            event.app.exit(result={"action": "allow"})
+        elif action == "allow_always":
+            mode = "save"
+            event.app.invalidate()
+        else:
+            event.app.exit(result={"action": "deny"})
+
+    @kb.add("c-h")
+    @kb.add("backspace")
+    def _backspace(event) -> None:
+        nonlocal feedback
+        nonlocal confirmation_input
+        nonlocal amended_subject
+        if requires_confirmation and not confirmed:
+            confirmation_input = confirmation_input[:-1]
+            event.app.invalidate()
+            return
+        if mode == "explain":
+            feedback = feedback[:-1]
+            event.app.invalidate()
+            return
+        if mode == "amend":
+            amended_subject = amended_subject[:-1]
+            event.app.invalidate()
+
+    @kb.add(Keys.Any)
+    def _type_text(event) -> None:
+        nonlocal feedback
+        nonlocal confirmation_input
+        nonlocal amended_subject
+        data = event.data
+        if not data or data in {"\r", "\n", "\t", "\x1b"}:
+            return
+        if requires_confirmation and not confirmed:
+            confirmation_input += data
+            event.app.invalidate()
+            return
+        if mode == "explain":
+            feedback += data
+            event.app.invalidate()
+            return
+        if mode == "amend":
+            amended_subject += data
+            event.app.invalidate()
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        if mode == "save":
+            event.app.exit(result={"action": "allow"})
+            return
+        event.app.exit(result={"action": "deny"})
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+        style=Style.from_dict({
+            "rule": "ansibrightblue",
+            "header": "ansibrightblue bold",
+            "title": "bold",
+            "hint": "ansibrightblack",
+            "item": "",
+            "desc": "ansibrightblack",
+            "selected": "ansibrightblue bold",
+            "danger": "ansired bold",
+            "input_label": "ansibrightblue",
+            "input": "ansiwhite",
+        }),
     )
 
-    while True:
-        with patch_stdout():
-            line = await _prompt().prompt_async(
-                HTML("<b><ansiyellow>Approval:</ansiyellow></b> ")
-            )
-        choice = (line or "").strip().lower()
-        if choice in {"y", "yes"}:
-            return {"action": "allow"}
-        scope = str(request.get("scope_hint") or "allow_tool")
-        if choice in {"s", "session"}:
-            return {"action": "allow", "scope": scope, "persist": False}
-        if choice in {"a", "always"}:
-            return {"action": "allow", "scope": scope, "persist": True}
-        if choice in {"n", "no", ""}:
-            return {"action": "deny"}
-        await _interactive_notice("Use y / s / a / n.")
+    with patch_stdout():
+        result = await app.run_async()
+    return result or {"action": "deny"}
+
+
+async def _run_batch_permission_prompt(requests: list[dict]) -> dict:
+    selected_index = 0
+    options = [
+        ("Approve ALL", "allow_all"),
+        ("Deny ALL", "deny_all"),
+        ("Review one-by-one", "review_one_by_one"),
+    ]
+    total = len(requests)
+
+    def _request_summary(index: int, request: dict) -> tuple[str, str]:
+        title = _permission_title(request)
+        subject = _permission_subject(request)
+        if not subject:
+            subject = str(request.get("message") or "").strip().splitlines()[-1:] or ["this operation"]
+            subject = str(subject[0]).strip()
+        return title, subject
+
+    def _render_batch_permission():
+        fragments: list[tuple[str, str]] = [
+            ("class:rule", "-" * 72 + "\n"),
+            ("class:header", f"{total} Permissions Required\n\n"),
+        ]
+        for idx, request in enumerate(requests, 1):
+            title, subject = _request_summary(idx, request)
+            fragments.extend([
+                ("class:title", f"[{idx}/{total}] {title}\n"),
+                ("class:item", f"    {subject}\n"),
+            ])
+            description = _permission_description(request)
+            if description:
+                fragments.append(("class:desc", f"    {description}\n"))
+            fragments.append(("", "\n"))
+        fragments.append(("class:title", "How do you want to proceed?\n"))
+        for idx, (label, _action) in enumerate(options):
+            style = "class:selected" if idx == selected_index else "class:item"
+            prefix = "> " if idx == selected_index else "  "
+            fragments.append((style, f"{prefix}{idx + 1}. {label}\n"))
+        fragments.extend([
+            ("", "\n"),
+            ("class:hint", "Esc to deny all · ↑↓/jk to navigate · Enter to confirm\n"),
+        ])
+        return fragments
+
+    body = FormattedTextControl(_render_batch_permission, focusable=True, show_cursor=False)
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _move_up(event) -> None:
+        nonlocal selected_index
+        selected_index = (selected_index - 1) % len(options)
+        event.app.invalidate()
+
+    @kb.add("down")
+    @kb.add("j")
+    def _move_down(event) -> None:
+        nonlocal selected_index
+        selected_index = (selected_index + 1) % len(options)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _accept(event) -> None:
+        event.app.exit(result={"action": options[selected_index][1]})
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        event.app.exit(result={"action": "deny_all"})
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=body, always_hide_cursor=True)])),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+        style=Style.from_dict({
+            "rule": "ansibrightblue",
+            "header": "ansibrightblue bold",
+            "title": "bold",
+            "hint": "ansibrightblack",
+            "item": "",
+            "desc": "ansibrightblack",
+            "selected": "ansibrightblue bold",
+        }),
+    )
+
+    with patch_stdout():
+        result = await app.run_async()
+    return result or {"action": "deny_all"}
 
 
 def _display_width(text: str) -> int:
@@ -1331,6 +1756,7 @@ async def main():
         all_handlers.update(mcp_client.tool_handlers)
         _render_mcp_startup(mcp_client)
     set_permission_prompt_handler(_permission_prompt)
+    set_batch_permission_prompt_handler(_batch_permission_prompt)
     set_ask_handler(_ask_user_handler)
 
     async def _run_background_turn(
@@ -1746,6 +2172,7 @@ async def main():
 
     finally:
         set_permission_prompt_handler(None)
+        set_batch_permission_prompt_handler(None)
         set_ask_handler(None)
         await heartbeat.stop()
         await CRON.stop()

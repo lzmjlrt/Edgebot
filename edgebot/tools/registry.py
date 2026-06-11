@@ -44,6 +44,11 @@ def set_permission_prompt_handler(handler) -> None:
     PERMISSIONS.set_prompt_handler(handler)
 
 
+def set_batch_permission_prompt_handler(handler) -> None:
+    """Register an async batch permission prompt handler for interactive sessions."""
+    PERMISSIONS.set_batch_prompt_handler(handler)
+
+
 def prepare_call(name: str, params: dict) -> tuple[object | None, dict, str | None]:
     """Resolve a tool and validate its parameters before execution."""
     if not isinstance(params, dict):
@@ -105,6 +110,7 @@ def init_builtin_tools() -> None:
     )
     from edgebot.tools.builtin.skills import LoadSkillTool
     from edgebot.tools.builtin.ask import AskUserTool
+    from edgebot.tools.builtin.web import WebFetchTool, WebSearchTool
     from edgebot.tools.builtin.subagent import (
         CheckSubagentTool,
         ControlSubagentTool,
@@ -128,6 +134,8 @@ def init_builtin_tools() -> None:
         TaskTool(),
         TodoWriteTool(),
         LoadSkillTool(),
+        WebFetchTool(),
+        WebSearchTool(),
         BackgroundRunTool(),
         CheckBackgroundTool(),
         CheckSubagentTool(),

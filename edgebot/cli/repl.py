@@ -1634,6 +1634,15 @@ def _resolve_session_summary(state: dict) -> str | None:
     return extract_session_summary(state.get("messages", []))
 
 
+def load_session_for_resume(
+    store: SessionStore,
+    session_key: str,
+) -> tuple[list[dict], str | None]:
+    """Load persisted session history and summary for /resume."""
+    state = store.load_state(session_key)
+    return list(state["messages"]), _resolve_session_summary(state)
+
+
 async def _pick_session_interactive(
     sessions: list[dict],
     *,
@@ -1996,24 +2005,11 @@ async def main():
                                 break
                 if target:
                     session_key = target["key"]
-                    state = store.load_state(session_key)
-                    history[:] = state["messages"]
-                    session_summary = _resolve_session_summary(state)
-
-                    idle_minutes = (time.time() - target["updated_at"].timestamp()) / 60
-                    if history and idle_minutes > 60 and len(history) > 10:
-                        console.print(
-                            f"[dim]  Idle {int(idle_minutes)}m — compressing older history...[/dim]"
-                        )
-                        history[:] = await auto_compact(
-                            history,
-                            is_idle=True,
-                            idle_minutes=idle_minutes,
-                            memory_store=_MEMORY,
-                        )
-                        store.save_all(session_key, history)
-                        session_summary = extract_session_summary(history)
-                        store.update_metadata(session_key, session_summary=session_summary or "")
+                    loaded_history, session_summary = load_session_for_resume(
+                        store,
+                        session_key,
+                    )
+                    history[:] = loaded_history
 
                     if history:
                         _render_history(history)

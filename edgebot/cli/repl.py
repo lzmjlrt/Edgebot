@@ -47,6 +47,11 @@ from edgebot.cron.types import CronJob, CronPayload
 from edgebot.heartbeat.service import HeartbeatService
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
+from edgebot.cli.slash_autocomplete import (
+    SlashCommandCompleter,
+    build_default_slash_registry,
+    resolve_skill_slash_prompt,
+)
 from edgebot.tools.builtin.ask import AskOption, AskQuestion, build_ask_user_result, set_ask_handler
 from edgebot.tools.registry import (
     BG,
@@ -72,7 +77,12 @@ _prompt_session: PromptSession | None = None
 def _prompt() -> PromptSession:
     global _prompt_session
     if _prompt_session is None:
-        _prompt_session = PromptSession(history=FileHistory(str(_HISTORY_PATH)))
+        _prompt_session = PromptSession(
+            history=FileHistory(str(_HISTORY_PATH)),
+            completer=SlashCommandCompleter(lambda: build_default_slash_registry(SKILLS)),
+            complete_while_typing=True,
+            reserve_space_for_menu=10,
+        )
     return _prompt_session
 
 
@@ -1883,6 +1893,7 @@ async def main():
                 continue
             if query.lower() in ("exit", "quit", "/exit", "/quit"):
                 break
+            agent_query = query
 
             # ---- REPL commands ----
             if query == "/help":
@@ -2137,14 +2148,17 @@ async def main():
                 console.print(json.dumps(PERMISSIONS.list_rules(), indent=2, ensure_ascii=False))
                 continue
 
-            if query.startswith("/"):
+            skill_prompt = resolve_skill_slash_prompt(query, SKILLS)
+            if skill_prompt:
+                agent_query = skill_prompt
+            elif query.startswith("/"):
                 console.print(f"[dim]  Unknown command: {query}[/dim]")
                 console.print("[dim]  Commands: /new /sessions /resume /compact /memory /dream-log /dream-restore /cron /heartbeat /mcp /tasks /bg /subagents /permissions /status /help[/dim]")
                 continue
 
             # ---- Normal message ----
             system = build_system_prompt(session_key=session_key)
-            user_msg = {"role": "user", "content": query}
+            user_msg = {"role": "user", "content": agent_query}
             store.update_metadata(session_key, pending_user_turn=True)
             history.append(user_msg)
             store.append(session_key, user_msg)

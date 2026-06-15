@@ -262,6 +262,7 @@ async def agent_loop(
         max_iterations=200,
         max_tokens=_RUN_MAX_COMPLETION_TOKENS,
         max_input_tokens=max_input_tokens,
+        temperature=provider.generation.temperature,
         session_key=session_key,
         tool_result_root=RUNTIME_DIR / "tool-results",
         retry_mode="standard",

@@ -12,10 +12,14 @@ from typing import Any
 
 from edgebot.config import (
     AGENTS_MD_PATH,
+    API_BASE,
+    GENERATION_TEMPERATURE,
     HEARTBEAT_MD_PATH,
     LEGACY_SKILLS_DIR,
     MCP_CONFIG_PATH,
+    MODEL,
     RUNTIME_DIR,
+    RUNTIME_CONFIG_ENV,
     SKILLS_DIR,
     SOUL_MD_PATH,
     TOOLS_MD_PATH,
@@ -42,12 +46,39 @@ _SESSION_SUMMARY_HEADING = "## Session Summary"
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 
 
+def _seed_runtime_config() -> None:
+    if RUNTIME_CONFIG_ENV.exists():
+        return
+    lines = [
+        "# Workspace-local Edgebot LLM settings.",
+        "# Values here override the workspace .env on the next Edgebot start.",
+        f"MODEL_ID={MODEL}",
+        "# API_KEY=your-api-key-here",
+    ]
+    if API_BASE:
+        lines.append(f"API_BASE={API_BASE}")
+    else:
+        lines.append("# API_BASE=https://api.example.com/v1")
+    lines.extend([
+        f"TEMPERATURE={GENERATION_TEMPERATURE}",
+        "",
+        "# Kimi K2.7 Code example:",
+        "# MODEL_ID=moonshot/kimi-k2.7-code",
+        "# API_BASE=https://api.moonshot.cn/v1",
+        "# TEMPERATURE=1.0",
+        "",
+    ])
+    RUNTIME_CONFIG_ENV.write_text("\n".join(lines), encoding="utf-8")
+    print("[setup] Created .edgebot/config.env")
+
+
 def seed_workspace_templates() -> None:
     """
     Copy default template files to the workspace if they don't already exist.
     Called once at startup — never overwrites user-edited files.
     """
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    _seed_runtime_config()
 
     for filename in BOOTSTRAP_FILES + _SEEDED_ONLY_FILES:
         src = _TEMPLATES_DIR / filename

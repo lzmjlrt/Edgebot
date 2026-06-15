@@ -17,7 +17,7 @@ from litellm import exceptions as _litellm_exc
 
 litellm.suppress_debug_info = True
 
-from edgebot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from edgebot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
 
 
 class LiteLLMProvider(LLMProvider):
@@ -28,9 +28,12 @@ class LiteLLMProvider(LLMProvider):
         api_key: str,
         model: str,
         api_base: str | None = None,
+        generation: GenerationSettings | None = None,
     ):
         super().__init__(api_key=api_key, api_base=api_base)
         self._model = model
+        if generation is not None:
+            self.generation = generation
 
     def get_default_model(self) -> str:
         return self._model
@@ -45,12 +48,13 @@ class LiteLLMProvider(LLMProvider):
     ) -> LLMResponse:
         safe_messages = self.enforce_role_alternation(messages)
         try:
+            request_model = model or self._model
             resp = await litellm.acompletion(
-                model=model or self._model,
+                model=request_model,
                 messages=safe_messages,
                 tools=tools,
                 max_tokens=max_tokens,
-                temperature=temperature,
+                temperature=_effective_temperature(request_model, temperature),
                 api_key=self.api_key,
                 api_base=self.api_base,
             )
@@ -69,12 +73,13 @@ class LiteLLMProvider(LLMProvider):
     ) -> LLMResponse:
         safe_messages = self.enforce_role_alternation(messages)
         try:
+            request_model = model or self._model
             stream = await litellm.acompletion(
-                model=model or self._model,
+                model=request_model,
                 messages=safe_messages,
                 tools=tools,
                 max_tokens=max_tokens,
-                temperature=temperature,
+                temperature=_effective_temperature(request_model, temperature),
                 api_key=self.api_key,
                 api_base=self.api_base,
                 stream=True,
@@ -332,3 +337,11 @@ def _parse_json(raw: str) -> dict[str, Any]:
         except Exception:
             return {}
     return result if isinstance(result, dict) else {}
+
+
+def _effective_temperature(model: str | None, temperature: float) -> float:
+    """Normalize generation params for providers with fixed model constraints."""
+    normalized = (model or "").lower()
+    if normalized in {"moonshot/kimi-k2.7-code", "kimi-k2.7-code"}:
+        return 1.0
+    return temperature

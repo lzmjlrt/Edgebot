@@ -18,8 +18,22 @@ class ConfigError(RuntimeError):
 
 WORKDIR = Path.cwd()
 WORKDIR_ENV = WORKDIR / ".env"
+RUNTIME_DIR = WORKDIR / ".edgebot"
+RUNTIME_CONFIG_ENV = RUNTIME_DIR / "config.env"
 if WORKDIR_ENV.exists():
     load_dotenv(dotenv_path=WORKDIR_ENV, override=True)
+if RUNTIME_CONFIG_ENV.exists():
+    load_dotenv(dotenv_path=RUNTIME_CONFIG_ENV, override=True)
+
+
+def _get_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid {name}: expected a number, got {raw!r}.") from exc
 
 # --- LLM settings ---
 # litellm uses provider-prefixed model names, e.g.:
@@ -35,11 +49,11 @@ except KeyError as exc:
         f"Set it in the environment or create {env_hint} with MODEL_ID and API_KEY."
     ) from exc
 API_BASE = os.getenv("API_BASE")  # optional, for proxies or custom endpoints
+GENERATION_TEMPERATURE = _get_float_env("TEMPERATURE", 0.7)
 
 # --- Workspace paths ---
 TASKS_DIR = WORKDIR / ".tasks"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-RUNTIME_DIR = WORKDIR / ".edgebot"
 SKILLS_DIR = RUNTIME_DIR / "skills"
 MEMORY_DIR = RUNTIME_DIR / "memory"
 CRON_DIR = RUNTIME_DIR / "cron"
@@ -75,10 +89,12 @@ def create_provider():
     global _PROVIDER
     if _PROVIDER is not None:
         return _PROVIDER
+    from edgebot.providers.base import GenerationSettings
     from edgebot.providers.litellm_provider import LiteLLMProvider
     _PROVIDER = LiteLLMProvider(
         api_key=API_KEY,
         model=MODEL,
         api_base=API_BASE,
+        generation=GenerationSettings(temperature=GENERATION_TEMPERATURE),
     )
     return _PROVIDER

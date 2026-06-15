@@ -390,6 +390,7 @@ class SubagentRunner:
             model=MODEL,
             max_iterations=_MAX_TURNS,
             max_tokens=8000,
+            temperature=provider.generation.temperature,
             retry_mode="standard",
             emit_output=False,
             assistant_label=f"subagent[{rec['capability']}]",

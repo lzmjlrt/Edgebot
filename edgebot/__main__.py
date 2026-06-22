@@ -4,8 +4,24 @@ import asyncio
 import sys
 
 
+def _usage_error(message: str) -> None:
+    print(message, file=sys.stderr)
+    print('Usage: edgebot exec "<instruction>"', file=sys.stderr)
+    sys.exit(2)
+
+
 def main() -> None:
-    """Run the interactive Edgebot CLI."""
+    """Run the interactive Edgebot CLI or a non-interactive command."""
+    if len(sys.argv) > 1 and sys.argv[1] == "exec":
+        if len(sys.argv) < 3 or not sys.argv[2].strip():
+            _usage_error("Missing instruction for edgebot exec.")
+        from edgebot.cli.exec_once import exec_main
+
+        output = asyncio.run(exec_main(sys.argv[2]))
+        if output:
+            print(output)
+        return
+
     try:
         from edgebot.cli.repl import main as repl_main
     except Exception as exc:

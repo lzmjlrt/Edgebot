@@ -238,3 +238,7 @@ skills/summarize/SKILL.md
 AGENTS.md
 ARCHITECTURE.md
 update_log/
+study_md/
+docs/
+.agents/
+.edge-debug-profile/

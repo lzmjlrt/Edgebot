@@ -180,14 +180,21 @@ Sensitive tools (`bash`, `write_file`, `edit_file`, `background_run`) go through
 - **`workspace_write_auto_allow`**: writes/edits whose path resolves under the current workspace are auto-allowed; writes outside still prompt.
 - **Chain-aware bash parsing**: `cd X && cmd` / `cmd1 | cmd2` / Windows `for %f in (...) do cmd` are split into segments; every segment's program must be allowed (so `cd X && rm -rf .` is still blocked even though `cd` is transparent).
 
-When a prompt is needed, the REPL offers four choices:
+When a prompt is needed, the REPL shows a prompt_toolkit picker with the
+requested command or file operation, a short risk description, and three
+choices:
 
-| Key | Effect |
-|-----|--------|
-| `y` | Allow this one call |
-| `s` | Allow for this session (adds to in-memory rules) |
-| `a` | Allow and persist to `.edgebot/permissions.json` |
-| `n` | Deny |
+| Choice | Effect |
+|--------|--------|
+| `Yes` | Allow this one call |
+| `Yes, and don't ask again for ...` | Allow and persist the suggested rule to `.edgebot/permissions.json` |
+| `No` | Deny |
+
+Use `Up/Down` or `j/k` to move, `Enter` to confirm, `Esc` to deny,
+`Ctrl+E` to deny with feedback for the agent, and `Tab` to amend the
+operation before allowing it. High-risk shell commands
+such as `git reset --hard`, recursive deletes, `sudo`, and pipe-to-shell
+patterns require typing the full command before the normal picker appears.
 
 Inspect the current ruleset anytime with `/permissions`.
 

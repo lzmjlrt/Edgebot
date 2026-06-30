@@ -79,6 +79,7 @@ class AgentRunResult:
     tool_names_used: list[str] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
     stop_reason: str = "completed"
+    new_messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentRunner:
@@ -88,7 +89,8 @@ class AgentRunner:
         self.provider = provider
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        messages = list(spec.initial_messages)
+        messages = [dict(message) for message in spec.initial_messages]
+        new_messages: list[dict[str, Any]] = []
         final_content: str | None = None
         tools_used: list[str] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -97,14 +99,16 @@ class AgentRunner:
         length_recoveries = 0
         context_emergency_compacts = 0
 
+        def append_message(message: dict[str, Any]) -> dict[str, Any]:
+            stored = dict(message)
+            messages.append(stored)
+            new_messages.append(stored)
+            return stored
+
         for iteration in range(spec.max_iterations):
-            # Context governance: clean up any inconsistencies from
-            # checkpoint recovery or earlier microcompact passes.
-            messages = _drop_orphan_tool_results(messages)
-            messages = _backfill_missing_tool_results(messages)
-            messages = _microcompact(messages)
-            governed_messages = _apply_tool_result_budget(messages, spec)
-            call_messages = _apply_input_token_budget(governed_messages, spec)
+            # Context governance is model-facing only. Synthetic repair
+            # messages must not shift the persisted append boundary.
+            call_messages = _prepare_messages_for_model(messages, spec)
 
             # Streaming LLM call via provider
             first_delta = True
@@ -161,6 +165,7 @@ class AgentRunner:
                     tool_names_used=tools_used,
                     usage=usage,
                     stop_reason="error",
+                    new_messages=list(new_messages),
                 )
             finally:
                 if status:
@@ -206,6 +211,7 @@ class AgentRunner:
                         tool_names_used=tools_used,
                         usage=usage,
                         stop_reason="error",
+                        new_messages=list(new_messages),
                     )
                 empty_content_retries = 0
                 continue
@@ -226,11 +232,11 @@ class AgentRunner:
                         f"{_MAX_LENGTH_RECOVERIES})[/dim yellow]"
                     )
                 if response.content and response.content.strip():
-                    messages.append({
+                    append_message({
                         "role": "assistant",
                         "content": response.content,
                     })
-                messages.append({
+                append_message({
                     "role": "user",
                     "content": _LENGTH_RECOVERY_PROMPT,
                 })
@@ -247,7 +253,7 @@ class AgentRunner:
                     "content": response.content or None,
                     "tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
                 }
-                messages.append(asst_msg)
+                asst_msg = append_message(asst_msg)
                 tools_used.extend(tc.name for tc in response.tool_calls)
 
                 await _emit_checkpoint(spec, {
@@ -315,7 +321,7 @@ class AgentRunner:
                         "name": tool_name,
                         "content": output,
                     }
-                    messages.append(tool_msg)
+                    tool_msg = append_message(tool_msg)
                     completed_results.append(tool_msg)
 
                 await _emit_checkpoint(spec, {
@@ -330,7 +336,8 @@ class AgentRunner:
                 if spec.injection_callback is not None:
                     injected = await spec.injection_callback()
                     if injected:
-                        messages.extend(injected)
+                        for message in injected:
+                            append_message(message)
 
                 empty_content_retries = 0
                 continue
@@ -359,8 +366,9 @@ class AgentRunner:
                 injected_messages = await spec.injection_callback()
             if injected_messages:
                 if final_content:
-                    messages.append({"role": "assistant", "content": final_content})
-                messages.extend(injected_messages)
+                    append_message({"role": "assistant", "content": final_content})
+                for message in injected_messages:
+                    append_message(message)
                 if spec.on_stream_end is not None:
                     await spec.on_stream_end(resuming=True)
                 empty_content_retries = 0
@@ -371,7 +379,7 @@ class AgentRunner:
                 await spec.on_stream_end(resuming=False)
 
             if final_content:
-                messages.append({"role": "assistant", "content": final_content})
+                append_message({"role": "assistant", "content": final_content})
 
             await _emit_checkpoint(spec, {
                 "phase": "final_response",
@@ -386,7 +394,7 @@ class AgentRunner:
             final_content = (
                 f"Max iterations ({spec.max_iterations}) reached."
             )
-            messages.append({"role": "assistant", "content": final_content})
+            append_message({"role": "assistant", "content": final_content})
 
         return AgentRunResult(
             final_content=final_content,
@@ -394,6 +402,7 @@ class AgentRunner:
             tool_names_used=tools_used,
             usage=usage,
             stop_reason=stop_reason,
+            new_messages=list(new_messages),
         )
 
 
@@ -415,6 +424,19 @@ async def _emit_checkpoint(spec: AgentRunSpec, payload: dict[str, Any]) -> None:
 
 
 # ---- Context governance ----
+
+
+def _prepare_messages_for_model(
+    messages: list[dict[str, Any]],
+    spec: AgentRunSpec,
+) -> list[dict[str, Any]]:
+    """Return a governed request copy without changing the persisted transcript."""
+    model_messages = [dict(message) for message in messages]
+    model_messages = _drop_orphan_tool_results(model_messages)
+    model_messages = _backfill_missing_tool_results(model_messages)
+    model_messages = _microcompact(model_messages)
+    governed_messages = _apply_tool_result_budget(model_messages, spec)
+    return _apply_input_token_budget(governed_messages, spec)
 
 
 def _drop_orphan_tool_results(

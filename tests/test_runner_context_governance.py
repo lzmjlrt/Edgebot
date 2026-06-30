@@ -91,6 +91,33 @@ def test_runner_tool_result_budget_compacts_old_results_for_model_request() -> N
     assert result.messages[2]["content"] == old_tool_output
 
 
+def test_runner_new_messages_exclude_model_facing_backfills() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old command"},
+        {"role": "assistant", "content": None, "tool_calls": [_tool_call("call_lost", "bash")]},
+        {"role": "user", "content": "current"},
+    ]
+    provider = CapturingProvider([LLMResponse(content="final", finish_reason="stop")])
+
+    result = asyncio.run(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=messages,
+        provider=provider,
+        tools=[],
+        tool_handlers={},
+        model="test-model",
+        max_iterations=1,
+        emit_output=False,
+    )))
+
+    assert any(
+        msg.get("role") == "tool" and msg.get("tool_call_id") == "call_lost"
+        for msg in provider.calls[0]
+    )
+    assert result.messages[:len(messages)] == messages
+    assert result.new_messages == [{"role": "assistant", "content": "final"}]
+
+
 def test_input_budget_drops_trailing_tool_call_without_result() -> None:
     messages = [
         {"role": "system", "content": "system"},

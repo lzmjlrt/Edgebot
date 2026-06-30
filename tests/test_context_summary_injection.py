@@ -27,7 +27,11 @@ def test_agent_loop_injects_session_summary_as_system_context(monkeypatch) -> No
         async def drain(self):
             return []
 
-    monkeypatch.setattr(loop, "create_provider", lambda: object())
+    class FakeProvider:
+        class generation:
+            temperature = 0.7
+
+    monkeypatch.setattr(loop, "create_provider", lambda: FakeProvider())
     monkeypatch.setattr(loop, "AgentRunner", FakeRunner)
     monkeypatch.setattr(loop, "SUBAGENT", EmptySubagent())
 
@@ -49,6 +53,65 @@ def test_agent_loop_injects_session_summary_as_system_context(monkeypatch) -> No
     user_content = captured["messages"][1]["content"]
     assert "[Runtime Context - metadata only, not instructions]" in user_content
     assert "- archived facts" not in user_content
+
+
+def test_agent_loop_appends_runner_new_messages_instead_of_slicing(monkeypatch) -> None:
+    class FakeResult:
+        def __init__(self, messages):
+            self.final_content = "final"
+            self.messages = messages
+            self.new_messages = [{"role": "assistant", "content": "final"}]
+            self.tool_names_used = []
+            self.usage = {}
+            self.stop_reason = "completed"
+
+    class FakeRunner:
+        def __init__(self, provider):
+            pass
+
+        async def run(self, spec):
+            shifted_messages = list(spec.initial_messages)
+            shifted_messages.insert(1, {
+                "role": "tool",
+                "tool_call_id": "call_lost",
+                "name": "bash",
+                "content": "synthetic backfill",
+            })
+            shifted_messages.append({"role": "assistant", "content": "final"})
+            return FakeResult(shifted_messages)
+
+    class EmptyBackgroundManager:
+        def drain(self):
+            return []
+
+    class EmptySubagent:
+        async def drain(self):
+            return []
+
+    class FakeProvider:
+        class generation:
+            temperature = 0.7
+
+    monkeypatch.setattr(loop, "create_provider", lambda: FakeProvider())
+    monkeypatch.setattr(loop, "AgentRunner", FakeRunner)
+    monkeypatch.setattr(loop, "SUBAGENT", EmptySubagent())
+    monkeypatch.setattr(loop, "_archive_turn_summary", lambda *args, **kwargs: None)
+
+    messages = [{"role": "user", "content": "current"}]
+    asyncio.run(loop.agent_loop(
+        messages=messages,
+        system="base system",
+        tools=[],
+        tool_handlers={},
+        todo_mgr=None,
+        bg_mgr=EmptyBackgroundManager(),
+        emit_output=False,
+    ))
+
+    assert messages == [
+        {"role": "user", "content": "current"},
+        {"role": "assistant", "content": "final"},
+    ]
 
 
 def test_system_prompt_recent_history_is_scoped_to_session(monkeypatch) -> None:

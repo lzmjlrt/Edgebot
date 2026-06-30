@@ -289,8 +289,7 @@ async def agent_loop(
             )
 
     # ---- Extract new messages from the runner result ----
-    original_count = len(call_messages)
-    new_msgs = result.messages[original_count:]
+    new_msgs = [dict(message) for message in result.new_messages]
 
     # Update the caller's messages list
     messages.extend(new_msgs)

@@ -35,6 +35,20 @@ def _get_float_env(name: str, default: float) -> float:
     except ValueError as exc:
         raise ConfigError(f"Invalid {name}: expected a number, got {raw!r}.") from exc
 
+
+def _get_int_env(name: str, default: int, *, minimum: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"Invalid {name}: expected an integer, got {raw!r}.") from exc
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"Invalid {name}: expected at least {minimum}, got {value}.")
+    return value
+
 # --- LLM settings ---
 # litellm uses provider-prefixed model names, e.g.:
 #   anthropic/claude-3-5-sonnet  openai/gpt-4o  ollama/llama3  deepseek/deepseek-chat
@@ -79,6 +93,11 @@ IDLE_TIMEOUT = 60
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL_SECONDS", "21600"))
 IDLE_COMPACT_MINUTES = int(os.getenv("IDLE_COMPACT_MINUTES", "0"))
+MAX_CONCURRENT_SUBAGENTS = _get_int_env(
+    "EDGEBOT_MAX_CONCURRENT_SUBAGENTS",
+    1,
+    minimum=1,
+)
 
 # --- Provider singleton ---
 _PROVIDER = None

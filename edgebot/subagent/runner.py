@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from edgebot.config import MODEL, SUBAGENT_DIR, create_provider
+from edgebot.config import MAX_CONCURRENT_SUBAGENTS, MODEL, SUBAGENT_DIR, create_provider
 from edgebot.subagent.capabilities import CAPABILITIES
 
 _MAX_TURNS = 20
@@ -32,8 +32,14 @@ _TERMINAL_STATUSES = {"completed", "failed", "stopped"}
 class SubagentRunner:
     """Manage isolated subagent runs as explicit local_agent tasks."""
 
-    def __init__(self, root_dir: Path | None = None):
+    def __init__(
+        self,
+        root_dir: Path | None = None,
+        *,
+        max_concurrent_subagents: int | None = None,
+    ):
         self.root_dir = Path(root_dir or SUBAGENT_DIR)
+        self.max_concurrent_subagents = max(1, max_concurrent_subagents or MAX_CONCURRENT_SUBAGENTS)
         self.transcript_dir = self.root_dir / "transcripts"
         self.output_dir = self.root_dir / "outputs"
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -159,6 +165,25 @@ class SubagentRunner:
                 rec["result"] = rec["partial_result"] or ""
         self._finalize_record(rec)
 
+    def get_running_count(self) -> int:
+        """Return the number of non-terminal subagents still executing."""
+        running = 0
+        for rec in self._tasks.values():
+            if rec.get("status") in _TERMINAL_STATUSES:
+                continue
+            runner_task = rec.get("runner_task")
+            if runner_task is not None and not runner_task.done():
+                running += 1
+        return running
+
+    def _limit_error(self, running: int) -> dict[str, Any]:
+        return {
+            "error": "subagent concurrency limit reached",
+            "running": running,
+            "limit": self.max_concurrent_subagents,
+            "message": "Wait for a running subagent to complete before spawning a new one.",
+        }
+
     def spawn(
         self,
         capability: str,
@@ -178,6 +203,10 @@ class SubagentRunner:
         existing = self._tasks.get(task_id)
         if existing and existing["status"] not in _TERMINAL_STATUSES:
             return {"error": f"task_id '{task_id}' already running"}
+
+        running = self.get_running_count()
+        if running >= self.max_concurrent_subagents:
+            return self._limit_error(running)
 
         transcript_file = self.transcript_dir / f"{task_id}.jsonl"
         output_file = self.output_dir / f"{task_id}.txt"

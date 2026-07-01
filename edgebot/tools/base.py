@@ -7,14 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from edgebot.config import WORKDIR
+from edgebot.security.workspace_policy import _require_workspace_path
 
 
 def safe_path(p: str) -> Path:
     """Resolve a path and ensure it stays inside WORKDIR."""
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+    return _require_workspace_path(p, workspace=WORKDIR, raw_label=p)
 
 
 class BaseTool(abc.ABC):

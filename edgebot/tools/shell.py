@@ -9,6 +9,12 @@ from pathlib import Path
 
 from edgebot.config import WORKDIR
 from edgebot.permissions.defaults import DEFAULT_BASH_DENY_PATTERNS
+from edgebot.security.workspace_policy import (
+    WORKSPACE_BOUNDARY_NOTE,
+    is_path_within_workspace,
+    require_workspace_path,
+    workspace_root,
+)
 
 _MAX_OUTPUT = 10_000
 _TIMEOUT = 120
@@ -95,16 +101,29 @@ def _guard_command(command: str, cwd: str) -> str | None:
     if contains_internal_url(command):
         return "Error: Command blocked by safety guard (internal/private URL detected)"
     if "..\\" in command or "../" in command:
-        return "Error: Command blocked by safety guard (path traversal detected)"
+        return (
+            "Error: Command blocked by safety guard (path traversal detected)"
+            + WORKSPACE_BOUNDARY_NOTE
+        )
 
-    cwd_path = Path(cwd).resolve()
+    try:
+        require_workspace_path(cwd, raw_label="working directory")
+    except Exception:
+        return (
+            "Error: Command blocked by safety guard (working directory outside workspace)"
+            + WORKSPACE_BOUNDARY_NOTE
+        )
+
     for raw in _extract_absolute_paths(command):
         try:
-            p = Path(os.path.expandvars(raw.strip())).expanduser().resolve()
+            p = Path(os.path.expandvars(raw.strip())).expanduser().resolve(strict=False)
         except Exception:
             continue
-        if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
-            return "Error: Command blocked by safety guard (path outside working dir)"
+        if p.is_absolute() and not is_path_within_workspace(p):
+            return (
+                "Error: Command blocked by safety guard (path outside working dir)"
+                + WORKSPACE_BOUNDARY_NOTE
+            )
     return None
 
 
@@ -161,7 +180,8 @@ def _format_output(
 
 
 def run_bash(command: str) -> str:
-    guard_error = _guard_command(command, str(WORKDIR))
+    cwd = workspace_root()
+    guard_error = _guard_command(command, str(cwd))
     if guard_error:
         return guard_error
 
@@ -169,7 +189,7 @@ def run_bash(command: str) -> str:
         process = subprocess.Popen(
             command,
             shell=True,
-            cwd=WORKDIR,
+            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,

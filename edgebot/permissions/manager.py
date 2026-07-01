@@ -580,18 +580,13 @@ class PermissionManager:
 
     @staticmethod
     def _path_inside_workdir(raw_path: Any) -> bool:
-        from edgebot.config import WORKDIR
+        from edgebot.security.workspace_policy import is_path_within_workspace
 
         try:
             path_str = str(raw_path or "").strip()
             if not path_str:
                 return False
-            p = Path(path_str)
-            if not p.is_absolute():
-                p = (Path(WORKDIR) / p)
-            resolved = p.resolve()
-            workdir = Path(WORKDIR).resolve()
-            return resolved == workdir or workdir in resolved.parents
+            return is_path_within_workspace(path_str)
         except (OSError, ValueError):
             return False
 

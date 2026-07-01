@@ -13,7 +13,8 @@ from pathlib import Path
 from queue import Queue
 from typing import Any
 
-from edgebot.config import BACKGROUND_DIR, WORKDIR
+from edgebot.config import BACKGROUND_DIR
+from edgebot.security.workspace_policy import workspace_root
 
 _OUTPUT_PREVIEW_CHARS = 4000
 _NOTIFICATION_PREVIEW_CHARS = 500
@@ -30,6 +31,23 @@ class BackgroundManager:
         self._lock = threading.Lock()
 
     def run(self, command: str, timeout: int = 120) -> dict[str, Any]:
+        from edgebot.tools.shell import _guard_command
+
+        guard_error = _guard_command(command, str(workspace_root()))
+        if guard_error:
+            return {
+                "task_type": "local_bash",
+                "status": "error",
+                "description": command[:120],
+                "command": command,
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "timeout_seconds": timeout,
+                "exit_code": None,
+                "error": guard_error,
+                "output_file": None,
+                "output_preview": guard_error,
+            }
         tid = str(uuid.uuid4())[:8]
         output_path = self.output_dir / f"{tid}.log"
         task = {
@@ -186,7 +204,7 @@ class BackgroundManager:
             result = subprocess.run(
                 command,
                 shell=True,
-                cwd=WORKDIR,
+                cwd=workspace_root(),
                 capture_output=True,
                 text=True,
                 timeout=timeout,

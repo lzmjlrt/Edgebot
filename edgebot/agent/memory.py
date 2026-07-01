@@ -734,8 +734,8 @@ class DreamProcessor:
         """Run Phase 2 via AgentRunner with read_file and edit_file tools."""
         from edgebot.agent.runner import AgentRunner, AgentRunSpec
 
-        # Build a minimal tool set for the dream agent
-        tools, handlers = self._build_dream_tools()
+        # Build a minimal registry for the dream agent.
+        tool_registry = self._build_dream_tools()
 
         system_prompt = PHASE2_SYSTEM_PROMPT.format(
             user_path=str(self.store.user_file),
@@ -761,8 +761,9 @@ class DreamProcessor:
         result = await runner.run(AgentRunSpec(
             initial_messages=messages,
             provider=self.provider,
-            tools=tools,
-            tool_handlers=handlers,
+            tools=[],
+            tool_handlers={},
+            tool_registry=tool_registry,
             model=self.model,
             max_iterations=15,
             max_tokens=4000,
@@ -792,11 +793,9 @@ class DreamProcessor:
                 changelog.append({"name": name, "status": "ok", "detail": content[:200]})
         return changelog
 
-    def _build_dream_tools(self) -> tuple[list[dict], dict[str, Any]]:
-        """Build read_file + edit_file tools scoped to the memory workspace."""
-
-        tools: list[dict] = []
-        handlers: dict[str, Any] = {}
+    def _build_dream_tools(self):
+        """Build a registry scoped to Dream memory-maintenance tools."""
+        from edgebot.tools.registry import ToolRegistry
 
         read_tool = _DreamReadTool(self.store.workspace)
         edit_tool = _DreamEditTool(
@@ -813,14 +812,11 @@ class DreamProcessor:
             skills_dir=self.store.skills_dir,
         )
 
-        tools.append(read_tool.to_openai())
-        handlers[read_tool.name] = read_tool.execute
-        tools.append(edit_tool.to_openai())
-        handlers[edit_tool.name] = edit_tool.execute
-        tools.append(write_tool.to_openai())
-        handlers[write_tool.name] = write_tool.execute
-
-        return tools, handlers
+        registry = ToolRegistry()
+        registry.register(read_tool)
+        registry.register(edit_tool)
+        registry.register(write_tool)
+        return registry
 
     # ---- cursor management ----
 

@@ -50,6 +50,17 @@ class SubagentRunner:
             return None
         return tool.to_openai()
 
+    def _build_tool_registry(self, allowed_tools: tuple[str, ...]):
+        """Build an isolated registry containing only allowed tool instances."""
+        from edgebot.tools.registry import ToolRegistry, get_tool_instance
+
+        registry = ToolRegistry()
+        for tool_name in allowed_tools:
+            tool = get_tool_instance(tool_name)
+            if tool is not None:
+                registry.register(tool)
+        return registry
+
     @staticmethod
     def _preview_text(text: str, limit: int = _RESULT_PREVIEW_CHARS) -> str:
         if len(text) <= limit:
@@ -334,7 +345,6 @@ class SubagentRunner:
     async def _run(self, task_id: str) -> None:
         """Delegate to AgentRunner; persist transcript + output via checkpoints."""
         from edgebot.agent.runner import AgentRunner, AgentRunSpec
-        from edgebot.tools.registry import TOOL_HANDLERS
 
         rec = self._tasks[task_id]
         cap = CAPABILITIES[rec["capability"]]
@@ -348,13 +358,7 @@ class SubagentRunner:
         # Persist the initial user prompt to the transcript.
         self._append_jsonl(transcript_path, initial_messages[1])
 
-        tool_schemas = [
-            schema for schema in (self._tool_schema(n) for n in cap["allowed_tools"]) if schema
-        ]
-
-        # AgentRunner uses execute_tool_batches which resolves tools via the
-        # registry directly; passing TOOL_HANDLERS here is for API parity.
-        tool_handlers = dict(TOOL_HANDLERS)
+        tool_registry = self._build_tool_registry(tuple(cap["allowed_tools"]))
 
         provider = create_provider()
         runner = AgentRunner(provider)
@@ -385,8 +389,9 @@ class SubagentRunner:
         spec = AgentRunSpec(
             initial_messages=initial_messages,
             provider=provider,
-            tools=tool_schemas,
-            tool_handlers=tool_handlers,
+            tools=[],
+            tool_handlers={},
+            tool_registry=tool_registry,
             model=MODEL,
             max_iterations=_MAX_TURNS,
             max_tokens=8000,

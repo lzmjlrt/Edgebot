@@ -59,6 +59,7 @@ class AgentRunSpec:
     tools: list[dict[str, Any]]
     tool_handlers: dict[str, Any]
     model: str
+    tool_registry: Any | None = None
     max_iterations: int = 200
     max_tokens: int = 8192
     max_input_tokens: int | None = None
@@ -136,6 +137,7 @@ class AgentRunner:
                 status.start()
 
             try:
+                tool_definitions = _tool_definitions(spec)
                 if spec.on_stream is not None:
                     async def _stream_cb(delta: str, *, _first=[True]) -> None:
                         if spec.emit_output and _first[0]:
@@ -150,7 +152,7 @@ class AgentRunner:
 
                     response = await spec.provider.chat_stream_with_retry(
                         messages=call_messages,
-                        tools=spec.tools,
+                        tools=tool_definitions,
                         model=spec.model,
                         max_tokens=spec.max_tokens,
                         temperature=spec.temperature,
@@ -161,7 +163,7 @@ class AgentRunner:
                 else:
                     response = await spec.provider.chat_with_retry(
                         messages=call_messages,
-                        tools=spec.tools,
+                        tools=tool_definitions,
                         model=spec.model,
                         max_tokens=spec.max_tokens,
                         temperature=spec.temperature,
@@ -345,6 +347,7 @@ class AgentRunner:
 
                 executed_calls = await execute_tool_batches(
                     [tc.to_openai_tool_call() for tc in valid_tool_calls],
+                    tool_registry=spec.tool_registry,
                     tool_handlers=spec.tool_handlers,
                     on_execution_start=_on_tool_execution_start,
                     on_execution_end=_on_tool_execution_end,
@@ -469,6 +472,15 @@ def _print_tool_hint(
 async def _emit_checkpoint(spec: AgentRunSpec, payload: dict[str, Any]) -> None:
     if spec.checkpoint_callback is not None:
         await spec.checkpoint_callback(payload)
+
+
+def _tool_definitions(spec: AgentRunSpec) -> list[dict[str, Any]]:
+    if spec.tool_registry is None:
+        return spec.tools
+    getter = getattr(spec.tool_registry, "get_definitions", None)
+    if callable(getter):
+        return getter()
+    return spec.tools
 
 
 # ---- Context governance ----

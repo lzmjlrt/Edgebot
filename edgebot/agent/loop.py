@@ -21,7 +21,12 @@ from edgebot.agent.memory import MemoryStore, consolidate_memory
 from edgebot.agent.runner import AgentRunSpec, AgentRunner
 from edgebot.agent.token_budget import consolidation_token_target, input_token_budget
 from edgebot.config import IDLE_COMPACT_MINUTES, MODEL, RUNTIME_DIR, WORKDIR, create_provider
-from edgebot.tools.registry import SUBAGENT, set_tool_runtime_context
+from edgebot.tools.registry import (
+    DEFAULT_TOOL_REGISTRY,
+    SUBAGENT,
+    build_runtime_tool_registry,
+    set_tool_runtime_context,
+)
 
 _console = Console()
 _CONSOLIDATION_INTERVAL = 15
@@ -253,11 +258,18 @@ async def agent_loop(
             _console.print(f"[dim yellow]  {msg}[/dim yellow]")
 
     # ---- Run the agent (single call, runner handles tool loop internally) ----
+    tool_registry = build_runtime_tool_registry(
+        DEFAULT_TOOL_REGISTRY,
+        tools,
+        tool_handlers,
+    )
+
     result = await runner.run(AgentRunSpec(
         initial_messages=call_messages,
         provider=provider,
         tools=tools,
         tool_handlers=tool_handlers,
+        tool_registry=tool_registry,
         model=MODEL,
         max_iterations=200,
         max_tokens=_RUN_MAX_COMPLETION_TOKENS,

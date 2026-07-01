@@ -41,6 +41,8 @@ edgebot/
 ├── agent/
 │   ├── loop.py              # Main turn orchestration & notification draining
 │   ├── runner.py            # Shared LLM-call / tool-execution loop (AgentRunner)
+│   ├── context_governance.py # Model-facing transcript repair and token budgets
+│   ├── tool_results.py      # Tool output truncation/offload policy
 │   ├── context.py           # Auto-seeds templates & bootstrap config
 │   ├── compression.py       # Token estimation, microcompact, LLM summary
 │   └── memory.py            # Dream-style memory consolidation

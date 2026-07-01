@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import difflib
 import mimetypes
-import os
 from pathlib import Path
 
 from edgebot.tools import file_state
@@ -48,15 +47,8 @@ def run_read(path: str, limit: int | None = None, offset: int = 1, force: bool =
         if not fp.is_file():
             return f"Error: Not a file: {path}"
 
-        entry = file_state._state.get(str(fp.resolve()))
-        try:
-            current_mtime = os.path.getmtime(fp)
-        except OSError:
-            current_mtime = 0.0
-        if not force and entry and entry.can_dedup and entry.offset == offset and entry.limit == limit:
-            current_hash = file_state._hash_file(fp)
-            if current_mtime == entry.mtime and current_hash == entry.content_hash:
-                return f"[File unchanged since last read: {path}]"
+        if not force and file_state.is_unchanged(fp, offset=offset, limit=limit):
+            return f"[File unchanged since last read: {path}]"
 
         raw = fp.read_bytes()
         if not raw:

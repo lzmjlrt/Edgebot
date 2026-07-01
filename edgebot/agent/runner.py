@@ -28,6 +28,7 @@ from edgebot.agent.tool_results import (
     safe_tool_result_name,
 )
 from edgebot.providers.base import LLMProvider, ToolCallRequest
+from edgebot.tools import file_state
 from edgebot.tools.orchestration import execute_tool_batches
 
 _console = Console()
@@ -96,6 +97,13 @@ class AgentRunner:
         self.provider = provider
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        token = file_state.bind_file_states(file_state.for_session(spec.session_key))
+        try:
+            return await self._run_loop(spec)
+        finally:
+            file_state.reset_file_states(token)
+
+    async def _run_loop(self, spec: AgentRunSpec) -> AgentRunResult:
         messages = [dict(message) for message in spec.initial_messages]
         new_messages: list[dict[str, Any]] = []
         final_content: str | None = None

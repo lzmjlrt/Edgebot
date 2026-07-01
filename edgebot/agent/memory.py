@@ -767,6 +767,7 @@ class DreamProcessor:
             max_iterations=15,
             max_tokens=4000,
             max_tool_result_chars=16_000,
+            session_key=f"dream:{self.store.workspace.resolve()}",
             emit_output=self.emit_output,
             assistant_label="Dream",
         ))

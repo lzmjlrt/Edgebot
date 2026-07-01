@@ -17,7 +17,7 @@ from rich.console import Console
 
 from edgebot.agent.compression import estimate_tokens
 from edgebot.agent.token_budget import input_token_budget
-from edgebot.providers.base import LLMProvider, ToolCallRequest
+from edgebot.providers.base import LLMProvider, ToolCallRequest, is_valid_tool_name
 from edgebot.session.store import find_legal_start
 from edgebot.tools.orchestration import execute_tool_batches
 
@@ -40,6 +40,12 @@ _LENGTH_RECOVERY_PROMPT = (
     "Output limit reached. Continue exactly where you left off "
     "— no recap, no apology. Break remaining work into smaller steps if needed."
 )
+_MALFORMED_TOOL_CALL_REPAIR_PROMPT = (
+    "The previous model response contained malformed tool calls with "
+    "invalid function names. Retry with valid tool names matching "
+    "^[A-Za-z0-9_-]{1,64}$, or answer without tools."
+)
+_MAX_MALFORMED_TOOL_CALL_REPAIRS = 2
 
 
 @dataclass(slots=True)
@@ -98,6 +104,7 @@ class AgentRunner:
         empty_content_retries = 0
         length_recoveries = 0
         context_emergency_compacts = 0
+        malformed_tool_call_repairs = 0
 
         def append_message(message: dict[str, Any]) -> dict[str, Any]:
             stored = dict(message)
@@ -248,24 +255,55 @@ class AgentRunner:
                 if spec.on_stream_end is not None:
                     await spec.on_stream_end(resuming=True)
 
+                valid_tool_calls = [
+                    tc for tc in response.tool_calls if tc.has_valid_name()
+                ]
+                if not valid_tool_calls:
+                    malformed_tool_call_repairs += 1
+                    if malformed_tool_call_repairs > _MAX_MALFORMED_TOOL_CALL_REPAIRS:
+                        final_content = (
+                            "Model returned malformed tool calls repeatedly; "
+                            "stopping before persisting invalid tool calls."
+                        )
+                        stop_reason = "error"
+                        append_message({
+                            "role": "assistant",
+                            "content": final_content,
+                        })
+                        await _emit_checkpoint(spec, {
+                            "phase": "final_response",
+                            "iteration": iteration,
+                            "assistant_message": messages[-1] if messages else None,
+                            "completed_tool_results": [],
+                            "pending_tool_calls": [],
+                        })
+                        break
+
+                    append_message({
+                        "role": "user",
+                        "content": _MALFORMED_TOOL_CALL_REPAIR_PROMPT,
+                    })
+                    empty_content_retries = 0
+                    continue
+
                 asst_msg: dict[str, Any] = {
                     "role": "assistant",
                     "content": response.content or None,
-                    "tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
+                    "tool_calls": [tc.to_openai_tool_call() for tc in valid_tool_calls],
                 }
                 asst_msg = append_message(asst_msg)
-                tools_used.extend(tc.name for tc in response.tool_calls)
+                tools_used.extend(tc.name for tc in valid_tool_calls)
 
                 await _emit_checkpoint(spec, {
                     "phase": "awaiting_tools",
                     "iteration": iteration,
                     "assistant_message": asst_msg,
                     "completed_tool_results": [],
-                    "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
+                    "pending_tool_calls": [tc.to_openai_tool_call() for tc in valid_tool_calls],
                 })
 
                 # Show tool hints
-                for tc in response.tool_calls:
+                for tc in valid_tool_calls:
                     _print_tool_hint(tc.name, tc.arguments, spec)
 
                 tool_status = None
@@ -298,7 +336,7 @@ class AgentRunner:
                             tool_status = None
 
                 executed_calls = await execute_tool_batches(
-                    [tc.to_openai_tool_call() for tc in response.tool_calls],
+                    [tc.to_openai_tool_call() for tc in valid_tool_calls],
                     tool_handlers=spec.tool_handlers,
                     on_execution_start=_on_tool_execution_start,
                     on_execution_end=_on_tool_execution_end,
@@ -340,6 +378,7 @@ class AgentRunner:
                             append_message(message)
 
                 empty_content_retries = 0
+                malformed_tool_call_repairs = 0
                 continue
 
             # ---- No tool calls: potentially the final response ----
@@ -359,6 +398,7 @@ class AgentRunner:
                 stop_reason = "empty_final_response"
             else:
                 final_content = clean
+            malformed_tool_call_repairs = 0
 
             # Check injection_callback — if new messages arrived, keep looping.
             injected_messages: list[dict[str, Any]] = []
@@ -432,11 +472,60 @@ def _prepare_messages_for_model(
 ) -> list[dict[str, Any]]:
     """Return a governed request copy without changing the persisted transcript."""
     model_messages = [dict(message) for message in messages]
+    model_messages = _strip_malformed_tool_calls(model_messages)
     model_messages = _drop_orphan_tool_results(model_messages)
     model_messages = _backfill_missing_tool_results(model_messages)
     model_messages = _microcompact(model_messages)
     governed_messages = _apply_tool_result_budget(model_messages, spec)
     return _apply_input_token_budget(governed_messages, spec)
+
+
+def _tool_call_name(tool_call: dict[str, Any]) -> Any:
+    function = tool_call.get("function")
+    if isinstance(function, dict):
+        return function.get("name")
+    return tool_call.get("name")
+
+
+def _strip_malformed_tool_calls(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove malformed assistant tool_calls from the model-facing transcript."""
+    updated: list[dict[str, Any]] | None = None
+    for idx, msg in enumerate(messages):
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            if updated is not None:
+                updated.append(dict(msg))
+            continue
+
+        valid_tool_calls = [
+            dict(tc)
+            for tc in msg.get("tool_calls") or []
+            if isinstance(tc, dict) and is_valid_tool_name(_tool_call_name(tc))
+        ]
+        if len(valid_tool_calls) == len(msg.get("tool_calls") or []):
+            if updated is not None:
+                updated.append(dict(msg))
+            continue
+
+        if updated is None:
+            updated = [dict(m) for m in messages[:idx]]
+
+        content = msg.get("content")
+        has_content = (
+            bool(content.strip()) if isinstance(content, str) else content is not None
+        )
+        if not valid_tool_calls and not has_content:
+            continue
+
+        cleaned = dict(msg)
+        if valid_tool_calls:
+            cleaned["tool_calls"] = valid_tool_calls
+        else:
+            cleaned.pop("tool_calls", None)
+        updated.append(cleaned)
+
+    return updated if updated is not None else messages
 
 
 def _drop_orphan_tool_results(

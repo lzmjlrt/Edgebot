@@ -18,6 +18,11 @@ from typing import Any
 from rich.console import Console
 
 _console = Console()
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_valid_tool_name(name: Any) -> bool:
+    return isinstance(name, str) and _TOOL_NAME_RE.fullmatch(name) is not None
 
 
 @dataclass
@@ -27,6 +32,9 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+
+    def has_valid_name(self) -> bool:
+        return is_valid_tool_name(self.name)
 
     def to_openai_tool_call(self) -> dict[str, Any]:
         return {

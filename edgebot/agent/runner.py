@@ -9,6 +9,7 @@ LLM-call -> tool-execution loop and returns the result.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -48,6 +49,54 @@ _MALFORMED_TOOL_CALL_REPAIR_PROMPT = (
     "^[A-Za-z0-9_-]{1,64}$, or answer without tools."
 )
 _MAX_MALFORMED_TOOL_CALL_REPAIRS = 2
+_REPEATED_TOOL_CALL_REPAIR_THRESHOLD = 3
+_REPEATED_TOOL_CALL_STOP_THRESHOLD = 5
+_REPEATED_TOOL_CALL_REPAIR_PROMPT = (
+    "You have called the same tool with the same arguments repeatedly and "
+    "received no new information. Do not call it again. Choose one of: read "
+    "a different range, edit a source file, run a targeted test, or submit "
+    "the final patch."
+)
+_REPEATED_READ_FILE_REPAIR_PROMPT = (
+    "The same read_file range has already been read and is unchanged. Do not "
+    "call read_file with the same path, offset, and limit again. Use a "
+    "different range, edit a source file, run a targeted test, or provide "
+    "the final answer."
+)
+_REPEATED_TOOL_CALL_FINALIZATION_PROMPT = (
+    "The agent loop stopped because the same tool call was repeated without "
+    "new information. Based only on the conversation and tool results above, "
+    "provide a concise final response. Do not call tools. Do not claim the "
+    "task is complete unless a source edit and verification are visible above."
+)
+_REPEATED_TOOL_CALL_FALLBACK_FINAL = (
+    "The agent loop stopped because the same tool call was repeated without "
+    "new information."
+)
+
+
+@dataclass(slots=True)
+class ToolRepeatState:
+    last_signature: str | None = None
+    consecutive_count: int = 0
+    max_consecutive_count: int = 0
+    repair_injections: int = 0
+
+    def observe(self, signature: str) -> int:
+        if signature == self.last_signature:
+            self.consecutive_count += 1
+        else:
+            self.last_signature = signature
+            self.consecutive_count = 1
+        self.max_consecutive_count = max(
+            self.max_consecutive_count,
+            self.consecutive_count,
+        )
+        return self.consecutive_count
+
+    def reset(self) -> None:
+        self.last_signature = None
+        self.consecutive_count = 0
 
 
 @dataclass(slots=True)
@@ -89,6 +138,7 @@ class AgentRunResult:
     usage: dict[str, int] = field(default_factory=dict)
     stop_reason: str = "completed"
     new_messages: list[dict[str, Any]] = field(default_factory=list)
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentRunner:
@@ -110,11 +160,22 @@ class AgentRunner:
         final_content: str | None = None
         tools_used: list[str] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+        telemetry: dict[str, Any] = {
+            "tool_call_count": 0,
+            "read_file_count": 0,
+            "edit_file_count": 0,
+            "write_file_count": 0,
+            "bash_count": 0,
+            "max_identical_tool_call_run": 0,
+            "repeated_tool_call_repairs": 0,
+            "repeated_tool_call_stops": 0,
+        }
         stop_reason = "completed"
         empty_content_retries = 0
         length_recoveries = 0
         context_emergency_compacts = 0
         malformed_tool_call_repairs = 0
+        repeat_state = ToolRepeatState()
 
         def append_message(message: dict[str, Any]) -> dict[str, Any]:
             stored = dict(message)
@@ -183,6 +244,7 @@ class AgentRunner:
                     usage=usage,
                     stop_reason="error",
                     new_messages=list(new_messages),
+                    telemetry=dict(telemetry),
                 )
             finally:
                 if status:
@@ -229,6 +291,7 @@ class AgentRunner:
                         usage=usage,
                         stop_reason="error",
                         new_messages=list(new_messages),
+                        telemetry=dict(telemetry),
                     )
                 empty_content_retries = 0
                 continue
@@ -292,6 +355,44 @@ class AgentRunner:
                     append_message({
                         "role": "user",
                         "content": _MALFORMED_TOOL_CALL_REPAIR_PROMPT,
+                    })
+                    empty_content_retries = 0
+                    continue
+
+                batch_signature = _tool_call_batch_signature(valid_tool_calls)
+                repeat_count = repeat_state.observe(batch_signature)
+                _record_tool_call_telemetry(telemetry, valid_tool_calls)
+                telemetry["max_identical_tool_call_run"] = max(
+                    int(telemetry["max_identical_tool_call_run"]),
+                    repeat_state.max_consecutive_count,
+                )
+                if repeat_count >= _REPEATED_TOOL_CALL_STOP_THRESHOLD:
+                    stop_reason = "repeated_tool_call"
+                    telemetry["repeated_tool_call_stops"] += 1
+                    final_content = await _finalize_without_tools(
+                        messages,
+                        spec,
+                        _REPEATED_TOOL_CALL_FINALIZATION_PROMPT,
+                    )
+                    append_message({
+                        "role": "assistant",
+                        "content": final_content,
+                    })
+                    await _emit_checkpoint(spec, {
+                        "phase": "final_response",
+                        "iteration": iteration,
+                        "assistant_message": messages[-1] if messages else None,
+                        "completed_tool_results": [],
+                        "pending_tool_calls": [],
+                    })
+                    break
+
+                if repeat_count >= _REPEATED_TOOL_CALL_REPAIR_THRESHOLD:
+                    repeat_state.repair_injections += 1
+                    telemetry["repeated_tool_call_repairs"] += 1
+                    append_message({
+                        "role": "user",
+                        "content": _repeated_tool_call_repair_prompt(valid_tool_calls),
                     })
                     empty_content_retries = 0
                     continue
@@ -387,6 +488,7 @@ class AgentRunner:
                     if injected:
                         for message in injected:
                             append_message(message)
+                        repeat_state.reset()
 
                 empty_content_retries = 0
                 malformed_tool_call_repairs = 0
@@ -410,6 +512,7 @@ class AgentRunner:
             else:
                 final_content = clean
             malformed_tool_call_repairs = 0
+            repeat_state.reset()
 
             # Check injection_callback — if new messages arrived, keep looping.
             injected_messages: list[dict[str, Any]] = []
@@ -454,6 +557,7 @@ class AgentRunner:
             usage=usage,
             stop_reason=stop_reason,
             new_messages=list(new_messages),
+            telemetry=dict(telemetry),
         )
 
 
@@ -481,6 +585,88 @@ def _tool_definitions(spec: AgentRunSpec) -> list[dict[str, Any]]:
     if callable(getter):
         return getter()
     return spec.tools
+
+
+def _normalize_tool_args(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_tool_args(value[key])
+            for key in sorted(value, key=lambda item: str(item))
+        }
+    if isinstance(value, list):
+        return [_normalize_tool_args(item) for item in value]
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return value
+
+
+def _tool_call_signature(name: str, arguments: Any) -> str:
+    normalized = _normalize_tool_args(arguments)
+    try:
+        payload = json.dumps(
+            normalized,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError):
+        payload = repr(normalized)
+    return f"{name}:{payload}"
+
+
+def _tool_call_batch_signature(tool_calls: list[ToolCallRequest]) -> str:
+    signatures = [
+        _tool_call_signature(tool_call.name, tool_call.arguments)
+        for tool_call in tool_calls
+    ]
+    return json.dumps(signatures, separators=(",", ":"), ensure_ascii=False)
+
+
+def _repeated_tool_call_repair_prompt(tool_calls: list[ToolCallRequest]) -> str:
+    if len(tool_calls) == 1 and tool_calls[0].name == "read_file":
+        return _REPEATED_READ_FILE_REPAIR_PROMPT
+    return _REPEATED_TOOL_CALL_REPAIR_PROMPT
+
+
+def _record_tool_call_telemetry(
+    telemetry: dict[str, Any],
+    tool_calls: list[ToolCallRequest],
+) -> None:
+    telemetry["tool_call_count"] += len(tool_calls)
+    for tool_call in tool_calls:
+        key = f"{tool_call.name}_count"
+        if key in telemetry:
+            telemetry[key] += 1
+
+
+async def _finalize_without_tools(
+    messages: list[dict[str, Any]],
+    spec: AgentRunSpec,
+    prompt: str,
+) -> str:
+    final_messages = [dict(message) for message in messages]
+    final_messages.append({"role": "user", "content": prompt})
+    call_messages = _prepare_messages_for_model(final_messages, spec)
+    try:
+        response = await spec.provider.chat_with_retry(
+            messages=call_messages,
+            tools=None,
+            model=spec.model,
+            max_tokens=spec.max_tokens,
+            temperature=spec.temperature,
+            retry_mode=spec.retry_mode,
+            on_retry_wait=spec.on_retry_wait,
+        )
+    except Exception as exc:
+        return f"{_REPEATED_TOOL_CALL_FALLBACK_FINAL} Finalization failed: {exc}"
+    if response.finish_reason == "error":
+        return response.content or _REPEATED_TOOL_CALL_FALLBACK_FINAL
+    content = (response.content or "").strip()
+    if content:
+        return content
+    return _REPEATED_TOOL_CALL_FALLBACK_FINAL
 
 
 # ---- Context governance ----

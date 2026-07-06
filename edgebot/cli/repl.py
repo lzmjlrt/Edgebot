@@ -2,14 +2,23 @@
 edgebot/cli/repl.py - Interactive REPL (async) with Rich UI and prompt_toolkit.
 
 REPL commands: /new /sessions /resume /compact /memory /dream-log /dream-restore /cron /heartbeat /mcp /tasks /bg /subagents /permissions /status /help
+
+This module keeps the interactive prompt_toolkit UIs (permission prompts,
+ask_user forms, session picker) and main(); non-interactive pieces live in
+sibling modules and are re-exported here for backward compatibility:
+- ui_state.py         shared console / _MEMORY singletons
+- textkit.py          display-width text helpers
+- permission_meta.py  permission-request classification
+- render.py           read-only renderers, banner, help text
+- dream_commands.py   /dream-log and /dream-restore handlers
+- cron_commands.py    /cron handler and cron rendering
+- session_resume.py   load_session_for_resume
 """
 
 import asyncio
 import json
-import re
 import shlex
 import time
-from datetime import datetime
 from pathlib import Path
 
 from prompt_toolkit import PromptSession, print_formatted_text
@@ -22,17 +31,13 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
-from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.markup import escape
-from rich.table import Table
 
 from edgebot.agent.compression import auto_compact, extract_session_summary
 from edgebot.agent.context import build_system_prompt, seed_workspace_templates
 from edgebot.agent.loop import agent_loop, get_autocompact
-from edgebot.agent.memory import MemoryStore, cleanup_memory_files_once, consolidate_memory
-from edgebot.cron.service import _get_croniter
-from edgebot.cron.types import CronSchedule
+from edgebot.agent.memory import cleanup_memory_files_once, consolidate_memory
 from edgebot.config import (
     HEARTBEAT_INTERVAL_SECONDS,
     IDLE_COMPACT_MINUTES,
@@ -43,7 +48,7 @@ from edgebot.config import (
     SESSION_DIR,
     WORKDIR,
 )
-from edgebot.cron.types import CronJob, CronPayload
+from edgebot.cron.types import CronJob, CronPayload, CronSchedule
 from edgebot.heartbeat.service import HeartbeatService
 from edgebot.mcp.loader import load_mcp
 from edgebot.session.store import SessionStore
@@ -66,8 +71,54 @@ from edgebot.tools.registry import (
     set_permission_prompt_handler,
 )
 
-console = Console()
-_MEMORY = MemoryStore(Path.cwd())
+from edgebot.cli.ui_state import _MEMORY, console  # noqa: F401  (shared singletons)
+from edgebot.cli.textkit import (  # noqa: F401  (re-exported for compat)
+    _answer_has_value,
+    _clip_display,
+    _display_answer,
+    _display_width,
+    _pad_display,
+    _preview_box,
+)
+from edgebot.cli.permission_meta import (  # noqa: F401  (re-exported for compat)
+    _bash_permission_pattern,
+    _permission_description,
+    _permission_scope_label,
+    _permission_subject,
+    _permission_title,
+)
+from edgebot.cli.dream_commands import (  # noqa: F401  (re-exported for compat)
+    _extract_changed_files,
+    _format_changed_files,
+    _format_dream_log_content,
+    _format_dream_restore_list,
+    _handle_dream_log_command,
+    _handle_dream_restore_command,
+)
+from edgebot.cli.cron_commands import (  # noqa: F401  (re-exported for compat)
+    _format_cron_snapshot,
+    _handle_cron_command,
+    _render_cron_table,
+)
+from edgebot.cli.render import (  # noqa: F401  (re-exported for compat)
+    _HELP_TEXT,
+    _LOGO,
+    _REPLAY_TAIL,
+    _SESSION_PICK_LIMIT,
+    _format_timestamp,
+    _print_banner,
+    _print_subagent_blob,
+    _render_history,
+    _render_mcp_details,
+    _render_mcp_startup,
+    _render_subagent_detail,
+    _render_subagent_list,
+    _time_ago,
+)
+from edgebot.cli.session_resume import (  # noqa: F401  (re-exported for compat)
+    _resolve_session_summary,
+    load_session_for_resume,
+)
 
 _HISTORY_PATH = Path.home() / ".edgebot" / "cli_history"
 _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -140,95 +191,6 @@ async def _permission_prompt(request: dict) -> dict | None:
 async def _batch_permission_prompt(requests: list[dict]) -> dict | None:
     result = await _run_batch_permission_prompt(requests)
     return result if isinstance(result, dict) else {"action": "deny_all"}
-
-
-def _permission_title(request: dict) -> str:
-    tool = str(request.get("tool", "")).strip()
-    if tool == "bash":
-        return "Bash command"
-    if tool == "write_file":
-        return "Write file"
-    if tool == "edit_file":
-        return "Edit file"
-    if tool == "background_run":
-        return "Background task"
-    if tool == "web_fetch":
-        return "Web fetch"
-    if tool == "web_search":
-        return "Web search"
-    if tool == "task":
-        return "Subagent"
-    return f"{tool or 'Tool'} request"
-
-
-def _permission_subject(request: dict) -> str:
-    tool = str(request.get("tool", "")).strip()
-    if tool == "bash":
-        return str(request.get("raw_command") or request.get("scope_value") or "").strip()
-    message = str(request.get("message", "")).strip()
-    lines = [line.strip() for line in message.splitlines() if line.strip()]
-    if len(lines) >= 2:
-        return lines[-1]
-    return str(request.get("scope_value") or tool or "this operation").strip()
-
-
-def _permission_description(request: dict) -> str:
-    description = str(request.get("description") or "").strip()
-    if description:
-        return description
-    tool = str(request.get("tool", "")).strip()
-    if tool == "bash":
-        command = _permission_subject(request)
-        if "git reset --hard" in command.lower():
-            return "Reset git history or working tree state (destructive operation)"
-        if re.search(r">\s*\S+", command):
-            return "Write command output to a file"
-        if request.get("requires_confirmation"):
-            return "Sensitive shell operation"
-        return "Shell command requested by Edgebot"
-    if tool in {"write_file", "edit_file"}:
-        return "Modify file contents"
-    if tool == "background_run":
-        return "Start a background command"
-    if tool in {"web_fetch", "web_search"}:
-        return "Network access requested by Edgebot"
-    if tool == "task":
-        return "Start a delegated agent task"
-    return "Sensitive tool operation"
-
-
-def _permission_scope_label(request: dict) -> str:
-    tool = str(request.get("tool", "")).strip()
-    scope = str(request.get("scope_hint") or "allow_tool")
-    subject = _permission_subject(request)
-    if tool == "bash":
-        if scope == "allow_program":
-            program = str(request.get("scope_value") or "").strip()
-            return program or subject or "this command"
-        pattern = _bash_permission_pattern(subject)
-        return pattern or subject or "this command"
-    if tool in {"write_file", "edit_file"}:
-        try:
-            path = Path(subject)
-            if not path.is_absolute():
-                first = path.parts[0] if path.parts else subject
-                return f"{first}{path.anchor or ''} from this project"
-        except (OSError, ValueError):
-            pass
-    return subject or str(request.get("scope_value") or tool or "this tool")
-
-
-def _bash_permission_pattern(command: str) -> str:
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        tokens = command.split()
-    if not tokens:
-        return ""
-    head = tokens[0]
-    if head.lower() == "git" and len(tokens) >= 2:
-        return f"git {tokens[1]} *"
-    return f"{head} *"
 
 
 async def _run_permission_prompt(request: dict) -> dict:
@@ -584,49 +546,6 @@ async def _run_batch_permission_prompt(requests: list[dict]) -> dict:
     return result or {"action": "deny_all"}
 
 
-def _display_width(text: str) -> int:
-    return get_cwidth(text)
-
-
-def _pad_display(text: str, width: int) -> str:
-    return text + " " * max(0, width - _display_width(text))
-
-
-def _clip_display(text: str, width: int) -> str:
-    if width <= 0:
-        return ""
-    if _display_width(text) <= width:
-        return text
-    if width <= 3:
-        return "." * width
-    clipped = ""
-    used = 0
-    for char in text:
-        char_width = _display_width(char)
-        if used + char_width > max(0, width - 3):
-            break
-        clipped += char
-        used += char_width
-    return clipped + "..."
-
-
-def _preview_box(preview: str | None, width: int = 58, height: int = 8) -> list[str]:
-    inner = max(12, width - 2)
-    lines = (preview or "No preview available").splitlines() or [""]
-    visible = lines[:height]
-    hidden = max(0, len(lines) - len(visible))
-    rendered = ["+" + "-" * inner + "+"]
-    for line in visible:
-        rendered.append("|" + _pad_display(_clip_display(line, inner), inner) + "|")
-    if hidden:
-        marker = f"... {hidden} lines hidden"
-        rendered[-1] = "|" + _pad_display(_clip_display(marker, inner), inner) + "|"
-    while len(rendered) < height + 1:
-        rendered.append("|" + " " * inner + "|")
-    rendered.append("+" + "-" * inner + "+")
-    return rendered
-
-
 async def _ask_free_text(question: str) -> str:
     safe_q = escape(question)
     await _interactive_print(
@@ -640,22 +559,6 @@ async def _ask_free_text(question: str) -> str:
             HTML("<b><ansicyan>You:</ansicyan></b> ")
         )
     return (line or "").strip() or "(no response)"
-
-
-def _answer_has_value(answer: object | None) -> bool:
-    if isinstance(answer, list):
-        return any(str(item).strip() for item in answer)
-    if answer is None:
-        return False
-    return bool(str(answer).strip())
-
-
-def _display_answer(answer: object | None) -> str:
-    if isinstance(answer, list):
-        values = [str(item).strip() for item in answer if str(item).strip()]
-        return ", ".join(values) if values else "(no response)"
-    value = str(answer or "").strip()
-    return value or "(no response)"
 
 
 async def _run_ask_questions(questions: list[AskQuestion]) -> dict[str, object]:
@@ -1133,516 +1036,9 @@ async def _ask_user_handler(questions: list[AskQuestion]) -> str:
     """Interactive ask_user prompt with structured option picker."""
     answers = await _run_ask_questions(questions)
     return build_ask_user_result(questions, answers)
-_HELP_TEXT = """[bold]Edgebot commands:[/bold]
-  /new                Start a new conversation
-  /sessions           List saved sessions
-  /resume             Interactively pick a session to resume
-  /resume <#|key>     Resume a specific session
-  /compact            Compress conversation context
-  /memory             Run memory consolidation now
-  /dream-log          Show the latest Dream memory change
-  /dream-log <sha>    Show a specific Dream memory change
-  /dream-restore      List recent Dream memory versions
-  /dream-restore <sha> Restore a Dream memory version
-  /cron               Show cron jobs and service state
-  /cron run <id>      Run a job immediately
-  /cron rm <id>       Remove a job
-  /cron on/off <id>   Enable or disable a job
-  /cron add every <seconds> <message>
-  /cron add at <iso-datetime> <message>
-  /cron add expr <cron-expr> <message> [tz]
-  /heartbeat          Trigger one heartbeat tick now
-  /mcp                Show MCP servers and loaded capabilities
-  /tasks              Show task board
-  /bg                 Show all background tasks
-  /bg <id>            Show one background task
-  /bg output <id>     Show task output
-  /subagents          List subagents
-  /subagents <id>     Show subagent details
-  /subagents output <id>
-  /subagents transcript <id>
-  /subagents fg <id>  Move subagent to foreground
-  /subagents bg <id>  Move subagent to background
-  /subagents stop <id> [reason]
-  /permissions        Show permission rules (persisted + session)
-  /status             Show current session info
-  /help               Show this help
-  /exit                Quit"""
 
 
-_REPLAY_TAIL = 10  # How many visible turns to replay on /resume
 _MEMORY_JOB_ID = "memory_consolidation"
-_SESSION_PICK_LIMIT = 20
-
-
-def _extract_changed_files(diff: str) -> list[str]:
-    files: list[str] = []
-    seen: set[str] = set()
-    for line in diff.splitlines():
-        if not line.startswith("diff --git "):
-            continue
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        path = parts[3]
-        if path.startswith("b/"):
-            path = path[2:]
-        if path in seen:
-            continue
-        seen.add(path)
-        files.append(path)
-    return files
-
-
-def _format_changed_files(diff: str) -> str:
-    files = _extract_changed_files(diff)
-    if not files:
-        return "No tracked memory files changed."
-    return ", ".join(f"`{path}`" for path in files)
-
-
-def _format_dream_log_content(commit, diff: str, *, requested_sha: str | None = None) -> str:
-    lines = [
-        "## Dream Update",
-        "",
-        "Here is the selected Dream memory change." if requested_sha else "Here is the latest Dream memory change.",
-        "",
-        f"- Commit: `{commit.sha}`",
-        f"- Time: {commit.timestamp}",
-        f"- Changed files: {_format_changed_files(diff)}",
-    ]
-    if diff:
-        lines.extend([
-            "",
-            f"Use `/dream-restore {commit.sha}` to undo this change.",
-            "",
-            "```diff",
-            diff.rstrip(),
-            "```",
-        ])
-    else:
-        lines.extend(["", "Dream recorded this version, but there is no file diff to display."])
-    return "\n".join(lines)
-
-
-def _format_dream_restore_list(commits: list) -> str:
-    lines = [
-        "## Dream Restore",
-        "",
-        "Choose a Dream memory version to restore. Latest first:",
-        "",
-    ]
-    for commit in commits:
-        lines.append(f"- `{commit.sha}` {commit.timestamp} - {commit.message.splitlines()[0]}")
-    lines.extend([
-        "",
-        "Preview a version with `/dream-log <sha>` before restoring it.",
-        "Restore a version with `/dream-restore <sha>`.",
-    ])
-    return "\n".join(lines)
-
-
-def _handle_dream_log_command(query: str) -> None:
-    _MEMORY.ensure_git_initialized()
-    git = _MEMORY.git
-    if not git.is_initialized():
-        console.print("[dim]  Dream history is not available because memory versioning is not initialized.[/dim]")
-        return
-
-    parts = shlex.split(query)
-    if len(parts) > 1:
-        sha = parts[1]
-        result = git.show_commit_diff(sha)
-        if not result:
-            console.print(f"[dim]  Couldn't find Dream change {sha}.[/dim]")
-            return
-        commit, diff = result
-        console.print(_format_dream_log_content(commit, diff, requested_sha=sha), highlight=False)
-        return
-
-    commits = git.log(max_entries=1)
-    if not commits:
-        console.print("[dim]  Dream memory has no saved versions yet.[/dim]")
-        return
-    result = git.show_commit_diff(commits[0].sha)
-    if not result:
-        console.print("[dim]  Dream memory has no diff to display yet.[/dim]")
-        return
-    commit, diff = result
-    console.print(_format_dream_log_content(commit, diff), highlight=False)
-
-
-def _handle_dream_restore_command(query: str) -> None:
-    _MEMORY.ensure_git_initialized()
-    git = _MEMORY.git
-    if not git.is_initialized():
-        console.print("[dim]  Dream history is not available because memory versioning is not initialized.[/dim]")
-        return
-
-    parts = shlex.split(query)
-    if len(parts) == 1:
-        commits = git.log(max_entries=10)
-        if not commits:
-            console.print("[dim]  Dream memory has no saved versions to restore yet.[/dim]")
-            return
-        console.print(_format_dream_restore_list(commits), highlight=False)
-        return
-
-    sha = parts[1]
-    result = git.show_commit_diff(sha)
-    changed_files = _format_changed_files(result[1]) if result else "the tracked memory files"
-    new_sha = git.revert(sha)
-    if new_sha:
-        console.print(
-            (
-                f"Restored Dream memory to the state before `{sha}`.\n\n"
-                f"- New safety commit: `{new_sha}`\n"
-                f"- Restored files: {changed_files}\n\n"
-                f"Use `/dream-log {new_sha}` to inspect the restore diff."
-            ),
-            highlight=False,
-        )
-    else:
-        console.print(f"[dim]  Couldn't restore Dream change {sha}.[/dim]")
-
-
-def _render_mcp_startup(mcp_client) -> None:
-    """Print a concise MCP startup summary."""
-    for line in mcp_client.startup_summary_lines():
-        console.print(f"[dim]{line}[/dim]")
-
-
-def _render_mcp_details(mcp_client) -> None:
-    """Print detailed MCP summary including capability names."""
-    for line in mcp_client.detailed_summary_lines():
-        console.print(f"[dim]{line}[/dim]")
-
-
-def _format_cron_snapshot() -> list[str]:
-    status = CRON.status(include_system=False)
-    lines = [
-        f"  Cron: {'running' if status['enabled'] else 'stopped'}, {status['jobs']} job(s)"
-    ]
-    for job in CRON.list_jobs(include_disabled=True, include_system=False):
-        state_bits = []
-        if job.state.next_run_at_ms:
-            state_bits.append(
-                "next " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job.state.next_run_at_ms / 1000))
-            )
-        if job.state.last_status:
-            state_bits.append(f"last {job.state.last_status}")
-        state = f" [{' | '.join(state_bits)}]" if state_bits else ""
-        lines.append(f"  - {job.id} {job.name} ({'on' if job.enabled else 'off'}){state}")
-    return lines
-
-
-def _render_cron_table() -> None:
-    jobs = CRON.list_jobs(include_disabled=True, include_system=False)
-    status = CRON.status(include_system=False)
-    console.print(
-        f"[dim]  Cron: {'running' if status['enabled'] else 'stopped'}, "
-        f"{status['jobs']} job(s)[/dim]"
-    )
-    if not jobs:
-        console.print("[dim]  No scheduled jobs.[/dim]")
-        return
-
-    table = Table(show_header=True, header_style="bold cyan", box=None)
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Name")
-    table.add_column("Schedule")
-    table.add_column("State", no_wrap=True)
-    table.add_column("Message")
-
-    for job in jobs:
-        if job.schedule.kind == "every" and job.schedule.every_ms:
-            schedule = f"every {job.schedule.every_ms // 1000}s"
-        elif job.schedule.kind == "cron":
-            tz = f" {job.schedule.tz}" if job.schedule.tz else ""
-            schedule = f"{job.schedule.expr}{tz}"
-        elif job.schedule.kind == "at" and job.schedule.at_ms:
-            schedule = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job.schedule.at_ms / 1000))
-        else:
-            schedule = job.schedule.kind
-
-        state_parts = ["on" if job.enabled else "off"]
-        if job.state.next_run_at_ms:
-            state_parts.append(
-                "next " + time.strftime("%m-%d %H:%M:%S", time.localtime(job.state.next_run_at_ms / 1000))
-            )
-        if job.state.last_status:
-            state_parts.append(f"last {job.state.last_status}")
-        message = " ".join(job.payload.message.split())
-        if len(message) > 56:
-            message = message[:53] + "..."
-        table.add_row(job.id, job.name, schedule, " | ".join(state_parts), message)
-
-    console.print(table)
-
-
-async def _handle_cron_command(query: str) -> None:
-    parts = shlex.split(query)
-    if len(parts) == 1:
-        _render_cron_table()
-        return
-
-    sub = parts[1].lower()
-    if sub in {"list", "ls"}:
-        _render_cron_table()
-        return
-    if sub == "status":
-        for line in _format_cron_snapshot():
-            console.print(f"[dim]{line}[/dim]")
-        return
-    if sub in {"rm", "remove", "run", "on", "off"}:
-        if len(parts) < 3:
-            console.print(f"[dim]  Usage: /cron {sub} <job_id>[/dim]")
-            return
-        job_id = parts[2]
-        if sub in {"rm", "remove"}:
-            result = CRON.remove_job(job_id)
-            if result == "removed":
-                msg = "Removed " + job_id
-            elif result == "protected":
-                msg = "Job is system-managed: " + job_id
-            else:
-                msg = "Job not found: " + job_id
-            console.print(f"[dim]  {msg}[/dim]")
-            return
-        if sub == "run":
-            ran = await CRON.run_job(job_id, force=True)
-            console.print(f"[dim]  {'Ran ' + job_id if ran else 'Job not found: ' + job_id}[/dim]")
-            return
-        if sub == "on":
-            job = CRON.enable_job(job_id, True)
-            if job == "protected":
-                msg = "Job is system-managed: " + job_id
-            else:
-                msg = "Enabled " + job_id if job else "Job not found: " + job_id
-            console.print(f"[dim]  {msg}[/dim]")
-            return
-        if sub == "off":
-            job = CRON.enable_job(job_id, False)
-            if job == "protected":
-                msg = "Job is system-managed: " + job_id
-            else:
-                msg = "Disabled " + job_id if job else "Job not found: " + job_id
-            console.print(f"[dim]  {msg}[/dim]")
-            return
-
-    if sub == "add":
-        if len(parts) < 5:
-            console.print("[dim]  Usage: /cron add every <seconds> <message>[/dim]")
-            console.print("[dim]         /cron add at <iso-datetime> <message>[/dim]")
-            console.print("[dim]         /cron add expr <cron-expr> <message> [tz][/dim]")
-            return
-        mode = parts[2].lower()
-        if mode == "every":
-            try:
-                seconds = int(parts[3])
-            except ValueError:
-                console.print("[dim]  Invalid seconds value.[/dim]")
-                return
-            message = " ".join(parts[4:]).strip()
-            job = CRON.add_job(
-                name=message[:40],
-                schedule=CronSchedule(kind="every", every_ms=seconds * 1000),
-                message=message,
-                deliver=True,
-                channel="cli",
-                to="direct",
-                session_key="manual_cron",
-            )
-            console.print(f"[dim]  Created job {job.id} ({job.name}).[/dim]")
-            return
-        if mode == "at":
-            try:
-                at_ms = int(datetime.fromisoformat(parts[3]).timestamp() * 1000)
-            except ValueError:
-                console.print("[dim]  Invalid ISO datetime.[/dim]")
-                return
-            message = " ".join(parts[4:]).strip()
-            job = CRON.add_job(
-                name=message[:40],
-                schedule=CronSchedule(kind="at", at_ms=at_ms),
-                message=message,
-                deliver=True,
-                channel="cli",
-                to="direct",
-                session_key="manual_cron",
-                delete_after_run=True,
-            )
-            console.print(f"[dim]  Created job {job.id} ({job.name}).[/dim]")
-            return
-        if mode == "expr":
-            if len(parts) < 5:
-                console.print("[dim]  Usage: /cron add expr <cron-expr> <message> [tz][/dim]")
-                return
-            if _get_croniter() is None:
-                console.print("[dim]  croniter is not installed, cron expressions are unavailable.[/dim]")
-                return
-            expr = parts[3]
-            message = parts[4]
-            tz = parts[5] if len(parts) >= 6 else None
-            job = CRON.add_job(
-                name=message[:40],
-                schedule=CronSchedule(kind="cron", expr=expr, tz=tz),
-                message=message,
-                deliver=True,
-                channel="cli",
-                to="direct",
-                session_key="manual_cron",
-            )
-            console.print(f"[dim]  Created job {job.id} ({job.name}).[/dim]")
-            return
-
-    console.print("[dim]  Unknown /cron usage. Subcommands: list, run, rm, on, off, add[/dim]")
-
-
-def _render_history(history: list[dict]) -> None:
-    """Pretty-print previous conversation after /resume, dimmed with a divider."""
-    def _is_visible(m: dict) -> bool:
-        if m.get("role") not in ("user", "assistant"):
-            return False
-        c = m.get("content")
-        if not isinstance(c, str) or not c.strip():
-            return False
-        skip_prefixes = (
-            "<background-results>",
-            "<reminder>",
-            "[System: Context auto-compressed",
-            "[System: User was idle",
-        )
-        return not c.startswith(skip_prefixes)
-
-    visible = [m for m in history if _is_visible(m)]
-    if not visible:
-        return
-
-    shown = visible[-_REPLAY_TAIL:]
-    omitted = len(visible) - len(shown)
-
-    console.rule("[dim]session history[/dim]", style="dim")
-    if omitted > 0:
-        console.print(
-            f"[dim italic]  \u2026 {omitted} earlier message(s) hidden \u2026[/dim italic]\n"
-        )
-
-    for msg in shown:
-        body = msg["content"]
-        if len(body) > 2000:
-            body = body[:2000] + f"\n[\u2026 {len(body) - 2000} chars truncated \u2026]"
-        # Escape Rich markup so user content like "[bold]" isn't interpreted.
-        from rich.markup import escape
-        body_esc = escape(body)
-        if msg["role"] == "user":
-            console.print(f"[dim bold]You:[/dim bold] [dim]{body_esc}[/dim]")
-        else:
-            console.print(f"[dim bold cyan]Edgebot:[/dim bold cyan] [dim]{body_esc}[/dim]")
-        console.print()
-
-    console.rule(style="dim")
-    console.print()
-
-
-def _time_ago(dt) -> str:
-    delta = time.time() - dt.timestamp()
-    if delta < 60:
-        return "just now"
-    if delta < 3600:
-        return f"{int(delta // 60)}m ago"
-    if delta < 86400:
-        return f"{int(delta // 3600)}h ago"
-    return f"{int(delta // 86400)}d ago"
-
-
-def _format_timestamp(ts: float | None) -> str:
-    if not ts:
-        return "-"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _render_subagent_list() -> None:
-    tasks = SUBAGENT.list_all()
-    if not tasks:
-        console.print("[dim]  No subagents.[/dim]")
-        return
-
-    table = Table(show_header=True, header_style="bold cyan", box=None)
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Status", no_wrap=True)
-    table.add_column("Mode", no_wrap=True)
-    table.add_column("Capability", no_wrap=True)
-    table.add_column("Tools", no_wrap=True)
-    table.add_column("Started", no_wrap=True)
-    table.add_column("Description")
-
-    for task in tasks:
-        mode = "bg" if task.get("is_backgrounded", True) else "fg"
-        table.add_row(
-            task["task_id"],
-            task["status"],
-            mode,
-            task.get("capability", "-"),
-            str(task.get("tool_uses", 0)),
-            _format_timestamp(task.get("started_at")),
-            task.get("description", ""),
-        )
-    console.print(table)
-
-
-def _print_subagent_blob(title: str, body: str) -> None:
-    console.rule(f"[dim]{title}[/dim]", style="dim")
-    console.print(escape(body) if body else "[dim](empty)[/dim]", highlight=False, soft_wrap=True)
-
-
-def _render_subagent_detail(task: dict[str, object]) -> None:
-    if task.get("error") and "task_id" not in task:
-        console.print(f"[dim]  {task['error']}[/dim]")
-        return
-
-    status = str(task.get("status", "-"))
-    mode = "background" if task.get("is_backgrounded", True) else "foreground"
-    console.print(f"[cyan]{escape(str(task.get('task_id', '-')))}[/cyan] [dim]({escape(status)} / {mode})[/dim]")
-    console.print(f"[dim]  Capability : {escape(str(task.get('capability', '-')))}[/dim]")
-    console.print(f"[dim]  Description: {escape(str(task.get('description', '')))}[/dim]")
-    console.print(f"[dim]  Started    : {_format_timestamp(task.get('started_at'))}[/dim]")
-    console.print(f"[dim]  Finished   : {_format_timestamp(task.get('finished_at'))}[/dim]")
-    console.print(f"[dim]  Tool uses  : {task.get('tool_uses', 0)}[/dim]")
-    console.print(f"[dim]  Output     : {escape(str(task.get('output_file', '-')))}[/dim]")
-    console.print(f"[dim]  Transcript : {escape(str(task.get('transcript_file', '-')))}[/dim]")
-    if task.get("stop_requested"):
-        console.print(f"[dim]  Stop req   : {escape(str(task.get('stop_reason') or 'requested'))}[/dim]")
-    if task.get("error") and status not in {"running"}:
-        console.print(f"[dim]  Error      : {escape(str(task.get('error')))}[/dim]")
-
-    output_preview = str(task.get("output_preview", "") or "")
-    transcript_preview = str(task.get("transcript_preview", "") or "")
-    if output_preview:
-        _print_subagent_blob("output preview", output_preview)
-    if transcript_preview:
-        _print_subagent_blob("transcript preview", transcript_preview)
-    console.print()
-
-
-def _resolve_session_summary(state: dict) -> str | None:
-    """Prefer explicit session metadata, then fall back to compacted history."""
-    metadata = state.get("metadata", {})
-    summary = metadata.get("session_summary")
-    if isinstance(summary, str) and summary.strip():
-        return summary.strip()
-    return extract_session_summary(state.get("messages", []))
-
-
-def load_session_for_resume(
-    store: SessionStore,
-    session_key: str,
-) -> tuple[list[dict], str | None]:
-    """Load persisted session history and summary for /resume."""
-    state = store.load_state(session_key)
-    return list(state["messages"]), _resolve_session_summary(state)
-
-
 async def _pick_session_interactive(
     sessions: list[dict],
     *,
@@ -1722,29 +1118,6 @@ async def _pick_session_interactive(
     with patch_stdout():
         return await app.run_async()
 
-
-_LOGO = """
-[bold cyan]    ,------.    [/bold cyan]
-[bold cyan]   / ,----. \\   [/bold cyan]    [bold white]E D G E B O T[/bold white]
-[bold blue]  / / ,--| \\ \\  [/bold blue]    [dim]Autonomous Workspace Agent[/dim]
-[bold blue]  \\ \\ `--/ / /  [/bold blue]
-[bold magenta]   \\ -----/ /   [/bold magenta]    [dim]Model:[/dim] [cyan]{model}[/cyan]
-[bold purple]    `------'    [/bold purple]
-"""
-
-
-def _print_banner(heartbeat) -> None:
-    console.print(_LOGO.format(model=MODEL))
-    for line in _format_cron_snapshot():
-        console.print(f"[dim]{line}[/dim]")
-    hb = heartbeat.status()
-    console.print(
-        f"[dim]  Heartbeat: {'running' if hb['running'] else 'stopped'}, "
-        f"every {hb['interval_s']}s, file={'yes' if hb['present'] else 'no'}[/dim]"
-    )
-    if hb.get("last_action"):
-        console.print(f"[dim]  Heartbeat last: {hb['last_action']} ({hb.get('last_reason') or 'n/a'})[/dim]")
-    console.print("  [dim]Type [bold]/help[/bold] for commands, [bold]exit[/bold] to quit[/dim]\n")
 
 
 async def main():

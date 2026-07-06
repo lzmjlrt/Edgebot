@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from edgebot.cli.repl import load_session_for_resume
 from edgebot.agent.autocompact import AutoCompact
 from edgebot.agent.consolidator import Consolidator
 from edgebot.providers.base import LLMResponse
@@ -81,3 +82,19 @@ def test_consolidator_file_cap_archives_only_unconsolidated_dropped_messages(tmp
     assert "message 2" in records[0]["content"]
     assert "message 3" in records[0]["content"]
     assert "message 0" not in records[0]["content"]
+
+
+def test_resume_loads_idle_session_without_compacting(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    messages = _messages(14)
+    state = store.load_state("s1")
+    state["messages"] = messages
+    state["metadata"]["session_summary"] = "- existing summary"
+    state["updated_at"] = datetime.now(timezone.utc) - timedelta(hours=2)
+    store.save_state("s1", state)
+
+    history, summary = load_session_for_resume(store, "s1")
+
+    assert history == messages
+    assert summary == "- existing summary"
+    assert store.load_state("s1")["messages"] == messages

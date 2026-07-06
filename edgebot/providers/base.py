@@ -36,6 +36,10 @@ class ToolCallRequest:
     def has_valid_name(self) -> bool:
         return is_valid_tool_name(self.name)
 
+    def is_valid(self) -> bool:
+        """Whether the call has a non-empty id and a valid tool name."""
+        return bool(self.id) and is_valid_tool_name(self.name)
+
     def to_openai_tool_call(self) -> dict[str, Any]:
         return {
             "id": self.id,

@@ -38,11 +38,11 @@ def test_dream_toolset_includes_skill_write_tool(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path, memory_dir=tmp_path / ".edgebot" / "memory")
     processor = DreamProcessor(store, FakeProvider(), emit_output=False)
 
-    tools, handlers = processor._build_dream_tools()
-    names = [tool["function"]["name"] for tool in tools]
+    registry = processor._build_dream_tools()
+    names = [tool["function"]["name"] for tool in registry.get_definitions()]
 
     assert "write_file" in names
-    assert "write_file" in handlers
+    assert registry.get("write_file") is not None
 
 
 def test_dream_write_only_creates_skill_markdown(monkeypatch, tmp_path: Path) -> None:

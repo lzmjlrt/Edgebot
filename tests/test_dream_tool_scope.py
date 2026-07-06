@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from edgebot.agent.memory import _DreamEditTool, _DreamReadTool
+from edgebot.agent.memory import DreamProcessor, MemoryStore, _DreamEditTool, _DreamReadTool
+from edgebot.tools.registry import ToolRegistry
 
 
 def _write(path: Path, content: str) -> None:
@@ -62,7 +63,7 @@ def test_dream_read_returns_content_after_global_read_dedup(monkeypatch, tmp_pat
     from edgebot.tools.filesystem import run_read
 
     monkeypatch.setattr(tool_base, "WORKDIR", tmp_path)
-    file_state._state.clear()
+    file_state.clear()
     memory_file = tmp_path / ".edgebot" / "memory" / "MEMORY.md"
     _write(memory_file, "- Durable fact: current")
 
@@ -80,3 +81,17 @@ def test_dream_read_schema_exposes_force_parameter() -> None:
 
     assert "force" in schema["properties"]
     assert schema["properties"]["force"]["type"] == "boolean"
+
+
+def test_dream_builds_restricted_tool_registry(tmp_path: Path) -> None:
+    processor = DreamProcessor(
+        MemoryStore(tmp_path),
+        provider=object(),
+        emit_output=False,
+    )
+
+    registry = processor._build_dream_tools()
+
+    assert isinstance(registry, ToolRegistry)
+    assert sorted(registry.tool_names) == ["edit_file", "read_file", "write_file"]
+    assert registry.get("bash") is None

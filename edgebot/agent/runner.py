@@ -48,6 +48,12 @@ _MALFORMED_TOOL_CALL_REPAIR_PROMPT = (
     "invalid function names. Retry with valid tool names matching "
     "^[A-Za-z0-9_-]{1,64}$, or answer without tools."
 )
+_PARTIAL_MALFORMED_TOOL_CALL_REPAIR_PROMPT = (
+    "The previous model response contained a mix of valid and malformed tool "
+    "calls. Valid: {valid_names}. Malformed: {malformed_names}. "
+    "Retry with only valid tool names matching ^[A-Za-z0-9_-]{{1,64}}$, "
+    "or answer without tools."
+)
 _MAX_MALFORMED_TOOL_CALL_REPAIRS = 2
 _REPEATED_TOOL_CALL_REPAIR_THRESHOLD = 3
 _REPEATED_TOOL_CALL_STOP_THRESHOLD = 5
@@ -331,7 +337,7 @@ class AgentRunner:
                 valid_tool_calls = [
                     tc for tc in response.tool_calls if tc.has_valid_name()
                 ]
-                if not valid_tool_calls:
+                if len(valid_tool_calls) != len(response.tool_calls):
                     malformed_tool_call_repairs += 1
                     if malformed_tool_call_repairs > _MAX_MALFORMED_TOOL_CALL_REPAIRS:
                         final_content = (
@@ -352,9 +358,22 @@ class AgentRunner:
                         })
                         break
 
+                    invalid_names = sorted({
+                        tc.name or "(empty)"
+                        for tc in response.tool_calls
+                        if not tc.has_valid_name()
+                    })
+                    valid_names = sorted({tc.name for tc in valid_tool_calls})
+                    if valid_tool_calls:
+                        prompt = _PARTIAL_MALFORMED_TOOL_CALL_REPAIR_PROMPT.format(
+                            valid_names=", ".join(valid_names),
+                            malformed_names=", ".join(invalid_names),
+                        )
+                    else:
+                        prompt = _MALFORMED_TOOL_CALL_REPAIR_PROMPT
                     append_message({
                         "role": "user",
-                        "content": _MALFORMED_TOOL_CALL_REPAIR_PROMPT,
+                        "content": prompt,
                     })
                     empty_content_retries = 0
                     continue

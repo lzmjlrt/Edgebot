@@ -17,7 +17,7 @@ from litellm import exceptions as _litellm_exc
 
 litellm.suppress_debug_info = True
 
-from edgebot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
+from edgebot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest, is_valid_tool_name
 
 
 class LiteLLMProvider(LLMProvider):
@@ -145,7 +145,7 @@ class LiteLLMProvider(LLMProvider):
                 arguments=_parse_json(b["arguments"] or "{}"),
             )
             for _, b in sorted(tool_calls_buf.items())
-            if b["name"]
+            if is_valid_tool_name(b["name"])
         ]
 
         return LLMResponse(
@@ -163,10 +163,13 @@ class LiteLLMProvider(LLMProvider):
         tool_calls: list[ToolCallRequest] = []
         for tc in getattr(choice.message, "tool_calls", None) or []:
             fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", "") if fn else ""
+            if not name or not is_valid_tool_name(name):
+                continue
             args = _parse_json(getattr(fn, "arguments", "{}") or "{}") if fn else {}
             tool_calls.append(ToolCallRequest(
                 id=tc.id,
-                name=getattr(fn, "name", "") if fn else "",
+                name=name,
                 arguments=args,
             ))
 

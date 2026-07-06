@@ -24,6 +24,83 @@ def _tool_call(call_id: str, name: str) -> dict:
     }
 
 
+def test_tool_call_request_validates_openai_compatible_names() -> None:
+    assert ToolCallRequest("call_1", "bash", {}).has_valid_name()
+    assert ToolCallRequest("call_2", "mcp_filesystem_read_file", {}).has_valid_name()
+    assert ToolCallRequest("call_3", "TodoWrite", {}).has_valid_name()
+
+    assert not ToolCallRequest("bad_empty", "", {}).has_valid_name()
+    assert not ToolCallRequest("bad_blank", "   ", {}).has_valid_name()
+    assert not ToolCallRequest("bad_space", "read file", {}).has_valid_name()
+    assert not ToolCallRequest("bad_dot", "mcp.server.tool", {}).has_valid_name()
+    assert not ToolCallRequest("bad_long", "a" * 65, {}).has_valid_name()
+
+
+def test_tool_call_request_is_valid_checks_id_and_name() -> None:
+    # Valid: non-empty id and valid name
+    assert ToolCallRequest("call_1", "bash", {}).is_valid()
+    assert ToolCallRequest("x", "TodoWrite", {}).is_valid()
+
+    # Invalid: empty id
+    assert not ToolCallRequest("", "bash", {}).is_valid()
+    assert not ToolCallRequest("", "TodoWrite", {}).is_valid()
+
+    # Invalid: invalid name
+    assert not ToolCallRequest("call_1", "", {}).is_valid()
+    assert not ToolCallRequest("call_1", "read file", {}).is_valid()
+
+    # Invalid: both empty
+    assert not ToolCallRequest("", "", {}).is_valid()
+
+
+def test_provider_sync_parser_filters_invalid_tool_names() -> None:
+    from edgebot.providers.litellm_provider import LiteLLMProvider
+
+    class _FakeToolCall:
+        def __init__(self, call_id, name):
+            self.id = call_id
+            self.function = type("_Fn", (), {"name": name, "arguments": "{}"})()
+
+    class _FakeChoice:
+        def __init__(self, tool_calls):
+            self.message = type("_Msg", (), {"content": None, "tool_calls": tool_calls or []})()
+            self.finish_reason = "tool_calls"
+
+    class _FakeResponse:
+        def __init__(self, tool_calls):
+            self.choices = [_FakeChoice(tool_calls)]
+            self.usage = None
+
+    # All valid
+    resp = LiteLLMProvider._parse_sync_response(_FakeResponse([
+        _FakeToolCall("id_1", "bash"),
+        _FakeToolCall("id_2", "read_file"),
+    ]))
+    assert len(resp.tool_calls) == 2
+    assert resp.tool_calls[0].name == "bash"
+    assert resp.tool_calls[1].name == "read_file"
+
+    # All invalid
+    resp = LiteLLMProvider._parse_sync_response(_FakeResponse([
+        _FakeToolCall("id_1", ""),
+        _FakeToolCall("id_2", "bad name"),
+    ]))
+    assert len(resp.tool_calls) == 0
+
+    # Mixed valid/invalid
+    resp = LiteLLMProvider._parse_sync_response(_FakeResponse([
+        _FakeToolCall("id_1", ""),
+        _FakeToolCall("id_2", "bash"),
+        _FakeToolCall("id_3", "bad.name"),
+    ]))
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "bash"
+
+    # No tool calls
+    resp = LiteLLMProvider._parse_sync_response(_FakeResponse([]))
+    assert len(resp.tool_calls) == 0
+
+
 def test_runner_offloads_large_non_read_file_tool_result(tmp_path: Path) -> None:
     original_output = "A" * 5000
     provider = CapturingProvider([
@@ -115,6 +192,122 @@ def test_runner_new_messages_exclude_model_facing_backfills() -> None:
         for msg in provider.calls[0]
     )
     assert result.messages[:len(messages)] == messages
+    assert result.new_messages == [{"role": "assistant", "content": "final"}]
+
+
+def test_runner_reprompts_without_persisting_malformed_only_tool_calls() -> None:
+    executed = False
+
+    def bad_tool():
+        nonlocal executed
+        executed = True
+        raise AssertionError("malformed tool call should not execute")
+
+    provider = CapturingProvider([
+        LLMResponse(
+            content=None,
+            tool_calls=[ToolCallRequest("bad_call", "", {})],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(content="done", finish_reason="stop"),
+    ])
+
+    result = asyncio.run(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "please use a tool"}],
+        provider=provider,
+        tools=[],
+        tool_handlers={"": bad_tool},
+        model="test-model",
+        max_iterations=2,
+        emit_output=False,
+    )))
+
+    assert executed is False
+    assert result.new_messages == [
+        {
+            "role": "user",
+            "content": (
+                "The previous model response contained malformed tool calls with "
+                "invalid function names. Retry with valid tool names matching "
+                "^[A-Za-z0-9_-]{1,64}$, or answer without tools."
+            ),
+        },
+        {"role": "assistant", "content": "done"},
+    ]
+    assert not any(msg.get("role") == "assistant" and msg.get("tool_calls") for msg in result.new_messages)
+    assert "malformed tool calls" in provider.calls[1][-1]["content"]
+
+
+def test_runner_executes_and_persists_only_valid_mixed_tool_calls() -> None:
+    """When tool calls are mixed valid/invalid, none should execute.
+
+    The runner sends a repair prompt listing which names were invalid and
+    which were valid, so the model can retry cleanly.
+    """
+    executed: list[str] = []
+    provider = CapturingProvider([
+        LLMResponse(
+            content=None,
+            tool_calls=[
+                ToolCallRequest("bad_call", "", {}),
+                ToolCallRequest("good_call", "known_tool", {}),
+                ToolCallRequest("bad_space", "known tool", {}),
+            ],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(content="done", finish_reason="stop"),
+    ])
+
+    result = asyncio.run(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "run tool"}],
+        provider=provider,
+        tools=[],
+        tool_handlers={"known_tool": lambda: executed.append("known_tool") or "ok"},
+        model="test-model",
+        max_iterations=2,
+        emit_output=False,
+    )))
+
+    # Mixed valid/invalid: NONE should execute.
+    assert executed == []
+    # The repair prompt must mention the malformed names and the valid names.
+    repair_msg = result.new_messages[0]
+    assert repair_msg["role"] == "user"
+    assert "known_tool" in repair_msg["content"]
+    assert "(empty)" in repair_msg["content"]
+    assert "known tool" in repair_msg["content"]
+    # No assistant tool_calls persisted.
+    assert not any(
+        msg.get("role") == "assistant" and msg.get("tool_calls")
+        for msg in result.new_messages
+    )
+    assert result.tool_names_used == []
+
+
+def test_model_facing_history_strips_malformed_tool_calls_and_results() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old command"},
+        {"role": "assistant", "content": None, "tool_calls": [_tool_call("bad_call", "")]},
+        {"role": "tool", "tool_call_id": "bad_call", "name": "", "content": "bad output"},
+        {"role": "user", "content": "current"},
+    ]
+    provider = CapturingProvider([LLMResponse(content="final", finish_reason="stop")])
+
+    result = asyncio.run(AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=messages,
+        provider=provider,
+        tools=[],
+        tool_handlers={},
+        model="test-model",
+        max_iterations=1,
+        emit_output=False,
+    )))
+
+    assert result.messages[:len(messages)] == messages
+    request = provider.calls[0]
+    assert not any(msg.get("role") == "assistant" and msg.get("tool_calls") for msg in request)
+    assert not any(msg.get("role") == "tool" and msg.get("tool_call_id") == "bad_call" for msg in request)
     assert result.new_messages == [{"role": "assistant", "content": "final"}]
 
 

@@ -551,7 +551,7 @@ class AgentRunner:
 def _print_tool_hint(
     name: str, arguments: dict[str, Any], spec: AgentRunSpec
 ) -> None:
-    from edgebot.cli.tool_hints import format_tool_hint
+    from edgebot.agent.tool_hints import format_tool_hint
     hint = format_tool_hint(name, arguments)
     if spec.emit_output:
         _console.print(f"  [dim]↳ {hint}[/dim]")

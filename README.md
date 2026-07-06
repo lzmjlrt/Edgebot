@@ -41,11 +41,22 @@ edgebot/
 ├── agent/
 │   ├── loop.py              # Main turn orchestration & notification draining
 │   ├── runner.py            # Shared LLM-call / tool-execution loop (AgentRunner)
+│   ├── tool_repeat.py       # Repeated-tool-call guard (signatures, repair prompts)
+│   ├── tool_hints.py        # Human-readable tool-call summaries
 │   ├── context_governance.py # Model-facing transcript repair and token budgets
 │   ├── tool_results.py      # Tool output truncation/offload policy
-│   ├── context.py           # Auto-seeds templates & bootstrap config
+│   ├── context.py           # System prompt assembly & runtime-context injection
+│   ├── workspace_setup.py   # Auto-seeds templates & bootstrap config
 │   ├── compression.py       # Token estimation, microcompact, LLM summary
-│   └── memory.py            # Dream-style memory consolidation
+│   ├── consolidator.py      # Token/idle-triggered session archiving
+│   ├── autocompact.py       # Idle-session auto compaction
+│   ├── token_budget.py      # Model context-window / token budgets
+│   └── memory/              # Dream-style memory consolidation
+│       ├── store.py         #   MemoryStore file I/O
+│       ├── heuristics.py    #   Text helpers, history filters, dedup
+│       ├── prompts.py       #   Phase 1/2 prompt templates
+│       ├── dream.py         #   DreamProcessor (two-phase consolidation)
+│       └── dream_tools.py   #   Sandboxed read/edit/write tools
 ├── subagent/
 │   ├── runner.py            # Isolated subagent task manager (delegates to AgentRunner)
 │   └── capabilities.py      # explore / builder / reviewer tool whitelists
@@ -67,7 +78,15 @@ edgebot/
 ├── skills/
 │   └── loader.py            # Automatic SKILL.md discovery & extraction
 └── cli/
-    └── repl.py              # Interactive REPL, prompt UI, approval handler
+    ├── repl.py              # Interactive REPL, prompt UI, approval handler
+    ├── exec_once.py         # Non-interactive one-shot entry (edgebot exec)
+    ├── ui_state.py          # Shared console / MemoryStore singletons
+    ├── textkit.py           # Display-width text helpers
+    ├── permission_meta.py   # Permission-request classification
+    ├── render.py            # Read-only renderers, banner, help text
+    ├── dream_commands.py    # /dream-log and /dream-restore handlers
+    ├── cron_commands.py     # /cron handler and cron rendering
+    └── session_resume.py    # Session loading for /resume
 ```
 
 ## 📦 Install & Quick Start

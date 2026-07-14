@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Iterator
 
-from edgebot.config import MEMORY_DIR
+from edgebot.config import MEMORY_DIR, runtime_dir_for_workspace
 from edgebot.utils.gitstore import GitStore
 
 from edgebot.agent.memory.heuristics import (
@@ -41,7 +41,11 @@ class MemoryStore:
 
     def __init__(self, workspace: Path, *, memory_dir: Path | None = None):
         self.workspace = Path(workspace)
-        runtime_dir = Path(memory_dir).parent if memory_dir is not None else self.workspace / ".edgebot"
+        runtime_dir = (
+            Path(memory_dir).parent
+            if memory_dir is not None
+            else runtime_dir_for_workspace(self.workspace)
+        )
         self.memory_dir = Path(memory_dir) if memory_dir is not None else runtime_dir / "memory"
         runtime_dir = self.memory_dir.parent
         self.memory_file = self.memory_dir / "MEMORY.md"

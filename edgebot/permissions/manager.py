@@ -28,7 +28,7 @@ from edgebot.permissions.defaults import (
     DEFAULT_BASH_PROGRAMS,
     INTERPRETER_PROGRAMS,
 )
-from edgebot.tools.shell import is_read_only_command
+from edgebot.tools.shell import is_read_only_command, is_safe_development_command
 
 
 PromptHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
@@ -69,7 +69,18 @@ class PermissionManager:
         "web_fetch",
         "web_search",
     }
-    _DEFAULT_MODE_VALUES = {"ask", "acceptEdits", "bypassPermissions"}
+    _DEFAULT_MODE_VALUES = {"ask", "acceptEdits", "auto", "bypassPermissions"}
+    _AUTO_EDIT_PROTECTED_NAMES = {
+        "agents.md",
+        "heartbeat.md",
+        "mcp_servers.json",
+        "permissions.json",
+        "skill.md",
+        "soul.md",
+        "tools.md",
+        "user.md",
+    }
+    _AUTO_EDIT_PROTECTED_DIRECTORIES = {".claude", ".edgebot", ".git"}
     _TOOL_ALIASES = {
         "bash": "bash",
         "write": "write_file",
@@ -166,6 +177,7 @@ class PermissionManager:
             "bash_prefixes": [],
             "bash_deny_patterns": list(DEFAULT_BASH_DENY_PATTERNS),
             "workspace_write_auto_allow": True,
+            "default_mode": "auto",
         }
 
     def _load_or_seed_rules(self) -> dict[str, Any]:
@@ -189,6 +201,8 @@ class PermissionManager:
                 rules[key] = [item for item in value if isinstance(item, str)]
         if isinstance(data.get("workspace_write_auto_allow"), bool):
             rules["workspace_write_auto_allow"] = data["workspace_write_auto_allow"]
+        if data.get("default_mode") in self._DEFAULT_MODE_VALUES:
+            rules["default_mode"] = data["default_mode"]
 
         if data.get("version") != _RULES_VERSION:
             self._write_rules(rules)
@@ -241,7 +255,7 @@ class PermissionManager:
             "deny": [],
             "ask": [],
         }
-        default_mode = "ask"
+        default_mode = str(self._rules.get("default_mode", "auto"))
         for source, path in (
             ("user", self.user_settings_path),
             ("project", self.project_settings_path),
@@ -573,7 +587,7 @@ class PermissionManager:
             return False
 
         if tool_name in {"write_file", "edit_file"} and self._rules.get("workspace_write_auto_allow", True):
-            if self._path_inside_workdir(params.get("path", "")):
+            if self._path_is_safe_auto_edit(params.get("path", "")):
                 return True
 
         return False
@@ -589,6 +603,22 @@ class PermissionManager:
             return is_path_within_workspace(path_str)
         except (OSError, ValueError):
             return False
+
+    @classmethod
+    def _path_is_safe_auto_edit(cls, raw_path: Any) -> bool:
+        if not cls._path_inside_workdir(raw_path):
+            return False
+        try:
+            path = Path(str(raw_path)).expanduser()
+            name = path.name.casefold()
+            parts = {part.casefold() for part in path.parts}
+        except (OSError, ValueError):
+            return False
+        if parts & cls._AUTO_EDIT_PROTECTED_DIRECTORIES:
+            return False
+        if name in cls._AUTO_EDIT_PROTECTED_NAMES:
+            return False
+        return not (name == ".env" or name.startswith(".env."))
 
     def _build_request(self, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         tool_name = self._canonical_tool_name(tool_name)
@@ -752,11 +782,16 @@ class PermissionManager:
             return PermissionDecision("allow", updated_params=params)
 
         if settings_decision != "ask":
+            if self._default_mode == "auto" and tool_name == "bash":
+                command = str(params.get("command", "")).strip()
+                if is_safe_development_command(command):
+                    return PermissionDecision("allow", updated_params=params)
             if self._default_mode == "bypassPermissions":
                 return PermissionDecision("allow", updated_params=params)
             if (
                 self._default_mode == "acceptEdits"
                 and tool_name in {"write_file", "edit_file"}
+                and self._path_is_safe_auto_edit(params.get("path", ""))
             ):
                 return PermissionDecision("allow", updated_params=params)
             if not self._tool_is_sensitive(tool_name, params, tool):
@@ -845,10 +880,14 @@ class PermissionManager:
             return False
         if self._matches_allow_rule(tool_name, params):
             return False
+        if self._default_mode == "auto" and tool_name == "bash":
+            command = str(params.get("command", "")).strip()
+            if is_safe_development_command(command):
+                return False
         if self._default_mode == "bypassPermissions":
             return False
         if self._default_mode == "acceptEdits" and tool_name in {"write_file", "edit_file"}:
-            return False
+            return not self._path_is_safe_auto_edit(params.get("path", ""))
         return self._tool_is_sensitive(tool_name, params, tool)
 
     def list_rules(self) -> dict[str, Any]:

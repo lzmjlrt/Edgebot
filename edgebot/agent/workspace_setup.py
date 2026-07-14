@@ -2,8 +2,9 @@
 edgebot/agent/workspace_setup.py - Workspace template and config seeding.
 
 One-shot startup setup: copies shipped templates (SOUL.md, AGENTS.md, USER.md,
-TOOLS.md, HEARTBEAT.md, default skills, mcp_servers.json) into .edgebot/ and
-creates the workspace-local config.env. Never overwrites user-edited files.
+TOOLS.md, HEARTBEAT.md, default skills, mcp_servers.json) into the per-workspace
+runtime directory and creates a user-local config.env. Never overwrites user-edited
+files.
 
 Config values are imported lazily inside the functions (not at module import
 time) so that callers which reload edgebot.config — e.g. tests that re-import
@@ -58,7 +59,7 @@ def _seed_runtime_config() -> None:
     if RUNTIME_CONFIG_ENV.exists():
         return
     lines = [
-        "# Workspace-local Edgebot LLM settings.",
+        "# Per-workspace Edgebot LLM settings.",
         "# Values here override the workspace .env on the next Edgebot start.",
         f"MODEL_ID={MODEL}",
         "# API_KEY=your-api-key-here",
@@ -77,12 +78,12 @@ def _seed_runtime_config() -> None:
         "",
     ])
     RUNTIME_CONFIG_ENV.write_text("\n".join(lines), encoding="utf-8")
-    print("[setup] Created .edgebot/config.env")
+    print(f"[setup] Created runtime config: {RUNTIME_CONFIG_ENV}")
 
 
 def seed_workspace_templates() -> None:
     """
-    Copy default template files to the workspace if they don't already exist.
+    Copy default template files to user-level runtime state if absent.
     Called once at startup — never overwrites user-edited files.
     """
     from edgebot.config import MCP_CONFIG_PATH, RUNTIME_DIR, SKILLS_DIR, WORKDIR
@@ -99,17 +100,17 @@ def seed_workspace_templates() -> None:
         if not dst.exists() and src.exists():
             if legacy.exists():
                 shutil.copy2(legacy, dst)
-                print(f"[setup] Imported {filename} into .edgebot/")
+                print(f"[setup] Imported {filename} into runtime state")
             else:
                 shutil.copy2(src, dst)
-                print(f"[setup] Created .edgebot/{filename}")
+                print(f"[setup] Created runtime file: {dst}")
 
     # Seed skills
     skills_src_dir = _TEMPLATES_DIR / "skills"
     skills_dst_dir = SKILLS_DIR
     if not skills_dst_dir.exists() and skills_src_dir.exists():
         shutil.copytree(skills_src_dir, skills_dst_dir)
-        print("[setup] Created .edgebot/skills directory")
+        print(f"[setup] Created runtime skills directory: {skills_dst_dir}")
 
     # Seed MCP config
     mcp_src = _TEMPLATES_DIR / "mcp_servers.json"
@@ -118,7 +119,7 @@ def seed_workspace_templates() -> None:
     if not mcp_dst.exists() and mcp_src.exists():
         if legacy_mcp.exists():
             shutil.copy2(legacy_mcp, mcp_dst)
-            print("[setup] Imported mcp_servers.json into .edgebot/")
+            print("[setup] Imported mcp_servers.json into runtime state")
         else:
             shutil.copy2(mcp_src, mcp_dst)
-            print("[setup] Created .edgebot/mcp_servers.json")
+            print(f"[setup] Created runtime MCP config: {mcp_dst}")

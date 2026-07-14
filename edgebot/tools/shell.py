@@ -273,6 +273,55 @@ def is_read_only_command(command: str) -> bool:
     return all(_is_read_only_segment(segment, allow_piped=False) for segment in segments)
 
 
+def is_safe_development_command(command: str) -> bool:
+    """Return whether *command* is a narrow, local development operation.
+
+    These commands are eligible for Edgebot's explicit ``auto`` permission
+    mode. The allowlist intentionally excludes installers, build commands,
+    arbitrary scripts, shell operators, and redirections.
+    """
+    stripped = command.strip()
+    if not stripped or any(token in stripped for token in ("&", "|", ";", ">", "<", "$(", "`")):
+        return False
+    try:
+        import shlex
+
+        tokens = shlex.split(stripped, posix=True)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    program = Path(tokens[0]).stem.lower()
+    arguments = [token.lower() for token in tokens[1:]]
+    if program in {"pytest", "mypy"}:
+        return True
+    if program in {"python", "python3", "py"}:
+        return len(arguments) >= 2 and arguments[:2] == ["-m", "pytest"]
+    if program == "uv":
+        return len(arguments) >= 2 and arguments[:2] == ["run", "pytest"]
+    if program == "ruff":
+        return bool(arguments) and (
+            arguments[0] == "check"
+            or (arguments[0] == "format" and "--check" in arguments)
+        )
+    if program == "black":
+        return "--check" in arguments
+    if program in {"npm", "pnpm", "yarn"}:
+        return bool(arguments) and (
+            arguments[0] == "test"
+            or (
+                len(arguments) >= 2
+                and arguments[:2] in (["run", "lint"], ["run", "test"], ["run", "typecheck"])
+            )
+        )
+    if program == "go":
+        return bool(arguments) and arguments[0] == "test"
+    if program == "cargo":
+        return bool(arguments) and arguments[0] == "test"
+    return False
+
+
 def _split_segments(command: str) -> list[str]:
     tokens = command.split()
     current: list[str] = []

@@ -194,12 +194,15 @@ Edgebot ships with **20+ tools** categorized logically:
 
 ### 🛡️ Permission Model
 
-Sensitive tools (`bash`, `write_file`, `edit_file`, `background_run`) go through `PermissionManager` before execution. The default policy ships with `.edgebot/permissions.json` auto-seeded on first run:
+Sensitive tools (`bash`, `write_file`, `edit_file`, `background_run`) go through `PermissionManager` before execution. Runtime state is stored outside the repository at `%LOCALAPPDATA%/Edgebot/projects/<workspace-hash>` on Windows (or `~/.edgebot/projects/<workspace-hash>` elsewhere); set `EDGEBOT_HOME` to override the user-level root. This keeps newly opened workspaces clean.
 
 - **`bash_programs`**: program-name allowlist (`git`, `python`, `rg`, `find`, …). Granting `git` covers `git status`, `git log`, `git diff`, etc.—no need to re-approve every subcommand.
 - **`bash_deny_patterns`**: regex blacklist (`rm -rf /`, fork bombs, `dd if=`, …). Matches are hard-denied with a no-retry hint sent back to the model.
-- **`workspace_write_auto_allow`**: writes/edits whose path resolves under the current workspace are auto-allowed; writes outside still prompt.
+- **Auto mode**: normal workspace edits plus narrow local checks (`pytest`, `python -m pytest`, `uv run pytest`, `ruff check`, `mypy`, `black --check`, test/lint scripts, `go test`, `cargo test`) run without repeated prompts.
+- **Protected paths**: `.env*`, `.claude/`, `.edgebot/`, `.git/`, MCP configuration, skills, and agent instruction files always require approval even in Auto or `acceptEdits` mode.
 - **Chain-aware bash parsing**: `cd X && cmd` / `cmd1 | cmd2` / Windows `for %f in (...) do cmd` are split into segments; every segment's program must be allowed (so `cd X && rm -rf .` is still blocked even though `cd` is transparent).
+
+Installers, arbitrary interpreter code, network tools, background jobs, subagents, destructive operations, and commands outside the narrow Auto allowlist still prompt for approval.
 
 When a prompt is needed, the REPL shows a prompt_toolkit picker with the
 requested command or file operation, a short risk description, and three
@@ -208,7 +211,7 @@ choices:
 | Choice | Effect |
 |--------|--------|
 | `Yes` | Allow this one call |
-| `Yes, and don't ask again for ...` | Allow and persist the suggested rule to `.edgebot/permissions.json` |
+| `Yes, and don't ask again for ...` | Allow and persist the suggested rule in the user-level per-workspace runtime state |
 | `No` | Deny |
 
 Use `Up/Down` or `j/k` to move, `Enter` to confirm, `Esc` to deny,
@@ -221,7 +224,7 @@ Inspect the current ruleset anytime with `/permissions`.
 
 ### 🔌 Model Context Protocol (MCP) Support
 
-Edgebot natively bridges with external MCP servers. A default configuration template `mcp_servers.json` drops directly into your workspace. Use `mcpServers` as the canonical key (legacy `servers` is also accepted for compatibility).
+Edgebot natively bridges with external MCP servers. The default configuration template is stored with the per-workspace runtime state rather than in your repository. Use `mcpServers` as the canonical key (legacy `servers` is also accepted for compatibility).
 
 ```json
 {
@@ -240,7 +243,7 @@ Edgebot natively bridges with external MCP servers. A default configuration temp
 
 ### 🧠 Inject Custom Skills
 
-Simply place Markdown files (e.g., `SKILL.md`) inside any subfolder under the auto-generated `skills/` directory. Edgebot absorbs this knowledge immediately without a single line of python code changes!
+Place Markdown files (e.g., `SKILL.md`) inside any subfolder under the runtime `skills/` directory, or use the legacy workspace `skills/` directory when the skill should live with the project. Edgebot absorbs this knowledge immediately without a single line of Python changes!
 
 ```markdown
 ---

@@ -7,6 +7,7 @@ LLM calls go through the provider abstraction layer
 """
 
 import os
+from hashlib import sha256
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,9 +17,31 @@ class ConfigError(RuntimeError):
     """Raised when required Edgebot runtime configuration is missing."""
 
 
-WORKDIR = Path.cwd()
+WORKDIR = Path.cwd().resolve()
 WORKDIR_ENV = WORKDIR / ".env"
-RUNTIME_DIR = WORKDIR / ".edgebot"
+
+
+def _runtime_home() -> Path:
+    override = os.getenv("EDGEBOT_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "Edgebot"
+    return Path.home() / ".edgebot"
+
+
+def _workspace_state_key(workspace: Path) -> str:
+    normalized = str(workspace.resolve()).casefold().encode("utf-8")
+    return sha256(normalized).hexdigest()[:16]
+
+
+def runtime_dir_for_workspace(workspace: Path) -> Path:
+    return _runtime_home() / "projects" / _workspace_state_key(workspace)
+
+
+RUNTIME_HOME = _runtime_home()
+RUNTIME_DIR = runtime_dir_for_workspace(WORKDIR)
 RUNTIME_CONFIG_ENV = RUNTIME_DIR / "config.env"
 if WORKDIR_ENV.exists():
     load_dotenv(dotenv_path=WORKDIR_ENV, override=True)
@@ -66,8 +89,8 @@ API_BASE = os.getenv("API_BASE")  # optional, for proxies or custom endpoints
 GENERATION_TEMPERATURE = _get_float_env("TEMPERATURE", 0.7)
 
 # --- Workspace paths ---
-TASKS_DIR = WORKDIR / ".tasks"
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TASKS_DIR = RUNTIME_DIR / "tasks"
+TRANSCRIPT_DIR = RUNTIME_DIR / "transcripts"
 SKILLS_DIR = RUNTIME_DIR / "skills"
 MEMORY_DIR = RUNTIME_DIR / "memory"
 CRON_DIR = RUNTIME_DIR / "cron"

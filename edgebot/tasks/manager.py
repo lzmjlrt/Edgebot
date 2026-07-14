@@ -16,7 +16,7 @@ _TASK_STATUSES = {"pending", "in_progress", "completed", "blocked"}
 
 class TaskManager:
     def __init__(self):
-        TASKS_DIR.mkdir(exist_ok=True)
+        TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
     def _next_id(self) -> int:
         ids = [int(f.stem.split("_")[1]) for f in TASKS_DIR.glob("task_*.json")]

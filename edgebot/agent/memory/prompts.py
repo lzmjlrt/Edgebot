@@ -101,7 +101,7 @@ skills/<name>/SKILL.md files
 If new, append to the correct file.
    - [FILE-REMOVE] entries: find the matching content and delete it using \
 edit_file (replace with empty string).
-   - [SKILL] entries: create or update .edgebot/skills/<name>/SKILL.md. If an \
+   - [SKILL] entries: create or update skills/<name>/SKILL.md. If an \
 existing skill covers the workflow, update that file instead of creating a \
 duplicate. Do not put reusable workflow steps into MEMORY.md.
    - [SKILL-REMOVE] entries: remove obsolete or duplicated workflow text from \

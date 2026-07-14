@@ -1,6 +1,6 @@
 """
 edgebot/agent/memory/dream_tools.py - Dream-scoped tools
-(read/edit restricted to workspace memory files).
+(read/edit restricted to runtime memory files).
 """
 
 from __future__ import annotations
@@ -12,11 +12,23 @@ from typing import Any
 from edgebot.tools.base import BaseTool
 
 
+_DEFAULT_READ_LIMIT = 2_000
+_MAX_READ_CHARS = 128_000
+_MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024
+
+
 def _normalized_path_key(path: Path) -> str:
-    key = os.path.abspath(path)
+    key = os.path.abspath(path.resolve(strict=False))
     if os.name == "nt":
         key = os.path.normcase(key)
     return key
+
+
+def _resolve_runtime_path(path: str, workspace: Path) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    return candidate.resolve(strict=False)
 
 
 def _is_allowed_skill_file(path: Path, skills_dir: Path) -> bool:
@@ -27,8 +39,92 @@ def _is_allowed_skill_file(path: Path, skills_dir: Path) -> bool:
     return len(rel.parts) == 2 and rel.parts[0] not in {"", ".", ".."} and rel.parts[1] == "SKILL.md"
 
 
+def _is_allowed_path(
+    path: Path,
+    *,
+    allowed_files: set[str],
+    allowed_skill_dir: Path | None,
+) -> bool:
+    if _normalized_path_key(path) in allowed_files:
+        return True
+    return allowed_skill_dir is not None and _is_allowed_skill_file(path, allowed_skill_dir)
+
+
+def _runtime_read(path: Path, label: str, limit: int | None, offset: int) -> str:
+    try:
+        if not path.exists():
+            return f"Error: File not found: {label}"
+        if not path.is_file():
+            return f"Error: Not a file: {label}"
+        text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        all_lines = text.splitlines()
+        if not all_lines:
+            return f"(Empty file: {label})"
+        offset = max(offset, 1)
+        total = len(all_lines)
+        if offset > total:
+            return f"Error: offset {offset} is beyond end of file ({total} lines)"
+        end = min(total, offset - 1 + (limit or _DEFAULT_READ_LIMIT))
+        result = "\n".join(
+            f"{line_number}| {line}"
+            for line_number, line in enumerate(all_lines[offset - 1:end], start=offset)
+        )
+        if len(result) > _MAX_READ_CHARS:
+            result = result[:_MAX_READ_CHARS] + "\n\n(Output truncated at ~128K chars)"
+        if end < total:
+            return result + f"\n\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
+        return result + f"\n\n(End of file — {total} lines total)"
+    except UnicodeDecodeError:
+        return f"Error: Cannot read binary file {label}. Only UTF-8 text is supported."
+    except OSError as exc:
+        return f"Error: {exc}"
+
+
+def _runtime_write(path: Path, content: str) -> str:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return f"Successfully wrote {len(content)} characters to {path}"
+    except OSError as exc:
+        return f"Error writing file: {exc}"
+
+
+def _runtime_edit(path: Path, label: str, old_text: str, new_text: str, replace_all: bool) -> str:
+    try:
+        if not path.exists():
+            if old_text:
+                return f"Error: File not found: {label}"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new_text, encoding="utf-8")
+            return f"Successfully created {path}"
+        if not path.is_file():
+            return f"Error: Not a file: {label}"
+        if path.stat().st_size > _MAX_EDIT_FILE_SIZE:
+            return "Error: File too large to edit. Maximum is 1 GiB."
+        content = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        if not old_text:
+            if content.strip():
+                return f"Error: Cannot create file — {label} already exists and is not empty."
+            path.write_text(new_text, encoding="utf-8")
+            return f"Successfully edited {path}"
+        count = content.count(old_text)
+        if count == 0:
+            return f"Error: old_text not found in {label}."
+        if count > 1 and not replace_all:
+            return (
+                f"Warning: old_text appears {count} times. "
+                "Provide more context to make it unique, or set replace_all=true."
+            )
+        path.write_text(content.replace(old_text, new_text, -1 if replace_all else 1), encoding="utf-8")
+        return f"Successfully edited {path}"
+    except UnicodeDecodeError:
+        return f"Error editing file: Cannot read binary file {label}. Only UTF-8 text is supported."
+    except OSError as exc:
+        return f"Error editing file: {exc}"
+
+
 class _DreamReadTool(BaseTool):
-    """read_file scoped to the workspace for Dream agent."""
+    """read_file scoped to Dream's runtime memory files."""
 
     @property
     def name(self) -> str:
@@ -48,7 +144,7 @@ class _DreamReadTool(BaseTool):
                 "offset": {"type": "integer", "description": "1-based line offset.", "minimum": 1},
                 "force": {
                     "type": "boolean",
-                    "description": "Force full read even if the global file cache thinks it is unchanged.",
+                    "description": "Accepted for compatibility; Dream always reads current contents.",
                 },
             },
             "required": ["path"],
@@ -57,21 +153,30 @@ class _DreamReadTool(BaseTool):
     def is_read_only(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
-    def __init__(self, workspace: Path):
-        self._workspace = workspace
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        allowed_files: tuple[Path, ...] = (),
+        allowed_skill_dir: Path | None = None,
+    ):
+        self._workspace = Path(workspace)
+        self._allowed_files = {_normalized_path_key(path) for path in allowed_files}
+        self._allowed_skill_dir = allowed_skill_dir
 
     def execute(self, **kwargs: Any) -> Any:
-        from edgebot.tools.filesystem import run_read
-        return run_read(
-            kwargs["path"],
-            kwargs.get("limit"),
-            kwargs.get("offset", 1),
-            kwargs.get("force", True),
-        )
+        target = _resolve_runtime_path(kwargs["path"], self._workspace)
+        if not _is_allowed_path(
+            target,
+            allowed_files=self._allowed_files,
+            allowed_skill_dir=self._allowed_skill_dir,
+        ):
+            return "Error: Dream read_file may only access runtime memory files or skills."
+        return _runtime_read(target, kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1))
 
 
 class _DreamEditTool(BaseTool):
-    """edit_file scoped to workspace memory files for Dream agent."""
+    """edit_file scoped to Dream's runtime memory files."""
 
     @property
     def name(self) -> str:
@@ -103,34 +208,27 @@ class _DreamEditTool(BaseTool):
         allowed_files: tuple[Path, ...] | None = None,
         allowed_skill_dir: Path | None = None,
     ):
-        self._workspace = workspace
-        runtime_dir = workspace / ".edgebot"
-        files = allowed_files if allowed_files is not None else (
-            runtime_dir / "USER.md",
-            runtime_dir / "SOUL.md",
-            runtime_dir / "memory" / "MEMORY.md",
-        )
+        self._workspace = Path(workspace)
+        files = allowed_files or ()
         self._allowed_files = {_normalized_path_key(path) for path in files}
         self._allowed_skill_dir = allowed_skill_dir
 
     def execute(self, **kwargs: Any) -> Any:
-        from edgebot.tools.base import safe_path
-        from edgebot.tools.filesystem import run_edit
-
-        try:
-            target = safe_path(kwargs["path"])
-        except Exception as exc:
-            return f"Error: {exc}"
-        allowed = _normalized_path_key(target) in self._allowed_files
-        if not allowed and self._allowed_skill_dir is not None:
-            allowed = _is_allowed_skill_file(target, self._allowed_skill_dir)
-        if not allowed:
+        target = _resolve_runtime_path(kwargs["path"], self._workspace)
+        if not _is_allowed_path(
+            target,
+            allowed_files=self._allowed_files,
+            allowed_skill_dir=self._allowed_skill_dir,
+        ):
             return (
                 "Error: Dream edit_file may only update USER.md, SOUL.md, "
                 "memory/MEMORY.md, or skills/<name>/SKILL.md."
             )
-        return run_edit(
-            kwargs["path"], kwargs["old_text"], kwargs["new_text"],
+        return _runtime_edit(
+            target,
+            kwargs["path"],
+            kwargs["old_text"],
+            kwargs["new_text"],
             kwargs.get("replace_all", False),
         )
 
@@ -144,7 +242,7 @@ class _DreamWriteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Create .edgebot/skills/<name>/SKILL.md for reusable workflows."
+        return "Create runtime skills/<name>/SKILL.md files for reusable workflows."
 
     @property
     def parameters(self) -> dict:
@@ -163,19 +261,15 @@ class _DreamWriteTool(BaseTool):
         *,
         skills_dir: Path | None = None,
     ):
-        self._workspace = workspace
-        self._skills_dir = skills_dir or (workspace / ".edgebot" / "skills")
+        self._workspace = Path(workspace)
+        self._skills_dir = skills_dir
 
     def execute(self, **kwargs: Any) -> Any:
-        from edgebot.tools.base import safe_path
-        from edgebot.tools.filesystem import run_write
-
-        try:
-            target = safe_path(kwargs["path"])
-        except Exception as exc:
-            return f"Error: {exc}"
+        if self._skills_dir is None:
+            return "Error: Dream write_file has no configured runtime skills directory."
+        target = _resolve_runtime_path(kwargs["path"], self._workspace)
         if not _is_allowed_skill_file(target, self._skills_dir):
             return "Error: Dream write_file may only write skills/<name>/SKILL.md."
         if target.exists() and target.read_text(encoding="utf-8").strip():
             return "Error: Skill already exists. Use edit_file to update existing skills."
-        return run_write(kwargs["path"], kwargs["content"])
+        return _runtime_write(target, kwargs["content"])

@@ -240,7 +240,15 @@ class DreamProcessor:
         """Build a registry scoped to Dream memory-maintenance tools."""
         from edgebot.tools.registry import ToolRegistry
 
-        read_tool = _DreamReadTool(self.store.workspace)
+        read_tool = _DreamReadTool(
+            self.store.workspace,
+            allowed_files=(
+                self.store.user_file,
+                self.store.soul_file,
+                self.store.memory_file,
+            ),
+            allowed_skill_dir=self.store.skills_dir,
+        )
         edit_tool = _DreamEditTool(
             self.store.workspace,
             allowed_files=(

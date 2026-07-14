@@ -13,6 +13,7 @@ from rich.console import Console
 
 from edgebot.agent.compression import auto_compact, estimate_tokens, extract_session_summary, microcompact
 from edgebot.agent.consolidator import Consolidator
+from edgebot.agent.context_governance import estimate_request_tokens
 from edgebot.agent.context import (
     inject_session_summary_into_system_prompt,
     merge_runtime_context_into_messages,
@@ -141,6 +142,13 @@ async def agent_loop(
     set_tool_runtime_context(
         channel=channel, chat_id=chat_id, session_key=session_key,
     )
+    tool_registry = build_runtime_tool_registry(
+        DEFAULT_TOOL_REGISTRY,
+        tools,
+        tool_handlers,
+    )
+    tool_definitions = tool_registry.get_definitions()
+    system = inject_session_summary_into_system_prompt(system, session_summary)
 
     microcompact(messages)
     max_input_tokens = input_token_budget(
@@ -151,6 +159,10 @@ async def agent_loop(
         MODEL,
         max_completion_tokens=_RUN_MAX_COMPLETION_TOKENS,
     )
+    replay_budget_tokens = max(0, max_input_tokens - estimate_request_tokens(
+        [{"role": "system", "content": system}],
+        tool_definitions,
+    ))
 
     call_history = messages
     if session_store:
@@ -170,7 +182,7 @@ async def agent_loop(
         call_history = session_store.get_history(
             session_key,
             max_messages=_MAX_REPLAY_MESSAGES,
-            max_tokens=max_input_tokens,
+            max_tokens=replay_budget_tokens,
         )
         if not call_history and messages:
             call_history = messages[-1:]
@@ -229,7 +241,6 @@ async def agent_loop(
             call_history = list(call_history) + pre_notifs
 
     # ---- Build the full prompt for the runner ----
-    system = inject_session_summary_into_system_prompt(system, session_summary)
     call_messages = [{"role": "system", "content": system}] + merge_runtime_context_into_messages(
         call_history,
         channel=channel,
@@ -258,12 +269,6 @@ async def agent_loop(
             _console.print(f"[dim yellow]  {msg}[/dim yellow]")
 
     # ---- Run the agent (single call, runner handles tool loop internally) ----
-    tool_registry = build_runtime_tool_registry(
-        DEFAULT_TOOL_REGISTRY,
-        tools,
-        tool_handlers,
-    )
-
     result = await runner.run(AgentRunSpec(
         initial_messages=call_messages,
         provider=provider,

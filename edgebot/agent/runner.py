@@ -18,6 +18,7 @@ from rich.console import Console
 from edgebot.agent.context_governance import (
     DEFAULT_MAX_TOOL_RESULT_TOKENS,
     ContextGovernanceConfig,
+    RequestBudgetError,
     apply_input_token_budget,
     prepare_messages_for_model,
 )
@@ -157,7 +158,25 @@ class AgentRunner:
         for iteration in range(spec.max_iterations):
             # Context governance is model-facing only. Synthetic repair
             # messages must not shift the persisted append boundary.
-            call_messages = _prepare_messages_for_model(messages, spec)
+            tool_definitions = _tool_definitions(spec)
+            try:
+                call_messages = _prepare_messages_for_model(
+                    messages,
+                    spec,
+                    tool_definitions=tool_definitions,
+                )
+            except RequestBudgetError as exc:
+                if spec.emit_output:
+                    _console.print(f"[red]  Request budget exceeded: {exc}[/red]")
+                return AgentRunResult(
+                    final_content=str(exc),
+                    messages=messages,
+                    tool_names_used=tools_used,
+                    usage=usage,
+                    stop_reason="context_budget_exceeded",
+                    new_messages=list(new_messages),
+                    telemetry=dict(telemetry),
+                )
 
             # Streaming LLM call via provider
             status = None
@@ -169,7 +188,6 @@ class AgentRunner:
                 status.start()
 
             try:
-                tool_definitions = _tool_definitions(spec)
                 if spec.on_stream is not None:
                     async def _stream_cb(delta: str, *, _first=[True]) -> None:
                         if spec.emit_output and _first[0]:
@@ -602,20 +620,30 @@ async def _finalize_without_tools(
 # ---- Context governance ----
 
 
-def _context_governance_config(spec: AgentRunSpec) -> ContextGovernanceConfig:
+def _context_governance_config(
+    spec: AgentRunSpec,
+    *,
+    tool_definitions: list[dict[str, Any]] | None = None,
+) -> ContextGovernanceConfig:
     return ContextGovernanceConfig(
         model=spec.model,
         max_tokens=spec.max_tokens,
         max_input_tokens=spec.max_input_tokens,
         max_tool_result_tokens=spec.max_tool_result_tokens,
+        tool_definitions=tool_definitions,
     )
 
 
 def _prepare_messages_for_model(
     messages: list[dict[str, Any]],
     spec: AgentRunSpec,
+    *,
+    tool_definitions: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    return prepare_messages_for_model(messages, _context_governance_config(spec))
+    return prepare_messages_for_model(messages, _context_governance_config(
+        spec,
+        tool_definitions=tool_definitions,
+    ))
 
 
 def _safe_session_dir_name(session_key: str) -> str:

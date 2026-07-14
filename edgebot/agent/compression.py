@@ -38,7 +38,8 @@ If the conversation is trivial, output: (nothing)"""
 
 
 def estimate_tokens(messages: list) -> int:
-    return len(json.dumps(messages, default=str)) // 4
+    """Conservatively estimate serialized message tokens without a tokenizer."""
+    return (len(json.dumps(messages, default=str)) + 2) // 3
 
 
 def microcompact(messages: list):

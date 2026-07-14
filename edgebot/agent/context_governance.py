@@ -26,6 +26,10 @@ _COMPACTABLE_TOOLS = frozenset({
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 
 
+class RequestBudgetError(ValueError):
+    """Raised when the non-reducible provider request exceeds its budget."""
+
+
 @dataclass(slots=True)
 class ContextGovernanceConfig:
     """Configuration for preparing a model-facing message copy."""
@@ -34,6 +38,20 @@ class ContextGovernanceConfig:
     max_tokens: int = 8192
     max_input_tokens: int | None = None
     max_tool_result_tokens: int | None = DEFAULT_MAX_TOOL_RESULT_TOKENS
+    tool_definitions: list[dict[str, Any]] | None = None
+
+
+def estimate_request_tokens(
+    messages: list[dict[str, Any]],
+    tool_definitions: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimate the complete provider request, including serialized tool schemas."""
+    if not tool_definitions:
+        return estimate_tokens(messages)
+    return estimate_tokens(messages + [{
+        "role": "tool_schema",
+        "content": tool_definitions,
+    }])
 
 
 def prepare_messages_for_model(
@@ -62,9 +80,6 @@ def apply_input_token_budget(
             max_completion_tokens=config.max_tokens,
         )
     max_input_tokens = max(0, int(max_input_tokens))
-    if estimate_tokens(messages) <= max_input_tokens:
-        return _drop_incomplete_tool_call_groups(messages)
-
     system_prefix: list[dict[str, Any]] = []
     body_start = 0
     for idx, message in enumerate(messages):
@@ -73,17 +88,30 @@ def apply_input_token_budget(
             break
         system_prefix.append(dict(message))
     else:
-        return [dict(message) for message in messages]
+        body_start = len(messages)
+
+    if estimate_request_tokens(system_prefix, config.tool_definitions) > max_input_tokens:
+        raise RequestBudgetError(
+            "System prompt and tool definitions exceed the available request budget."
+        )
+
+    if estimate_request_tokens(messages, config.tool_definitions) <= max_input_tokens:
+        return _drop_incomplete_tool_call_groups(messages)
 
     selected: list[dict[str, Any]] = []
     body = messages[body_start:]
     for message in reversed(body):
         candidate = [message] + selected
-        if selected and estimate_tokens(system_prefix + candidate) > max_input_tokens:
+        if estimate_request_tokens(
+            system_prefix + candidate,
+            config.tool_definitions,
+        ) > max_input_tokens:
+            if not selected:
+                raise RequestBudgetError(
+                    "The most recent message cannot fit within the available request budget."
+                )
             break
         selected = candidate
-        if estimate_tokens(system_prefix + selected) > max_input_tokens:
-            break
 
     start = find_legal_start(selected)
     selected = selected[start:]
@@ -95,7 +123,10 @@ def apply_input_token_budget(
             break
 
     repaired = _drop_incomplete_tool_call_groups(selected)
-    return system_prefix + [dict(message) for message in repaired]
+    prepared = system_prefix + [dict(message) for message in repaired]
+    if estimate_request_tokens(prepared, config.tool_definitions) > max_input_tokens:
+        raise RequestBudgetError("Prepared request exceeds the available request budget.")
+    return prepared
 
 
 def _tool_call_name(tool_call: dict[str, Any]) -> Any:

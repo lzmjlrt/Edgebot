@@ -9,7 +9,6 @@ from functools import lru_cache
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 CONTEXT_SAFETY_MARGIN_TOKENS = 1_024
 DEFAULT_CONSOLIDATION_RATIO = 0.6
-MIN_INPUT_BUDGET_TOKENS = 1_024
 
 _KNOWN_CONTEXT_WINDOWS = {
     "gpt-4o": 128_000,
@@ -72,7 +71,7 @@ def input_token_budget(
     """Return prompt/input tokens available after reserving output and margin."""
     window = model_context_window_tokens(model)
     reserved = max(0, int(max_completion_tokens)) + max(0, int(safety_margin_tokens))
-    return max(MIN_INPUT_BUDGET_TOKENS, window - reserved)
+    return max(0, window - reserved)
 
 
 def consolidation_token_target(

@@ -285,3 +285,23 @@ def test_multiselect_type_something_is_included_without_space_toggle(monkeypatch
     assert asyncio.run(repl._run_ask_questions([question])) == {
         "Which features?": ["audit"]
     }
+
+
+def test_ask_user_handler_marks_cancelled_questions(monkeypatch) -> None:
+    async def fake_run_ask_questions(_questions):
+        return {}
+
+    monkeypatch.setattr(repl, "_run_ask_questions", fake_run_ask_questions)
+    question = AskQuestion(
+        question="Choose auth?",
+        header="Auth",
+        options=[AskOption(label="JWT"), AskOption(label="Session")],
+    )
+
+    result = json.loads(asyncio.run(repl._ask_user_handler([question])))
+
+    assert result == {
+        "status": "cancelled",
+        "answers": {},
+        "annotations": {},
+    }

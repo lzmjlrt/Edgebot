@@ -37,7 +37,7 @@ async def _allow_batch_permissions(_requests: list[dict]) -> dict:
 async def _answer_ask_user(questions) -> str:
     if not isinstance(questions, list):
         return ""
-    return build_ask_user_result(questions, {question.question: "" for question in questions})
+    return build_ask_user_result(questions, {}, status="unavailable")
 
 
 def _install_noninteractive_handlers(*, eval_mode: bool) -> None:

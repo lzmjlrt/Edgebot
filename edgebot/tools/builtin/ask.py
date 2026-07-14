@@ -9,6 +9,8 @@ as a normal tool result -- no interrupt/resume needed.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -33,7 +35,7 @@ class AskQuestion:
 
 AskHandler = Callable[[list[AskQuestion]], Awaitable[str]]
 
-_handler: AskHandler | None = None
+_handler: ContextVar[AskHandler | None] = ContextVar("ask_user_handler", default=None)
 
 
 def _option_item_schema(*, description_required: bool) -> dict[str, Any]:
@@ -64,8 +66,18 @@ def _option_item_schema(*, description_required: bool) -> dict[str, Any]:
 
 
 def set_ask_handler(handler: AskHandler | None) -> None:
-    global _handler
-    _handler = handler
+    """Set the current task's interactive ask handler."""
+    _handler.set(handler)
+
+
+@contextmanager
+def ask_handler_context(handler: AskHandler | None):
+    """Temporarily bind an ask handler within the current task context."""
+    token = _handler.set(handler)
+    try:
+        yield
+    finally:
+        _handler.reset(token)
 
 
 def _option_from_value(value: Any, *, multi_select: bool = False) -> AskOption:
@@ -162,6 +174,8 @@ def build_ask_user_result(
     questions: list[AskQuestion],
     answers: dict[str, Any],
     notes: dict[str, str] | None = None,
+    *,
+    status: str = "answered",
 ) -> str:
     annotations: dict[str, dict[str, str]] = {}
     notes = notes or {}
@@ -183,6 +197,7 @@ def build_ask_user_result(
             annotations[question.question] = annotation
 
     return json.dumps({
+        "status": status,
         "answers": answers,
         "annotations": annotations,
     }, ensure_ascii=False)
@@ -213,6 +228,10 @@ class AskUserTool(BaseTool):
     def parameters(self) -> dict:
         return {
             "type": "object",
+            "oneOf": [
+                {"required": ["questions"]},
+                {"required": ["question"]},
+            ],
             "properties": {
                 "questions": {
                     "type": "array",
@@ -277,6 +296,8 @@ class AskUserTool(BaseTool):
         has_legacy = "question" in params
         if not has_structured and not has_legacy:
             errors.append("provide either 'questions' or 'question'")
+        if has_structured and has_legacy:
+            errors.append("provide 'questions' or 'question', not both")
 
         questions = params.get("questions")
         if questions is not None:
@@ -284,15 +305,63 @@ class AskUserTool(BaseTool):
                 errors.append("'questions' must be an array")
             else:
                 if not 1 <= len(questions) <= 4:
-                    errors.append("'questions' must contain at most 4 questions")
+                    errors.append("'questions' must contain 1-4 questions")
+                question_texts: set[str] = set()
                 for idx, question in enumerate(questions):
                     if not isinstance(question, dict):
                         errors.append(f"'questions[{idx}]' must be an object")
                         continue
+                    text = question.get("question")
+                    if not isinstance(text, str) or not text.strip():
+                        errors.append(f"'questions[{idx}].question' must be a non-empty string")
+                    else:
+                        key = text.strip().casefold()
+                        if key in question_texts:
+                            errors.append("'questions' question texts must be unique")
+                        question_texts.add(key)
+                    header = question.get("header")
+                    if not isinstance(header, str) or not header.strip():
+                        errors.append(f"'questions[{idx}].header' must be a non-empty string")
+                    elif len(header.strip()) > 12:
+                        errors.append(f"'questions[{idx}].header' must be 12 characters or fewer")
+                    multi_select = question.get("multiSelect", False)
+                    if not isinstance(multi_select, bool):
+                        errors.append(f"'questions[{idx}].multiSelect' must be a boolean")
                     options = question.get("options")
                     if not isinstance(options, list) or not 2 <= len(options) <= 4:
                         errors.append(f"'questions[{idx}].options' must have 2-4 options")
+                        continue
+                    labels: set[str] = set()
+                    for option_index, option in enumerate(options):
+                        label = option if isinstance(option, str) else option.get("label") if isinstance(option, dict) else None
+                        if not isinstance(label, str) or not label.strip():
+                            errors.append(
+                                f"'questions[{idx}].options[{option_index}].label' must be a non-empty string"
+                            )
+                            continue
+                        label_key = label.strip().casefold()
+                        if label_key == "other":
+                            errors.append(f"'questions[{idx}].options' must not include 'Other'")
+                        if label_key in labels:
+                            errors.append(f"'questions[{idx}].options' labels must be unique")
+                        labels.add(label_key)
+                        if isinstance(option, dict):
+                            description = option.get("description")
+                            if not isinstance(description, str) or not description.strip():
+                                errors.append(
+                                    f"'questions[{idx}].options[{option_index}].description' must be a non-empty string"
+                                )
+                            preview = option.get("preview")
+                            if preview is not None and not isinstance(preview, str):
+                                errors.append(
+                                    f"'questions[{idx}].options[{option_index}].preview' must be a string"
+                                )
+                        elif not isinstance(option, str):
+                            errors.append(f"'questions[{idx}].options[{option_index}]' must be a string or object")
 
+        legacy_question = params.get("question")
+        if has_legacy and (not isinstance(legacy_question, str) or not legacy_question.strip()):
+            errors.append("'question' must be a non-empty string")
         legacy_options = params.get("options")
         if legacy_options is not None and (
             not isinstance(legacy_options, list) or not 2 <= len(legacy_options) <= 4
@@ -302,9 +371,10 @@ class AskUserTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> Any:
         questions = normalize_ask_payload(kwargs)
-        if _handler is not None:
-            return await _handler(questions)
-        return build_ask_user_result(questions, {q.question: "" for q in questions})
+        handler = _handler.get()
+        if handler is not None:
+            return await handler(questions)
+        return build_ask_user_result(questions, {}, status="unavailable")
 
 
 def pending_ask_user_id(messages: list[dict]) -> str | None:

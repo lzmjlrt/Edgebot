@@ -57,7 +57,13 @@ from edgebot.cli.slash_autocomplete import (
     build_default_slash_registry,
     resolve_skill_slash_prompt,
 )
-from edgebot.tools.builtin.ask import AskOption, AskQuestion, build_ask_user_result, set_ask_handler
+from edgebot.tools.builtin.ask import (
+    AskOption,
+    AskQuestion,
+    ask_handler_context,
+    build_ask_user_result,
+    set_ask_handler,
+)
 from edgebot.tools.registry import (
     BG,
     CRON,
@@ -1035,7 +1041,11 @@ async def _run_ask_question(question: AskQuestion) -> str | list[str] | None:
 async def _ask_user_handler(questions: list[AskQuestion]) -> str:
     """Interactive ask_user prompt with structured option picker."""
     answers = await _run_ask_questions(questions)
-    return build_ask_user_result(questions, answers)
+    return build_ask_user_result(
+        questions,
+        answers,
+        status="answered" if answers else "cancelled",
+    )
 
 
 _MEMORY_JOB_ID = "memory_consolidation"
@@ -1160,28 +1170,29 @@ async def main():
         emit_output: bool,
         assistant_label: str,
     ) -> str | None:
-        state = store.load_state(run_session_key)
-        run_history = list(state["messages"])
-        run_summary = _resolve_session_summary(state)
-        user_msg = {"role": "user", "content": prompt}
-        store.update_metadata(run_session_key, pending_user_turn=True)
-        run_history.append(user_msg)
-        store.append(run_session_key, user_msg)
-        return await agent_loop(
-            messages=run_history,
-            system=build_system_prompt(session_key=run_session_key),
-            tools=all_tools,
-            tool_handlers=all_handlers,
-            todo_mgr=TODO,
-            bg_mgr=BG,
-            session_store=store,
-            session_key=run_session_key,
-            channel=run_channel,
-            chat_id=run_chat_id,
-            session_summary=run_summary,
-            emit_output=emit_output,
-            assistant_label=assistant_label,
-        )
+        with ask_handler_context(None):
+            state = store.load_state(run_session_key)
+            run_history = list(state["messages"])
+            run_summary = _resolve_session_summary(state)
+            user_msg = {"role": "user", "content": prompt}
+            store.update_metadata(run_session_key, pending_user_turn=True)
+            run_history.append(user_msg)
+            store.append(run_session_key, user_msg)
+            return await agent_loop(
+                messages=run_history,
+                system=build_system_prompt(session_key=run_session_key),
+                tools=all_tools,
+                tool_handlers=all_handlers,
+                todo_mgr=TODO,
+                bg_mgr=BG,
+                session_store=store,
+                session_key=run_session_key,
+                channel=run_channel,
+                chat_id=run_chat_id,
+                session_summary=run_summary,
+                emit_output=emit_output,
+                assistant_label=assistant_label,
+            )
 
     async def _handle_cron_job(job) -> str | None:
         if job.payload.kind == "system_event" and job.id == _MEMORY_JOB_ID:

@@ -3,6 +3,7 @@ import json
 
 from edgebot.tools.builtin.ask import (
     AskUserTool,
+    ask_handler_context,
     build_ask_user_result,
     normalize_ask_payload,
     set_ask_handler,
@@ -103,6 +104,7 @@ def test_normalize_ask_payload_adds_other_and_drops_preview_for_multiselect() ->
 def test_ask_user_execute_returns_structured_json_from_handler() -> None:
     async def handler(questions):
         return json.dumps({
+            "status": "answered",
             "answers": {questions[0].question: questions[0].options[0].label},
             "annotations": {},
         })
@@ -124,6 +126,7 @@ def test_ask_user_execute_returns_structured_json_from_handler() -> None:
 
     payload = json.loads(result)
     assert payload == {
+        "status": "answered",
         "answers": {"Choose auth?": "JWT (Recommended)"},
         "annotations": {},
     }
@@ -140,7 +143,7 @@ def test_ask_user_validates_question_or_questions_and_limits() -> None:
     tool = AskUserTool()
 
     assert "either 'questions' or 'question'" in "; ".join(tool.validate_params({}))
-    assert "at most 4 questions" in "; ".join(tool.validate_params({
+    assert "must contain 1-4 questions" in "; ".join(tool.validate_params({
         "questions": [
             {"question": "Q?", "header": "H", "options": [
                 {"label": "A", "description": "a"},
@@ -156,6 +159,123 @@ def test_ask_user_validates_question_or_questions_and_limits() -> None:
             "options": [{"label": "A", "description": "a"}],
         }]
     }))
+
+
+def test_ask_user_rejects_ambiguous_or_duplicate_structured_questions() -> None:
+    tool = AskUserTool()
+    valid_options = [
+        {"label": "First", "description": "First choice"},
+        {"label": "Second", "description": "Second choice"},
+    ]
+
+    mixed_errors = tool.validate_params({
+        "question": "Legacy?",
+        "questions": [{
+            "question": "Structured?",
+            "header": "Choice",
+            "options": valid_options,
+        }],
+    })
+    duplicate_question_errors = tool.validate_params({
+        "questions": [
+            {"question": "Choose?", "header": "One", "options": valid_options},
+            {"question": "Choose?", "header": "Two", "options": valid_options},
+        ],
+    })
+    duplicate_option_errors = tool.validate_params({
+        "questions": [{
+            "question": "Choose?",
+            "header": "Choice",
+            "options": [
+                {"label": "Same", "description": "First choice"},
+                {"label": "Same", "description": "Second choice"},
+            ],
+        }],
+    })
+
+    assert "not both" in "; ".join(mixed_errors)
+    assert "must be unique" in "; ".join(duplicate_question_errors)
+    assert "must be unique" in "; ".join(duplicate_option_errors)
+
+
+def test_ask_user_returns_unavailable_instead_of_empty_answers_without_handler() -> None:
+    set_ask_handler(None)
+
+    result = json.loads(asyncio.run(AskUserTool().execute(
+        questions=[{
+            "question": "Choose auth?",
+            "header": "Auth",
+            "options": [
+                {"label": "JWT", "description": "Token auth"},
+                {"label": "Session", "description": "Cookie auth"},
+            ],
+        }]
+    )))
+
+    assert result == {
+        "status": "unavailable",
+        "answers": {},
+        "annotations": {},
+    }
+
+
+def test_ask_user_handlers_are_isolated_between_concurrent_tasks() -> None:
+    async def ask(answer: str) -> str:
+        async def handler(questions):
+            return build_ask_user_result(
+                questions,
+                {questions[0].question: answer},
+            )
+
+        set_ask_handler(handler)
+        await asyncio.sleep(0)
+        return await AskUserTool().execute(
+            questions=[{
+                "question": "Choose auth?",
+                "header": "Auth",
+                "options": [
+                    {"label": "JWT", "description": "Token auth"},
+                    {"label": "Session", "description": "Cookie auth"},
+                ],
+            }]
+        )
+
+    async def run_both() -> tuple[str, str]:
+        return await asyncio.gather(ask("JWT"), ask("Session"))
+
+    try:
+        first, second = asyncio.run(run_both())
+    finally:
+        set_ask_handler(None)
+
+    assert json.loads(first)["answers"] == {"Choose auth?": "JWT"}
+    assert json.loads(second)["answers"] == {"Choose auth?": "Session"}
+
+
+def test_ask_handler_context_makes_background_execution_unavailable() -> None:
+    async def handler(questions):
+        return build_ask_user_result(questions, {questions[0].question: "JWT"})
+
+    set_ask_handler(handler)
+    payload = {
+        "questions": [{
+            "question": "Choose auth?",
+            "header": "Auth",
+            "options": [
+                {"label": "JWT", "description": "Token auth"},
+                {"label": "Session", "description": "Cookie auth"},
+            ],
+        }]
+    }
+    try:
+        with ask_handler_context(None):
+            unavailable = json.loads(asyncio.run(AskUserTool().execute(**payload)))
+        restored = json.loads(asyncio.run(AskUserTool().execute(**payload)))
+    finally:
+        set_ask_handler(None)
+
+    assert unavailable["status"] == "unavailable"
+    assert restored["answers"] == {"Choose auth?": "JWT"}
 
 
 def test_build_ask_user_result_includes_selected_preview_annotation() -> None:
@@ -184,6 +304,7 @@ def test_build_ask_user_result_includes_selected_preview_annotation() -> None:
     ))
 
     assert result == {
+        "status": "answered",
         "answers": {"Choose component?": "Function"},
         "annotations": {
             "Choose component?": {"preview": "function Button() {}"}

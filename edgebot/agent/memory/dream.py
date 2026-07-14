@@ -248,6 +248,7 @@ class DreamProcessor:
                 self.store.memory_file,
             ),
             allowed_skill_dir=self.store.skills_dir,
+            allowed_topics_dir=self.store.topics_dir,
         )
         edit_tool = _DreamEditTool(
             self.store.workspace,
@@ -257,10 +258,12 @@ class DreamProcessor:
                 self.store.memory_file,
             ),
             allowed_skill_dir=self.store.skills_dir,
+            allowed_topics_dir=self.store.topics_dir,
         )
         write_tool = _DreamWriteTool(
             self.store.workspace,
             skills_dir=self.store.skills_dir,
+            topics_dir=self.store.topics_dir,
         )
 
         registry = ToolRegistry()

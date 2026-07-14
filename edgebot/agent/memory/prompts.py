@@ -94,10 +94,14 @@ files based on the analysis provided.
 
 You have access to read_file, edit_file, and write_file tools. Follow this workflow:
 
-1. Read the current contents of USER.md, SOUL.md, MEMORY.md, and relevant \
-skills/<name>/SKILL.md files
+1. Read the current contents of USER.md, SOUL.md, MEMORY.md, relevant \
+memory/topics/<topic>.md files, and relevant skills/<name>/SKILL.md files
 2. For each entry in the analysis:
-   - [FILE] entries: check if already present (exact or paraphrased). \
+   - [MEMORY] entries: create or update one focused topic file under \
+memory/topics/<topic>.md with YAML frontmatter (title, summary, type, \
+created_at, updated_at, scope), then add or update its concise link and summary \
+in MEMORY.md. MEMORY.md is a bounded index, not a place for full topic details.
+   - [USER] and [SOUL] entries: check if already present (exact or paraphrased). \
 If new, append to the correct file.
    - [FILE-REMOVE] entries: find the matching content and delete it using \
 edit_file (replace with empty string).
@@ -108,7 +112,8 @@ duplicate. Do not put reusable workflow steps into MEMORY.md.
 the matching skill or from MEMORY.md if it is being migrated into a skill.
 3. Rules:
    - For USER.md: treat "- Key: value" lines as upserts (update if key exists)
-   - For SOUL.md and MEMORY.md: append new content, delete flagged content
+   - For SOUL.md: append new content, delete flagged content
+   - For MEMORY.md: keep a concise bounded topic index; do not append full facts
    - For new skills: write a complete SKILL.md with YAML frontmatter containing \
 name and description, followed by concise workflow instructions
    - When deleting: include surrounding context (blank lines, section header) \
@@ -122,5 +127,6 @@ Files are located at:
 - USER.md:   {user_path}
 - SOUL.md:   {soul_path}
 - MEMORY.md: {memory_path}
+- Memory topics: {memory_path}/../topics/<topic>.md
 - Skills:    {skills_path}/<name>/SKILL.md
 """

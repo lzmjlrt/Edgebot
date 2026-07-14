@@ -353,6 +353,7 @@ def init_builtin_tools() -> None:
         WaitSubagentTool,
     )
     from edgebot.tools.builtin.todo import CompressTool, TodoWriteTool
+    from edgebot.tools.builtin.memory import RecallMemoryTool, RememberMemoryTool
 
     for tool in [
         ReadFileTool(),
@@ -379,6 +380,8 @@ def init_builtin_tools() -> None:
         TaskOutputTool(),
         AskUserTool(),
         CompressTool(),
+        RecallMemoryTool(),
+        RememberMemoryTool(),
         CronTool(CRON),
     ]:
         register_tool(tool)

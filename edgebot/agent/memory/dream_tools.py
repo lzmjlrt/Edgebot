@@ -39,15 +39,27 @@ def _is_allowed_skill_file(path: Path, skills_dir: Path) -> bool:
     return len(rel.parts) == 2 and rel.parts[0] not in {"", ".", ".."} and rel.parts[1] == "SKILL.md"
 
 
+def _is_allowed_topic_file(path: Path, topics_dir: Path) -> bool:
+    try:
+        rel = path.resolve(strict=False).relative_to(topics_dir.resolve())
+    except ValueError:
+        return False
+    return len(rel.parts) == 1 and rel.suffix == ".md" and rel.stem not in {"", ".", ".."}
+
+
 def _is_allowed_path(
     path: Path,
     *,
     allowed_files: set[str],
     allowed_skill_dir: Path | None,
+    allowed_topics_dir: Path | None,
 ) -> bool:
     if _normalized_path_key(path) in allowed_files:
         return True
-    return allowed_skill_dir is not None and _is_allowed_skill_file(path, allowed_skill_dir)
+    return (
+        (allowed_skill_dir is not None and _is_allowed_skill_file(path, allowed_skill_dir))
+        or (allowed_topics_dir is not None and _is_allowed_topic_file(path, allowed_topics_dir))
+    )
 
 
 def _runtime_read(path: Path, label: str, limit: int | None, offset: int) -> str:
@@ -159,10 +171,12 @@ class _DreamReadTool(BaseTool):
         *,
         allowed_files: tuple[Path, ...] = (),
         allowed_skill_dir: Path | None = None,
+        allowed_topics_dir: Path | None = None,
     ):
         self._workspace = Path(workspace)
         self._allowed_files = {_normalized_path_key(path) for path in allowed_files}
         self._allowed_skill_dir = allowed_skill_dir
+        self._allowed_topics_dir = allowed_topics_dir
 
     def execute(self, **kwargs: Any) -> Any:
         target = _resolve_runtime_path(kwargs["path"], self._workspace)
@@ -170,6 +184,7 @@ class _DreamReadTool(BaseTool):
             target,
             allowed_files=self._allowed_files,
             allowed_skill_dir=self._allowed_skill_dir,
+            allowed_topics_dir=self._allowed_topics_dir,
         ):
             return "Error: Dream read_file may only access runtime memory files or skills."
         return _runtime_read(target, kwargs["path"], kwargs.get("limit"), kwargs.get("offset", 1))
@@ -207,11 +222,13 @@ class _DreamEditTool(BaseTool):
         *,
         allowed_files: tuple[Path, ...] | None = None,
         allowed_skill_dir: Path | None = None,
+        allowed_topics_dir: Path | None = None,
     ):
         self._workspace = Path(workspace)
         files = allowed_files or ()
         self._allowed_files = {_normalized_path_key(path) for path in files}
         self._allowed_skill_dir = allowed_skill_dir
+        self._allowed_topics_dir = allowed_topics_dir
 
     def execute(self, **kwargs: Any) -> Any:
         target = _resolve_runtime_path(kwargs["path"], self._workspace)
@@ -219,10 +236,11 @@ class _DreamEditTool(BaseTool):
             target,
             allowed_files=self._allowed_files,
             allowed_skill_dir=self._allowed_skill_dir,
+            allowed_topics_dir=self._allowed_topics_dir,
         ):
             return (
                 "Error: Dream edit_file may only update USER.md, SOUL.md, "
-                "memory/MEMORY.md, or skills/<name>/SKILL.md."
+                "memory/MEMORY.md, memory/topics/<topic>.md, or skills/<name>/SKILL.md."
             )
         return _runtime_edit(
             target,
@@ -234,7 +252,7 @@ class _DreamEditTool(BaseTool):
 
 
 class _DreamWriteTool(BaseTool):
-    """write_file scoped to new Dream skill files."""
+    """write_file scoped to new Dream skill and durable topic files."""
 
     @property
     def name(self) -> str:
@@ -242,7 +260,7 @@ class _DreamWriteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Create runtime skills/<name>/SKILL.md files for reusable workflows."
+        return "Create runtime skills/<name>/SKILL.md or memory/topics/<topic>.md files."
 
     @property
     def parameters(self) -> dict:
@@ -260,16 +278,21 @@ class _DreamWriteTool(BaseTool):
         workspace: Path,
         *,
         skills_dir: Path | None = None,
+        topics_dir: Path | None = None,
     ):
         self._workspace = Path(workspace)
         self._skills_dir = skills_dir
+        self._topics_dir = topics_dir
 
     def execute(self, **kwargs: Any) -> Any:
-        if self._skills_dir is None:
-            return "Error: Dream write_file has no configured runtime skills directory."
+        if self._skills_dir is None and self._topics_dir is None:
+            return "Error: Dream write_file has no configured runtime directories."
         target = _resolve_runtime_path(kwargs["path"], self._workspace)
-        if not _is_allowed_skill_file(target, self._skills_dir):
-            return "Error: Dream write_file may only write skills/<name>/SKILL.md."
+        is_skill = self._skills_dir is not None and _is_allowed_skill_file(target, self._skills_dir)
+        is_topic = self._topics_dir is not None and _is_allowed_topic_file(target, self._topics_dir)
+        if not is_skill and not is_topic:
+            return "Error: Dream write_file may only write skills/<name>/SKILL.md or memory/topics/<topic>.md."
         if target.exists() and target.read_text(encoding="utf-8").strip():
-            return "Error: Skill already exists. Use edit_file to update existing skills."
+            label = "Skill" if is_skill else "Topic"
+            return f"Error: {label} already exists. Use edit_file to update it."
         return _runtime_write(target, kwargs["content"])

@@ -10,6 +10,7 @@ from __future__ import annotations
 import platform
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from edgebot.config import (
@@ -36,6 +37,18 @@ _BOOTSTRAP_PATHS = {
 _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
 _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 _SESSION_SUMMARY_HEADING = "## Session Summary"
+
+# Source order is the documented precedence contract. Project instructions are
+# live configuration; runtime bootstrap files remain user-owned configuration.
+SYSTEM_PROMPT_PRECEDENCE = (
+    "Built-in safety",
+    "Runtime identity",
+    "Project instructions",
+    "Runtime user configuration",
+    "Always skills",
+    "MCP instructions",
+    "Append prompt",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,12 +106,18 @@ def build_system_prompt_sections(
     skills_descriptions: str | None = None,
     session_summary: str | None = None,
     session_key: str | None = None,
+    active_path: str | Path | None = None,
+    mcp_instructions: str | None = None,
+    append_prompt: str | None = None,
 ) -> list[SystemPromptSection]:
     """Build ordered, bounded source sections for the system prompt."""
     return _build_system_prompt_sections(
         skills_descriptions=skills_descriptions,
         session_summary=session_summary,
         session_key=session_key,
+        active_path=active_path,
+        mcp_instructions=mcp_instructions,
+        append_prompt=append_prompt,
     )
 
 
@@ -106,29 +125,89 @@ def build_system_prompt(
     skills_descriptions: str | None = None,
     session_summary: str | None = None,
     session_key: str | None = None,
+    active_path: str | Path | None = None,
+    mcp_instructions: str | None = None,
+    append_prompt: str | None = None,
 ) -> str:
     """
     Assemble a rich system prompt from identity, workspace files, and skills.
 
     Loading order (separated by ---):
       1. Identity + Runtime info
-      2. Bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md from workspace)
-      3. Long-term memory
-      4. Active always-skills
-      5. Skills summary
-      6. Recent archived history
+      2. Live project AGENTS.md files from workspace root to active path
+      3. Bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md from runtime)
+      4. Long-term memory
+      5. Active always-skills
+      6. Skills summary and session continuity
+      7. Optional MCP instructions and append prompt
     """
     return render_system_prompt_sections(build_system_prompt_sections(
         skills_descriptions=skills_descriptions,
         session_summary=session_summary,
         session_key=session_key,
+        active_path=active_path,
+        mcp_instructions=mcp_instructions,
+        append_prompt=append_prompt,
     ))
+
+
+def discover_project_instruction_sections(
+    *,
+    workspace: Path | None = None,
+    active_path: str | Path | None = None,
+) -> list[SystemPromptSection]:
+    """Read live ``AGENTS.md`` files from the workspace root to an active path.
+
+    The files are intentionally read on every prompt build. That keeps edits,
+    additions, and removals visible without relying on a stale prompt cache.
+    Paths outside the workspace fall back to the workspace root.
+    """
+    root = (workspace or WORKDIR).resolve()
+    raw_active = Path(active_path) if active_path is not None else root
+    if not raw_active.is_absolute():
+        raw_active = root / raw_active
+    active = raw_active.resolve(strict=False)
+    if active.suffix and not active.is_dir():
+        active = active.parent
+    try:
+        relative = active.relative_to(root)
+    except ValueError:
+        relative = Path()
+
+    directories = [root]
+    current = root
+    for part in relative.parts:
+        current = current / part
+        directories.append(current)
+
+    sections: list[SystemPromptSection] = []
+    for directory in directories:
+        path = directory / "AGENTS.md"
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not content:
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        sections.append(SystemPromptSection(
+            source=f"Project instructions: {relative_path}",
+            content=f"## Project Instructions: {relative_path}\n\n{content}",
+            priority=10,
+            hard_cap_tokens=_SECTION_TOKEN_CAPS["bootstrap"],
+        ))
+    return sections
 
 
 def _build_system_prompt_sections(
     skills_descriptions: str | None = None,
     session_summary: str | None = None,
     session_key: str | None = None,
+    active_path: str | Path | None = None,
+    mcp_instructions: str | None = None,
+    append_prompt: str | None = None,
 ) -> list[SystemPromptSection]:
     """Implementation kept separate so the public builder remains concise."""
     sections: list[SystemPromptSection] = []
@@ -146,12 +225,18 @@ def _build_system_prompt_sections(
         content=(
         f"# Edgebot\n\n"
         f"You are Edgebot, a coding agent.\n\n"
+        f"## Instruction Precedence\n"
+        f"When source instructions conflict, follow this order: "
+        f"{', '.join(SYSTEM_PROMPT_PRECEDENCE)}.\n\n"
         f"## Runtime\n{runtime}\n\n"
         f"## Workspace\n{WORKDIR}"
         ),
     ))
 
-    # 2. Bootstrap files from Edgebot runtime directory
+    # 2. Live project instructions (root to the active task directory).
+    sections.extend(discover_project_instruction_sections(active_path=active_path))
+
+    # 3. Bootstrap files from Edgebot runtime directory.
     for filename in BOOTSTRAP_FILES:
         path = _BOOTSTRAP_PATHS[filename]
         if path.exists():
@@ -160,13 +245,13 @@ def _build_system_prompt_sections(
                 sections.append(SystemPromptSection(
                     source=filename,
                     content=f"## {filename}\n\n{content}",
-                    priority=10,
+                    priority=20,
                     hard_cap_tokens=_SECTION_TOKEN_CAPS["bootstrap"],
                 ))
             except Exception:
                 pass
 
-    # 3. Long-term memory (memory/MEMORY.md)
+    # 4. Long-term memory (memory/MEMORY.md)
     from edgebot.agent.memory import _STORE as _memory
 
     memory_context = _memory.get_memory_context()
@@ -174,11 +259,11 @@ def _build_system_prompt_sections(
         sections.append(SystemPromptSection(
             source="Long-term Memory",
             content=memory_context,
-            priority=20,
+            priority=30,
             hard_cap_tokens=_SECTION_TOKEN_CAPS["memory"],
         ))
 
-    # 4. Active always-skills
+    # 5. Active always-skills
     from edgebot.tools.registry import SKILLS as _skills
 
     _skills.reload()
@@ -190,11 +275,11 @@ def _build_system_prompt_sections(
                 sections.append(SystemPromptSection(
                     source=f"Always skill: {skill_name}",
                     content=f"## Active Skill: {skill_name}\n\n{always_content}",
-                    priority=30,
+                    priority=40,
                     hard_cap_tokens=_SECTION_TOKEN_CAPS["always_skill"],
                 ))
 
-    # 5. Skills summary
+    # 6. Skills summary
     summary = skills_descriptions
     if summary is None:
         summary = _skills.build_skills_summary(exclude=set(always_skills))
@@ -202,11 +287,11 @@ def _build_system_prompt_sections(
         sections.append(SystemPromptSection(
             source="Available Skills",
             content=f"## Available Skills\n\n{summary}",
-            priority=40,
+            priority=50,
             hard_cap_tokens=_SECTION_TOKEN_CAPS["skills_summary"],
         ))
 
-    # 6. Recent archived history that has not yet been folded into MEMORY.md
+    # 7. Recent archived history that has not yet been folded into MEMORY.md
     recent_history_entries = _memory.read_unprocessed_history(
         _memory.get_last_dream_cursor(),
         session_key=session_key,
@@ -221,7 +306,7 @@ def _build_system_prompt_sections(
             sections.append(SystemPromptSection(
                 source="Recent History",
                 content="## Recent History\n\n" + "\n".join(recent_lines),
-                priority=50,
+                priority=55,
                 hard_cap_tokens=_SECTION_TOKEN_CAPS["recent_history"],
             ))
 
@@ -229,8 +314,22 @@ def _build_system_prompt_sections(
         sections.append(SystemPromptSection(
             source="Session Summary",
             content=f"{_SESSION_SUMMARY_HEADING}\n\n{session_summary.strip()}",
-            priority=60,
+            priority=56,
             hard_cap_tokens=_SECTION_TOKEN_CAPS["session_summary"],
+        ))
+    if isinstance(mcp_instructions, str) and mcp_instructions.strip():
+        sections.append(SystemPromptSection(
+            source="MCP instructions",
+            content=f"## MCP Instructions\n\n{mcp_instructions.strip()}",
+            priority=60,
+            hard_cap_tokens=_SECTION_TOKEN_CAPS["bootstrap"],
+        ))
+    if isinstance(append_prompt, str) and append_prompt.strip():
+        sections.append(SystemPromptSection(
+            source="Append prompt",
+            content=append_prompt.strip(),
+            priority=70,
+            hard_cap_tokens=_SECTION_TOKEN_CAPS["bootstrap"],
         ))
     return sections
 

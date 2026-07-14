@@ -4,7 +4,8 @@ edgebot/agent/workspace_setup.py - Workspace template and config seeding.
 One-shot startup setup: copies shipped templates (SOUL.md, AGENTS.md, USER.md,
 TOOLS.md, HEARTBEAT.md, default skills, mcp_servers.json) into the per-workspace
 runtime directory and creates a user-local config.env. Never overwrites user-edited
-files.
+files. A workspace-root AGENTS.md may be imported once as a migration source;
+live project instructions are discovered separately by edgebot.agent.context.
 
 Config values are imported lazily inside the functions (not at module import
 time) so that callers which reload edgebot.config — e.g. tests that re-import
@@ -98,7 +99,7 @@ def seed_workspace_templates() -> None:
         dst = bootstrap_paths.get(filename) or seeded_only_paths[filename]
         legacy = WORKDIR / filename
         if not dst.exists() and src.exists():
-            if legacy.exists():
+            if legacy.exists() and filename != "AGENTS.md":
                 shutil.copy2(legacy, dst)
                 print(f"[setup] Imported {filename} into runtime state")
             else:
